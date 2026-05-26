@@ -4,6 +4,19 @@ import cors from "@fastify/cors";
 import { closeDatabase, initDatabase } from "./database/db.js";
 import { registerApiWithDocs } from "./plugins/swagger.plugin.js";
 
+function parseAllowedOrigins(value: string | undefined): Set<string> | null {
+  if (!value || value.trim() === "*") {
+    return null;
+  }
+
+  return new Set(
+    value
+      .split(",")
+      .map((origin) => origin.trim().replace(/\/$/, ""))
+      .filter(Boolean),
+  );
+}
+
 async function main(): Promise<void> {
   await initDatabase();
 
@@ -15,12 +28,20 @@ async function main(): Promise<void> {
     await closeDatabase();
   });
 
-  app.get("/health", async () => ({ status: "ok" }));
-
-  const frontendOrigin = process.env.FRONTEND_ORIGIN ?? "*";
+  const allowedOrigins = parseAllowedOrigins(process.env.FRONTEND_ORIGIN);
   await app.register(cors, {
-    origin: frontendOrigin,
+    origin: (origin, callback) => {
+      if (!origin || !allowedOrigins) {
+        callback(null, true);
+        return;
+      }
+
+      const normalized = origin.replace(/\/$/, "");
+      callback(null, allowedOrigins.has(normalized) ? origin : false);
+    },
   });
+
+  app.get("/health", async () => ({ status: "ok" }));
 
   await app.register(registerApiWithDocs);
 
