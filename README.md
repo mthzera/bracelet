@@ -15,6 +15,12 @@ Cria o arquivo `.env`.
 - `DATABASE_URL`: URL do Postgres (ex.: conexão do Neon com `sslmode=require`).
 - `PORT`: fornecida pelo Render/host (localmente pode ser 3000).
 
+Arquivos de exemplo/local:
+- `.env.example`: modelo base sem segredos.
+- `.env.dev`: use para desenvolvimento local (`cp .env.dev .env` antes de `npm run dev`).
+- `.env.prod`: opcional para testar local com credenciais de produção (`cp .env.prod .env` antes de `npm start`).
+No Render, defina apenas `DATABASE_URL` no painel; não suba `.env*` para o repositório.
+
 ```bash
 npm run dev
 ```
