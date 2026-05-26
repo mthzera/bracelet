@@ -1,5 +1,6 @@
 import "dotenv/config";
 import Fastify from "fastify";
+import cors from "@fastify/cors";
 import { closeDatabase, initDatabase } from "./database/db.js";
 import { registerApiWithDocs } from "./plugins/swagger.plugin.js";
 
@@ -15,6 +16,11 @@ async function main(): Promise<void> {
   });
 
   app.get("/health", async () => ({ status: "ok" }));
+
+  const frontendOrigin = process.env.FRONTEND_ORIGIN ?? "*";
+  await app.register(cors, {
+    origin: frontendOrigin,
+  });
 
   await app.register(registerApiWithDocs);
 
