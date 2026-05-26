@@ -1,0 +1,36 @@
+# fly.toml app configuration file generated for bracelet-api-miqueias on 2026-05-26T08:39:33-03:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'bracelet-api-miqueias'
+primary_region = 'gru'
+
+[build]
+
+[env]
+  DATABASE_PATH = '/data/bracelet.db'
+
+[[mounts]]
+  source = 'bracelet_data'
+  destination = '/data'
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/health'
+
+[[vm]]
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256

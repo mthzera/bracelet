@@ -10,6 +10,11 @@ copy .env.example .env
 ```
 Cria o arquivo `.env`.
 
+### Variáveis de ambiente
+
+- `DATABASE_URL`: URL do Postgres (ex.: conexão do Neon com `sslmode=require`).
+- `PORT`: fornecida pelo Render/host (localmente pode ser 3000).
+
 ```bash
 npm run dev
 ```

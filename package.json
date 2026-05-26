@@ -1,0 +1,35 @@
+{
+  "name": "bracelet-api",
+  "version": "1.0.0",
+  "description": "BLE wristband packet API (2208A via ESP32 gateway)",
+  "main": "dist/server.js",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js"
+  },
+  "keywords": [
+    "fastify",
+    "ble",
+    "bracelet"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@fastify/swagger": "^9.5.1",
+    "@fastify/swagger-ui": "^5.2.2",
+    "dotenv": "^16.5.0",
+    "fastify": "^5.3.3",
+    "pg": "^8.21.0",
+    "zod": "^3.25.28",
+    "zod-to-json-schema": "^3.24.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "@types/pg": "^8.20.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}
