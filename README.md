@@ -1,0 +1,51 @@
+# bracelet
+
+```bash
+npm install
+```
+Instala as dependências.
+
+```bash
+copy .env.example .env
+```
+Cria o arquivo `.env`.
+
+```bash
+npm run dev
+```
+Inicia o servidor em desenvolvimento (hot reload).
+
+```bash
+npm run build
+```
+Compila o TypeScript para `dist/`.
+
+```bash
+npm start
+```
+Inicia o servidor em produção.
+
+```bash
+flyctl auth login
+```
+Login no Fly.io (uma vez).
+
+```bash
+flyctl launch --no-deploy
+```
+Cria o app (primeira vez).
+
+```bash
+flyctl volumes create bracelet_data --region gru --size 1
+```
+Cria volume para o SQLite (primeira vez).
+
+```bash
+flyctl deploy
+```
+Publica a API em https://bracelet-api-miqueias.fly.dev
+
+```bash
+flyctl logs -a bracelet-api-miqueias
+```
+Mostra os logs em tempo real (produção).
