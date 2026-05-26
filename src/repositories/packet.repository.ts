@@ -54,6 +54,9 @@ function rowToSavedPacket(row: PacketRow): SavedPacket {
 export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
   const pool = getPool();
 
+  const bytesJson = input.bytes ? JSON.stringify(input.bytes) : null;
+  const decodedJson = input.decoded ? JSON.stringify(input.decoded) : null;
+
   const result = await pool.query<PacketRow>(
     `
       INSERT INTO packets (
@@ -66,7 +69,7 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
         decoded,
         decode_error
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8)
       RETURNING id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at
     `,
     [
@@ -74,9 +77,9 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
       input.payload.packetType,
       input.payload.rawHex,
       input.payload.source,
-      input.bytes ?? null,
+      bytesJson,
       input.crcValid,
-      input.decoded ?? null,
+      decodedJson,
       input.decodeError ?? null,
     ],
   );
