@@ -1,8 +1,13 @@
 import "dotenv/config";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { closeDatabase, initDatabase } from "./database/db.js";
 import { registerApiWithDocs } from "./plugins/swagger.plugin.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function parseAllowedOrigins(value: string | undefined): Set<string> | null {
   if (!value || value.trim() === "*") {
@@ -42,6 +47,14 @@ async function main(): Promise<void> {
   });
 
   app.get("/health", async () => ({ status: "ok" }));
+
+  app.get("/dashboard", async (_req, reply) => {
+    const html = fs.readFileSync(
+      path.join(__dirname, "..", "public", "dashboard.html"),
+      "utf-8",
+    );
+    reply.type("text/html").send(html);
+  });
 
   await app.register(registerApiWithDocs);
 
