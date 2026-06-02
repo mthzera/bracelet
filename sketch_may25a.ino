@@ -25,12 +25,6 @@ unsigned long batteryTimeoutMs = 5000;
 unsigned long restartDelaySuccessMs = 30000;
 unsigned long restartDelayErrorMs = 15000;
 
-const unsigned long POLL_INTERVAL_MS = 5000;
-unsigned long lastPollMs = 0;
-
-int activeCommandId = 0;
-bool commandFromCloud = false;
-
 const char* CONFIG_AP_SSID = "ESP32_BRACELET_CONFIG";
 const char* CONFIG_AP_PASS = "12345678";
 
@@ -471,214 +465,6 @@ bool postPacket(const char* packetType, const char* hex, const char* metricName)
 }
 
 // =====================
-// API NA NUVEM (polling de comandos)
-// =====================
-
-String getApiBase() {
-  String base = apiUrl;
-  const char* suffix = "/bracelets/packets";
-
-  if (base.endsWith(suffix)) {
-    base = base.substring(0, base.length() - strlen(suffix));
-  }
-
-  while (base.length() > 0 && base.charAt(base.length() - 1) == '/') {
-    base.remove(base.length() - 1);
-  }
-
-  return base;
-}
-
-String getDevicePathId() {
-  String id = deviceMac;
-  id.replace(":", "-");
-  return id;
-}
-
-bool httpRequest(const char* method, const String& url, const String& body, String& responseOut) {
-  WiFiClientSecure sc;
-  sc.setInsecure();
-  sc.setHandshakeTimeout(45);
-
-  HTTPClient http;
-  http.setReuse(false);
-  http.setTimeout(30000);
-
-  if (!http.begin(sc, url)) {
-    return false;
-  }
-
-  http.addHeader("Content-Type", "application/json");
-
-  int code = 0;
-
-  if (strcmp(method, "GET") == 0) {
-    code = http.GET();
-  } else {
-    code = http.POST((uint8_t*)body.c_str(), body.length());
-  }
-
-  responseOut = http.getString();
-  http.end();
-
-  return code >= 200 && code < 300;
-}
-
-String buildRuntimeJson() {
-  return String("{")
-    + "\"status\":\"" + jsonEscape(lastStatus) + "\","
-    + "\"error\":\"" + jsonEscape(lastError) + "\","
-    + "\"readingActive\":" + String(readingActive ? "true" : "false") + ","
-    + "\"sendingData\":" + String(sendingData ? "true" : "false") + ","
-    + "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ","
-    + "\"wifiSsid\":\"" + jsonEscape(wifiSsid) + "\","
-    + "\"ip\":\"" + jsonEscape(WiFi.localIP().toString()) + "\","
-    + "\"rssi\":" + String(WiFi.RSSI()) + ","
-    + "\"heapFree\":" + String(ESP.getFreeHeap())
-    + "}";
-}
-
-bool ackCloudCommand(int commandId, const char* resultStatus) {
-  if (commandId <= 0 || getApiBase().length() == 0) return false;
-
-  String url = getApiBase()
-    + "/devices/" + getDevicePathId()
-    + "/commands/" + String(commandId) + "/ack";
-
-  String body = String("{\"status\":\"") + resultStatus + "\",\"runtime\":" + buildRuntimeJson() + "}";
-
-  if (lastError.length() > 0 && strcmp(resultStatus, "failed") == 0) {
-    body = String("{\"status\":\"failed\",\"error\":\"") + jsonEscape(lastError) + "\",\"runtime\":" + buildRuntimeJson() + "}";
-  }
-
-  Serial.printf("[CLOUD] ACK %d -> %s\n", commandId, url.c_str());
-
-  String response;
-  return httpRequest("POST", url, body, response);
-}
-
-bool sendCloudHeartbeat() {
-  if (getApiBase().length() == 0 || deviceMac.length() == 0) return false;
-
-  String url = getApiBase() + "/devices/" + getDevicePathId() + "/heartbeat";
-  String body = buildRuntimeJson();
-
-  String response;
-  return httpRequest("POST", url, body, response);
-}
-
-void applyConfigFromCloud(const String& body) {
-  String newWifiSsid = getJsonValue(body, "wifiSsid");
-  String newWifiPass = getJsonValue(body, "wifiPass");
-  String newApiUrl = getJsonValue(body, "apiUrl");
-  String newDeviceMac = getJsonValue(body, "deviceMac");
-
-  if (newWifiSsid.length() > 0) wifiSsid = newWifiSsid;
-  if (newWifiPass.length() > 0) wifiPass = newWifiPass;
-  if (newApiUrl.length() > 0) apiUrl = newApiUrl;
-  if (newDeviceMac.length() > 0) deviceMac = normalizeMac(newDeviceMac);
-
-  scanTimeoutMs = getJsonULong(body, "scanTimeoutMs", scanTimeoutMs);
-  restartDelaySuccessMs = getJsonULong(body, "restartDelaySuccessMs", restartDelaySuccessMs);
-  restartDelayErrorMs = getJsonULong(body, "restartDelayErrorMs", restartDelayErrorMs);
-
-  saveConfig();
-}
-
-void finishCloudCommandIfNeeded() {
-  if (!commandFromCloud || activeCommandId <= 0) return;
-
-  const char* result = (lastStatus == "done") ? "completed" : "failed";
-  ackCloudCommand(activeCommandId, result);
-
-  commandFromCloud = false;
-  activeCommandId = 0;
-}
-
-void executeCloudCommand(const String& response, int commandId, const String& cmdType) {
-  activeCommandId = commandId;
-  commandFromCloud = true;
-
-  Serial.printf("[CLOUD] Executando comando %d tipo %s\n", commandId, cmdType.c_str());
-
-  if (cmdType == "start") {
-    startReading();
-
-    if (lastStatus == "error") {
-      ackCloudCommand(activeCommandId, "failed");
-      commandFromCloud = false;
-      activeCommandId = 0;
-    }
-
-    return;
-  }
-
-  if (cmdType == "stop") {
-    stopReading();
-    ackCloudCommand(activeCommandId, "completed");
-    commandFromCloud = false;
-    activeCommandId = 0;
-    return;
-  }
-
-  if (cmdType == "config") {
-    applyConfigFromCloud(response);
-    ackCloudCommand(activeCommandId, "completed");
-    commandFromCloud = false;
-    activeCommandId = 0;
-    return;
-  }
-
-  if (cmdType == "reset_config") {
-    ackCloudCommand(activeCommandId, "completed");
-    clearConfig();
-    commandFromCloud = false;
-    activeCommandId = 0;
-    scheduleRestart(2000);
-    return;
-  }
-
-  lastError = "Comando desconhecido: " + cmdType;
-  ackCloudCommand(activeCommandId, "failed");
-  commandFromCloud = false;
-  activeCommandId = 0;
-}
-
-void pollCloud() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (apiUrl.length() == 0 || deviceMac.length() == 0) return;
-  if (lastStatus == "config_ap") return;
-
-  if (readingActive || sendingData) {
-    sendCloudHeartbeat();
-    return;
-  }
-
-  String url = getApiBase() + "/devices/" + getDevicePathId() + "/commands/pending";
-  String response;
-
-  if (!httpRequest("GET", url, "", response)) {
-    Serial.println("[CLOUD] Falha ao buscar comandos.");
-    return;
-  }
-
-  if (response.indexOf("\"command\":null") >= 0) {
-    sendCloudHeartbeat();
-    return;
-  }
-
-  String cmdId = getJsonValue(response, "id");
-  String cmdType = getJsonValue(response, "type");
-
-  if (cmdId.length() == 0 || cmdType.length() == 0) {
-    sendCloudHeartbeat();
-    return;
-  }
-
-  executeCloudCommand(response, cmdId.toInt(), cmdType);
-}
-
-// =====================
 // CONTROLE DE LEITURA
 // =====================
 
@@ -807,13 +593,11 @@ void readingLoop() {
   if (sent > 0 && okCount == sent) {
     lastStatus = "done";
     Serial.println("[APP] Dados enviados com sucesso.");
-    finishCloudCommandIfNeeded();
     scheduleRestart(restartDelaySuccessMs);
   } else {
     lastStatus = "error";
     if (sent == 0) lastError = "Nenhum dado capturado no ciclo";
     Serial.println("[APP] Falha ou captura incompleta.");
-    finishCloudCommandIfNeeded();
     scheduleRestart(restartDelayErrorMs);
   }
 }
@@ -876,17 +660,6 @@ void handleConfig() {
   String body = server.arg("plain");
 
   String newWifiSsid = getJsonValue(body, "wifiSsid");
-  String newWifiPass = getJsonValue(body, "wifiPass");
-  String newApiUrl = getJsonValue(body, "apiUrl");
-  String newDeviceMac = getJsonValue(body, "deviceMac");
-
-  if (newWifiSsid.length() > 0) wifiSsid = newWifiSsid;
-  if (newWifiPass.length() > 0) wifiPass = newWifiPass;
-  if (newApiUrl.length() > 0) apiUrl = newApiUrl;
-  if (newDeviceMac.length() > 0) deviceMac = normalizeMac(newDeviceMac);
-
-  scanTimeoutMs = getJsonULong(body, "scanTimeoutMs", scanTimeoutMs);
-  restartDelaySuccessMs = getJsonULong(body, "restartDelaySuccessMs", restartDelaySuccessMs);
   restartDelayErrorMs = getJsonULong(body, "restartDelayErrorMs", restartDelayErrorMs);
 
   bool wifiChanged = newWifiSsid.length() > 0;
@@ -1049,11 +822,6 @@ void setup() {
 void loop() {
   server.handleClient();
   readingLoop();
-
-  if (millis() - lastPollMs >= POLL_INTERVAL_MS) {
-    lastPollMs = millis();
-    pollCloud();
-  }
 
   if (scheduledRestart && millis() >= scheduledRestartAt) {
     Serial.println("[APP] Reiniciando ESP32...");

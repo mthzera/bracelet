@@ -28,42 +28,6 @@ async function migrate(client: PoolClient): Promise<void> {
 
   await client.query(`CREATE INDEX IF NOT EXISTS idx_packets_device_mac ON packets(device_mac);`);
   await client.query(`CREATE INDEX IF NOT EXISTS idx_packets_created_at ON packets(created_at);`);
-
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS device_commands (
-      id SERIAL PRIMARY KEY,
-      device_id TEXT NOT NULL,
-      command_type TEXT NOT NULL,
-      payload JSONB,
-      status TEXT NOT NULL DEFAULT 'pending',
-      error TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      claimed_at TIMESTAMPTZ,
-      completed_at TIMESTAMPTZ
-    );
-  `);
-
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_device_commands_pending
-    ON device_commands(device_id, status, created_at);
-  `);
-
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS device_runtime_status (
-      device_id TEXT PRIMARY KEY,
-      status TEXT NOT NULL DEFAULT 'unknown',
-      error TEXT NOT NULL DEFAULT '',
-      reading_active BOOLEAN NOT NULL DEFAULT FALSE,
-      sending_data BOOLEAN NOT NULL DEFAULT FALSE,
-      wifi_connected BOOLEAN NOT NULL DEFAULT FALSE,
-      wifi_ssid TEXT NOT NULL DEFAULT '',
-      ip TEXT NOT NULL DEFAULT '',
-      rssi INTEGER,
-      heap_free INTEGER,
-      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `);
 }
 
 export async function initDatabase(): Promise<Pool> {

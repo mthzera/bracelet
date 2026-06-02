@@ -15,13 +15,6 @@ import {
   postGatewayStopRouteSchema,
 } from "../schemas/gateway.swagger.js";
 import {
-  cloudEnqueueAction,
-  cloudEnqueueConfig,
-  cloudGetGatewayConfig,
-  cloudGetGatewayStatus,
-  resolveDeviceMac,
-} from "../services/gateway-cloud.service.js";
-import {
   GatewayNotConfiguredError,
   GatewayUnreachableError,
   getConfiguredGatewayUrl,
@@ -36,50 +29,18 @@ function asGatewayReply(reply: FastifyReply): GatewayReply {
 
 const GATEWAY_ENDPOINTS: Record<string, string> = {
   "GET /gateway": "API discovery (this service)",
-  "GET /gateway/status": "ESP32 status (cloud queue or LAN proxy)",
-  "GET /gateway/config": "ESP32 config (cloud queue or LAN proxy)",
-  "POST /gateway/config": "Update config (cloud queue or LAN proxy)",
+  "GET /gateway/status": "ESP32 reading state, Wi-Fi, captures",
+  "GET /gateway/config": "Current ESP32 config (from status)",
+  "POST /gateway/config": "Update Wi-Fi, API URL, bracelet MAC, timeouts",
   "PUT /gateway/config": "Same as POST /gateway/config",
-  "POST /gateway/start": "Start BLE cycle",
-  "POST /gateway/stop": "Cancel reading",
-  "POST /gateway/reset-config": "Reset ESP32 NVS",
+  "POST /gateway/start": "Start full BLE cycle (0x13 + 5× 0x28)",
+  "POST /gateway/stop": "Cancel active reading",
+  "POST /gateway/reset-config": "Clear NVS and reboot ESP32",
 };
 
-function gatewayQuery(request: FastifyRequest) {
-  return gatewayUrlQuerySchema.safeParse(request.query);
-}
-
 function gatewayUrlFromRequest(request: FastifyRequest): string | undefined {
-  const query = gatewayQuery(request);
+  const query = gatewayUrlQuerySchema.safeParse(request.query);
   return query.success ? query.data.gatewayUrl : undefined;
-}
-
-function deviceMacFromQuery(request: FastifyRequest): string | undefined {
-  const query = gatewayQuery(request);
-  return query.success ? query.data.deviceMac : undefined;
-}
-
-function useCloudGateway(request: FastifyRequest): boolean {
-  return !getConfiguredGatewayUrl() && !gatewayUrlFromRequest(request);
-}
-
-function deviceMacRequired(reply: FastifyReply): unknown {
-  return reply.status(400).send({
-    error: "deviceMac is required in cloud mode",
-    hint: "Add ?deviceMac=AA:BB:CC:DD:EE:FF or include deviceMac in the JSON body",
-  });
-}
-
-function handleDeviceMacError(reply: FastifyReply, err: unknown): unknown {
-  if (err instanceof Error && err.message === "DEVICE_MAC_REQUIRED") {
-    return deviceMacRequired(reply);
-  }
-
-  if (err instanceof Error && err.message === "INVALID_DEVICE_ID") {
-    return reply.status(400).send({ error: "Invalid deviceMac (use bracelet MAC)" });
-  }
-
-  return null;
 }
 
 function handleGatewayRouteError(
@@ -88,9 +49,7 @@ function handleGatewayRouteError(
   err: unknown,
 ): unknown {
   if (err instanceof GatewayNotConfiguredError) {
-    return reply.status(503).send({
-      error: "ESP32_GATEWAY_URL is not set. Use ?deviceMac= for cloud mode or configure ESP32_GATEWAY_URL.",
-    });
+    return reply.status(503).send({ error: err.message });
   }
 
   if (err instanceof GatewayUnreachableError) {
@@ -110,21 +69,6 @@ async function handleGatewayConfig(
 ): Promise<unknown> {
   try {
     const body = gatewayConfigBodySchema.parse(request.body);
-
-    if (useCloudGateway(request)) {
-      let deviceMac: string;
-      try {
-        deviceMac = resolveDeviceMac(deviceMacFromQuery(request), body.deviceMac);
-      } catch (err) {
-        const handled = handleDeviceMacError(reply, err);
-        if (handled) return handled;
-        throw err;
-      }
-
-      const result = await cloudEnqueueConfig(deviceMac, body);
-      return reply.status(200).send(result);
-    }
-
     const result = await proxyToGateway(
       "/config",
       {
@@ -151,19 +95,22 @@ export async function gatewayRoutes(app: FastifyInstance): Promise<void> {
     { schema: getGatewayInfoRouteSchema },
     async (_request, reply) => {
       const gatewayUrl = getConfiguredGatewayUrl();
-      const cloudMode = !gatewayUrl;
 
       return reply.status(200).send({
-        name: "Bracelet API — ESP32 Gateway",
+        name: "Bracelet API — ESP32 Gateway Proxy",
         configured: gatewayUrl !== null,
-        cloudMode,
         gatewayUrl,
         endpoints: GATEWAY_ENDPOINTS,
-        cloudHint: cloudMode
-          ? "Pass ?deviceMac=AA:BB:CC:DD:EE:FF on /gateway/* routes. ESP32 polls /devices/:deviceId/commands/pending."
-          : undefined,
+        esp32LocalEndpoints: {
+          "GET /": "ESP32 discovery",
+          "GET /status": "Full status JSON",
+          "POST /config": "Persist config to NVS",
+          "POST /start": "Start reading",
+          "POST /stop": "Stop reading",
+          "POST /reset-config": "Factory reset NVS",
+        },
         env: {
-          ESP32_GATEWAY_URL: "Optional. LAN proxy to ESP32. If unset, uses cloud command queue.",
+          ESP32_GATEWAY_URL: "Base URL of ESP32 HTTP server (required for proxy)",
           ESP32_GATEWAY_TIMEOUT_MS: "Proxy timeout in ms (default 120000)",
         },
       });
@@ -174,18 +121,6 @@ export async function gatewayRoutes(app: FastifyInstance): Promise<void> {
     "/gateway/status",
     { schema: getGatewayStatusRouteSchema },
     async (request, reply) => {
-      if (useCloudGateway(request)) {
-        try {
-          const deviceMac = resolveDeviceMac(deviceMacFromQuery(request));
-          const status = await cloudGetGatewayStatus(deviceMac);
-          return reply.status(200).send(status);
-        } catch (err) {
-          const handled = handleDeviceMacError(reply, err);
-          if (handled) return handled;
-          throw err;
-        }
-      }
-
       try {
         const result = await proxyToGateway(
           "/status",
@@ -203,18 +138,6 @@ export async function gatewayRoutes(app: FastifyInstance): Promise<void> {
     "/gateway/config",
     { schema: getGatewayConfigRouteSchema },
     async (request, reply) => {
-      if (useCloudGateway(request)) {
-        try {
-          const deviceMac = resolveDeviceMac(deviceMacFromQuery(request));
-          const config = await cloudGetGatewayConfig(deviceMac);
-          return reply.status(200).send(config);
-        } catch (err) {
-          const handled = handleDeviceMacError(reply, err);
-          if (handled) return handled;
-          throw err;
-        }
-      }
-
       try {
         const result = await proxyToGateway(
           "/status",
@@ -264,19 +187,6 @@ export async function gatewayRoutes(app: FastifyInstance): Promise<void> {
     "/gateway/start",
     { schema: postGatewayStartRouteSchema },
     async (request, reply) => {
-      if (useCloudGateway(request)) {
-        try {
-          const body = (request.body ?? {}) as { deviceMac?: string };
-          const deviceMac = resolveDeviceMac(deviceMacFromQuery(request), body.deviceMac);
-          const result = await cloudEnqueueAction(deviceMac, "start");
-          return reply.status(200).send(result);
-        } catch (err) {
-          const handled = handleDeviceMacError(reply, err);
-          if (handled) return handled;
-          throw err;
-        }
-      }
-
       try {
         const result = await proxyToGateway(
           "/start",
@@ -294,19 +204,6 @@ export async function gatewayRoutes(app: FastifyInstance): Promise<void> {
     "/gateway/stop",
     { schema: postGatewayStopRouteSchema },
     async (request, reply) => {
-      if (useCloudGateway(request)) {
-        try {
-          const body = (request.body ?? {}) as { deviceMac?: string };
-          const deviceMac = resolveDeviceMac(deviceMacFromQuery(request), body.deviceMac);
-          const result = await cloudEnqueueAction(deviceMac, "stop");
-          return reply.status(200).send(result);
-        } catch (err) {
-          const handled = handleDeviceMacError(reply, err);
-          if (handled) return handled;
-          throw err;
-        }
-      }
-
       try {
         const result = await proxyToGateway(
           "/stop",
@@ -324,19 +221,6 @@ export async function gatewayRoutes(app: FastifyInstance): Promise<void> {
     "/gateway/reset-config",
     { schema: postGatewayResetConfigRouteSchema },
     async (request, reply) => {
-      if (useCloudGateway(request)) {
-        try {
-          const body = (request.body ?? {}) as { deviceMac?: string };
-          const deviceMac = resolveDeviceMac(deviceMacFromQuery(request), body.deviceMac);
-          const result = await cloudEnqueueAction(deviceMac, "reset_config");
-          return reply.status(200).send(result);
-        } catch (err) {
-          const handled = handleDeviceMacError(reply, err);
-          if (handled) return handled;
-          throw err;
-        }
-      }
-
       try {
         const result = await proxyToGateway(
           "/reset-config",

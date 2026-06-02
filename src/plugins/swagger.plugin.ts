@@ -2,7 +2,6 @@ import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
 import type { FastifyInstance } from "fastify";
 import { braceletRoutes } from "../routes/bracelet.routes.js";
-import { deviceRoutes } from "../routes/device.routes.js";
 import { gatewayRoutes } from "../routes/gateway.routes.js";
 
 const openApiConfig = {
@@ -23,10 +22,6 @@ const openApiConfig = {
         name: "gateway",
         description: "Proxy to ESP32 local HTTP API (requires ESP32_GATEWAY_URL)",
       },
-      {
-        name: "devices",
-        description: "Cloud command queue — front enqueues, ESP32 polls (works across networks)",
-      },
     ],
   },
 };
@@ -43,7 +38,6 @@ const swaggerUiConfig = {
 export async function registerApiWithDocs(app: FastifyInstance): Promise<void> {
   await app.register(swagger, openApiConfig);
   await app.register(braceletRoutes);
-  await app.register(deviceRoutes);
   await app.register(gatewayRoutes);
   await app.register(swaggerUi, swaggerUiConfig);
 }
