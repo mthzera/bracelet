@@ -27,6 +27,10 @@ export const gatewayUrlQuerySchema = z.object({
     .url()
     .optional()
     .describe("Override ESP32_GATEWAY_URL for this request (e.g. http://192.168.0.42)"),
+  deviceMac: z
+    .string()
+    .optional()
+    .describe("Bracelet MAC — required for cloud mode when ESP32_GATEWAY_URL is not set"),
 });
 
 export type GatewayUrlQuery = z.infer<typeof gatewayUrlQuerySchema>;
