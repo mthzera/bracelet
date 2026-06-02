@@ -1,4 +1,6 @@
 import "dotenv/config";
+import fs from "node:fs";
+import path from "node:path";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { closeDatabase, initDatabase } from "./database/db.js";
@@ -42,6 +44,14 @@ async function main(): Promise<void> {
   });
 
   app.get("/health", async () => ({ status: "ok" }));
+
+  app.get("/dashboard", async (_req, reply) => {
+    const html = fs.readFileSync(
+      path.join(process.cwd(), "public", "dashboard.html"),
+      "utf-8",
+    );
+    reply.type("text/html").send(html);
+  });
 
   await app.register(registerApiWithDocs);
 
