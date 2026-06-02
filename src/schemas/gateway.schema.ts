@@ -11,9 +11,9 @@ export const gatewayConfigBodySchema = z
       .string()
       .regex(macAddressRegex, "deviceMac must be AA:BB:CC:DD:EE:FF")
       .optional(),
-    scanTimeoutMs: z.number().int().positive().max(120_000).optional(),
-    restartDelaySuccessMs: z.number().int().nonnegative().max(600_000).optional(),
-    restartDelayErrorMs: z.number().int().nonnegative().max(600_000).optional(),
+    scanTimeoutMs: z.number().int().min(1).max(120_000).optional(),
+    restartDelaySuccessMs: z.number().int().min(0).max(600_000).optional(),
+    restartDelayErrorMs: z.number().int().min(0).max(600_000).optional(),
   })
   .refine((data) => Object.values(data).some((v) => v !== undefined), {
     message: "At least one configuration field is required",

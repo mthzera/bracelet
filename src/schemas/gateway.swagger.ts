@@ -40,13 +40,12 @@ const gatewayInfoResponseSchema = {
   type: "object",
   required: ["name", "configured", "endpoints"],
   properties: {
-    name: { type: "string", example: "Bracelet API — ESP32 Gateway Proxy" },
+    name: { type: "string" },
     configured: { type: "boolean" },
     gatewayUrl: {
       type: "string",
       nullable: true,
       description: "ESP32_GATEWAY_URL from environment (passwords never exposed)",
-      example: "http://192.168.0.42",
     },
     endpoints: {
       type: "object",
