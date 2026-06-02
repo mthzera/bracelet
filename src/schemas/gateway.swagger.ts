@@ -32,7 +32,6 @@ const gatewayUrlQueryOpenApi = {
       type: "string",
       format: "uri",
       description: "Override ESP32_GATEWAY_URL (ESP32 must be reachable from this API)",
-      example: "http://192.168.0.42",
     },
   },
 } as const;
