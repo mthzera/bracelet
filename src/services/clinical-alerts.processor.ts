@@ -1,0 +1,164 @@
+import {
+  getRecentVitalsHistory,
+  saveClinicalAssessment,
+} from "../repositories/clinical-alerts.repository.js";
+import { getRecentHealthPackets } from "../repositories/packet.repository.js";
+import type { PacketPayload } from "../schemas/packet.schema.js";
+import type { DecodedHealth, DecodedHrvHistory } from "../services/packet-decoder.service.js";
+import {
+  evaluateClinicalAlerts,
+  vitalsFromDecodedHealth,
+} from "../services/clinical-alerts.service.js";
+import type { VitalsInput } from "../types/clinical-alerts.types.js";
+
+function pickNonZero(current: number, next: number): number {
+  return next > 0 ? next : current;
+}
+
+export function mergeVitalsFromHealthPackets(decodedList: DecodedHealth[]): VitalsInput {
+  const merged: VitalsInput = {
+    heartRate: 0,
+    systolic: 0,
+    diastolic: 0,
+    temperature: 0,
+    spo2: 0,
+    hrv: 0,
+    fatigue: 0,
+  };
+
+  for (const d of decodedList) {
+    merged.heartRate = pickNonZero(merged.heartRate, d.heartRate);
+    merged.spo2 = pickNonZero(merged.spo2, d.spo2);
+    merged.hrv = pickNonZero(merged.hrv, d.hrv);
+    merged.fatigue = pickNonZero(merged.fatigue, d.fatigue);
+    merged.systolic = pickNonZero(merged.systolic, d.systolicPressure);
+    merged.diastolic = pickNonZero(merged.diastolic, d.diastolicPressure);
+    merged.temperature = pickNonZero(merged.temperature, d.temperature);
+  }
+
+  return merged;
+}
+
+function parseBloodPressure(value: string): { systolic: number; diastolic: number } {
+  const match = value.match(/(\d+)\s*\/\s*(\d+)/);
+  if (!match) return { systolic: 0, diastolic: 0 };
+  return { systolic: Number(match[1]), diastolic: Number(match[2]) };
+}
+
+export function vitalsFromPacketMetrics(
+  metrics: NonNullable<PacketPayload["metrics"]>,
+): VitalsInput | null {
+  const bp = metrics.bloodPressure ? parseBloodPressure(metrics.bloodPressure) : { systolic: 0, diastolic: 0 };
+
+  const vitals: VitalsInput = {
+    heartRate: metrics.heartRate ?? 0,
+    systolic: bp.systolic,
+    diastolic: bp.diastolic,
+    temperature: metrics.temperature ?? 0,
+    spo2: metrics.spO2 ?? 0,
+    hrv: metrics.hrv ?? 0,
+    fatigue: metrics.fatigue ?? 0,
+  };
+
+  const hasData =
+    vitals.heartRate > 0 ||
+    vitals.spo2 > 0 ||
+    vitals.hrv > 0 ||
+    vitals.systolic > 0 ||
+    vitals.temperature > 0;
+
+  return hasData ? vitals : null;
+}
+
+function hasEnoughVitals(vitals: VitalsInput): boolean {
+  const signals =
+    (vitals.heartRate > 0 ? 1 : 0) +
+    (vitals.spo2 > 0 ? 1 : 0) +
+    (vitals.hrv > 0 ? 1 : 0) +
+    (vitals.systolic > 0 ? 1 : 0) +
+    (vitals.temperature > 0 ? 1 : 0);
+  return signals >= 2;
+}
+
+/** Backend-only: roda após ingestão de pacote de saúde (0x28 / 0x56 / metrics). */
+export async function processClinicalAlertsAfterHealthPacket(input: {
+  deviceMac: string;
+  source: string;
+  packetId: number;
+  measuredAt: string;
+  vitals: VitalsInput;
+}): Promise<void> {
+  if (!hasEnoughVitals(input.vitals)) return;
+
+  const history = await getRecentVitalsHistory(input.deviceMac, 10);
+
+  const assessment = evaluateClinicalAlerts({
+    deviceMac: input.deviceMac,
+    measuredAt: input.measuredAt,
+    vitals: input.vitals,
+    context: { isResting: true, signalQuality: "unknown", source: input.source },
+    recentHistory: history,
+  });
+
+  await saveClinicalAssessment(assessment, input.packetId);
+}
+
+export async function processClinicalAlertsFromRecentPackets(
+  deviceMac: string,
+  source: string,
+  packetId: number,
+  measuredAt: string,
+): Promise<void> {
+  const recent = await getRecentHealthPackets(deviceMac, 12);
+  const healthDecoded = recent
+    .map((p) => p.decoded)
+    .filter((d): d is DecodedHealth => d?.type === "0x28");
+
+  if (healthDecoded.length === 0) return;
+
+  const vitals = mergeVitalsFromHealthPackets(healthDecoded);
+  await processClinicalAlertsAfterHealthPacket({
+    deviceMac,
+    source,
+    packetId,
+    measuredAt,
+    vitals,
+  });
+}
+
+export async function processClinicalAlertsFromDecoded(
+  deviceMac: string,
+  source: string,
+  packetId: number,
+  measuredAt: string,
+  decoded: DecodedHealth | DecodedHrvHistory,
+): Promise<void> {
+  if (decoded.type === "0x56") {
+    const vitals: VitalsInput = {
+      heartRate: 0,
+      systolic: 0,
+      diastolic: 0,
+      temperature: 0,
+      spo2: 0,
+      hrv: decoded.hrv,
+      fatigue: decoded.fatigue,
+    };
+    await processClinicalAlertsAfterHealthPacket({ deviceMac, source, packetId, measuredAt, vitals });
+    return;
+  }
+
+  await processClinicalAlertsFromRecentPackets(deviceMac, source, packetId, measuredAt);
+}
+
+export function vitalsFromMetricsOrDecoded(
+  metrics: PacketPayload["metrics"],
+  decoded?: DecodedHealth,
+): VitalsInput | null {
+  if (metrics) {
+    return vitalsFromPacketMetrics(metrics);
+  }
+  if (decoded?.type === "0x28") {
+    return vitalsFromDecodedHealth(decoded);
+  }
+  return null;
+}

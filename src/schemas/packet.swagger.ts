@@ -24,7 +24,7 @@ export const packetBodySchema = flattenZodJsonSchema(packetPayloadSchema);
 const decodedSchema = {
   type: "object",
   additionalProperties: true,
-  description: "Decoded packet (0x13 battery, 0x22 MAC, 0x28 health, 0x09 realtime)",
+  description: "Decoded packet (0x13 battery, 0x22 MAC, 0x28 health, 0x56 HRV history, 0x09 realtime)",
 } as const;
 
 export const packetSuccessResponseSchema = {

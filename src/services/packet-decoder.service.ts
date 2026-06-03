@@ -30,6 +30,13 @@ export type DecodedHealth = {
   temperature: number;
 };
 
+/** Histórico HRV — comando 0x56 (D1=HRV, D4=fadiga). */
+export type DecodedHrvHistory = {
+  type: "0x56";
+  hrv: number;
+  fatigue: number;
+};
+
 /** Pacote 0x09 — tempo real (passos, calorias, distância, HR, SpO2, temperatura). */
 export type DecodedRealtime = {
   type: "0x09";
@@ -43,7 +50,46 @@ export type DecodedRealtime = {
   spo2: number;
 };
 
-export type DecodedPacket = DecodedBattery | DecodedMac | DecodedHealth | DecodedRealtime;
+export type DecodedPacket =
+  | DecodedBattery
+  | DecodedMac
+  | DecodedHealth
+  | DecodedHrvHistory
+  | DecodedRealtime;
+
+export type HealthMeasurementKind = "hrv" | "heartRate" | "spo2" | "temperature";
+
+const HEALTH_TYPE_BYTE: Record<HealthMeasurementKind, number> = {
+  hrv: 0x01,
+  heartRate: 0x02,
+  spo2: 0x03,
+  temperature: 0x04,
+};
+
+/** Monta pacote BLE 16 bytes: 0x28 AA BB (PDF §33). */
+export function buildHealthMeasurementPacket(
+  kind: HealthMeasurementKind,
+  start: boolean,
+): number[] {
+  const packet = new Array<number>(16).fill(0);
+  packet[0] = 0x28;
+  packet[1] = HEALTH_TYPE_BYTE[kind];
+  packet[2] = start ? 0x01 : 0x00;
+  packet[15] = packet.slice(0, 15).reduce((sum, b) => sum + b, 0) & 0xff;
+  return packet;
+}
+
+/** Interpreta resposta 0x28 (notify FFF7, 16 bytes). */
+export function parseHealthMeasurement(bytes: number[]): DecodedHealth {
+  if (bytes.length < 16) {
+    throw new PacketDecoderError("Health packet (0x28) requires 16 bytes");
+  }
+  if (bytes[0] !== 0x28) {
+    throw new PacketDecoderError("Not a 0x28 health measurement packet");
+  }
+  validateCrc(bytes);
+  return decodeHealth(bytes);
+}
 
 export class PacketDecoderError extends Error {
   constructor(message: string) {
@@ -174,6 +220,17 @@ function decodeBloodPressure(bytes: number[]): {
   return { systolicPressure: systolic, diastolicPressure: diastolic };
 }
 
+function decodeHrvHistory(bytes: number[]): DecodedHrvHistory {
+  if (bytes.length < 13) {
+    throw new PacketDecoderError("HRV history packet (0x56) requires at least 13 bytes");
+  }
+  return {
+    type: "0x56",
+    hrv: bytes[9] ?? 0,
+    fatigue: bytes[12] ?? 0,
+  };
+}
+
 function decodeHealth(bytes: number[]): DecodedHealth {
   if (bytes.length < 10) {
     throw new PacketDecoderError("Health packet (0x28) requires at least 10 bytes");
@@ -248,6 +305,9 @@ export function decodePacket(packetType: string, rawHex: string): {
       break;
     case 0x28:
       decoded = decodeHealth(bytes);
+      break;
+    case 0x56:
+      decoded = decodeHrvHistory(bytes);
       break;
     case 0x09:
       decoded = decodeRealtime(bytes);

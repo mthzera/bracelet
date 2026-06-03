@@ -28,6 +28,32 @@ async function migrate(client: PoolClient): Promise<void> {
 
   await client.query(`CREATE INDEX IF NOT EXISTS idx_packets_device_mac ON packets(device_mac);`);
   await client.query(`CREATE INDEX IF NOT EXISTS idx_packets_created_at ON packets(created_at);`);
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS vital_assessments (
+      id SERIAL PRIMARY KEY,
+      device_mac TEXT NOT NULL,
+      measured_at TIMESTAMPTZ NOT NULL,
+      packet_id INTEGER REFERENCES packets(id) ON DELETE SET NULL,
+      vitals JSONB NOT NULL,
+      context JSONB NOT NULL DEFAULT '{}',
+      alerts JSONB NOT NULL DEFAULT '[]',
+      notes JSONB NOT NULL DEFAULT '[]',
+      risk_score INTEGER NOT NULL DEFAULT 0,
+      overall_status TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      baseline JSONB NOT NULL DEFAULT '{}',
+      disclaimer TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_vital_assessments_device_mac ON vital_assessments(device_mac);`,
+  );
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_vital_assessments_measured_at ON vital_assessments(measured_at);`,
+  );
 }
 
 export async function initDatabase(): Promise<Pool> {

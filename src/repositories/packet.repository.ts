@@ -103,3 +103,28 @@ export async function listPackets(limit = 50): Promise<SavedPacket[]> {
 
   return rows.map(rowToSavedPacket);
 }
+
+export async function getRecentHealthPackets(
+  deviceMac: string,
+  limit = 12,
+): Promise<SavedPacket[]> {
+  const pool = getPool();
+  const safeLimit = Math.min(Math.max(limit, 1), 30);
+
+  const { rows } = await pool.query<PacketRow>(
+    `
+      SELECT id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at
+      FROM packets
+      WHERE device_mac = $1
+        AND packet_type IN ('0x28', '0x56')
+        AND crc_valid = TRUE
+        AND decoded IS NOT NULL
+        AND created_at > now() - interval '15 minutes'
+      ORDER BY created_at DESC
+      LIMIT $2
+    `,
+    [deviceMac, safeLimit],
+  );
+
+  return rows.map(rowToSavedPacket);
+}

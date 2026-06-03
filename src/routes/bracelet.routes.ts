@@ -7,6 +7,11 @@ import {
   postPacketRouteSchema,
 } from "../schemas/packet.swagger.js";
 import {
+  processClinicalAlertsFromDecoded,
+  processClinicalAlertsAfterHealthPacket,
+  vitalsFromMetricsOrDecoded,
+} from "../services/clinical-alerts.processor.js";
+import {
   decodePacket,
   PacketDecoderError,
   rawHexToBytes,
@@ -83,6 +88,33 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
         },
         "Bracelet packet decoded and saved",
       );
+
+      try {
+        const metricsVitals = vitalsFromMetricsOrDecoded(
+          payload.metrics,
+          decoded.type === "0x28" ? decoded : undefined,
+        );
+
+        if (metricsVitals) {
+          await processClinicalAlertsAfterHealthPacket({
+            deviceMac: payload.deviceMac,
+            source: payload.source,
+            packetId: saved.id,
+            measuredAt: saved.createdAt,
+            vitals: metricsVitals,
+          });
+        } else if (decoded.type === "0x28" || decoded.type === "0x56") {
+          await processClinicalAlertsFromDecoded(
+            payload.deviceMac,
+            payload.source,
+            saved.id,
+            saved.createdAt,
+            decoded,
+          );
+        }
+      } catch (alertErr) {
+        request.log.error({ err: alertErr }, "Clinical assessment after packet failed");
+      }
 
       return reply.status(200).send(response);
     } catch (err) {
