@@ -555,10 +555,10 @@
 
   function renderPanels() {
     // Health panel
-    const h = packets.find(p => p.decoded?.type === '0x28');
+    const h = packets.find(p => p.decoded?.type === '0x28' || p.mergedHealth);
     const healthEl = document.getElementById('healthPanel');
     if (h) {
-      const d = h.decoded;
+      const d = h.mergedHealth || h.decoded;
       healthEl.innerHTML = `
         <div class="metric-row">
           <span class="metric-name">&#x2764;&#xFE0F; Heart Rate</span>
@@ -690,7 +690,13 @@
     if (!d) return '<span style="color:var(--muted)">—</span>';
     if (d.type === '0x13') return `Battery: <b>${d.battery}%</b>`;
     if (d.type === '0x22') return `MAC: <b>${d.mac}</b>`;
-    if (d.type === '0x28') return `HR: <b>${d.heartRate}bpm</b> &nbsp; SpO2: <b>${d.spo2}%</b> &nbsp; Temp: <b>${d.temperature}°C</b>`;
+    if (d.type === '0x28') {
+      const view = p.mergedHealth || d;
+      const hr = view.heartRate > 0 ? view.heartRate + 'bpm' : '—';
+      const spo2 = view.spo2 > 0 ? view.spo2 + '%' : '—';
+      const temp = view.temperature > 0 ? view.temperature + '°C' : '—';
+      return `HR: <b>${hr}</b> &nbsp; SpO2: <b>${spo2}</b> &nbsp; Temp: <b>${temp}</b>`;
+    }
     if (d.type === '0x09') return `Steps: <b>${(d.steps||0).toLocaleString()}</b> &nbsp; HR: <b>${d.heartRate}bpm</b> &nbsp; SpO2: <b>${d.spo2}%</b>`;
     return JSON.stringify(d).slice(0, 80);
   }

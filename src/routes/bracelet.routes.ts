@@ -1,6 +1,10 @@
 import type { FastifyInstance } from "fastify";
 import { ZodError } from "zod";
-import { listPackets, savePacket } from "../repositories/packet.repository.js";
+import {
+  getMergedHealthForDevice,
+  listPackets,
+  savePacket,
+} from "../repositories/packet.repository.js";
 import { packetPayloadSchema } from "../schemas/packet.schema.js";
 import {
   getPacketRouteSchema,
@@ -67,6 +71,11 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
         decoded,
       });
 
+      const mergedHealth =
+        decoded.type === "0x28" || decoded.type === "0x56"
+          ? await getMergedHealthForDevice(payload.deviceMac)
+          : null;
+
       const response = {
         id: saved.id,
         deviceMac: payload.deviceMac,
@@ -75,6 +84,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
         bytes,
         crcValid: true,
         decoded,
+        mergedHealth,
         savedAt: saved.createdAt,
       };
 

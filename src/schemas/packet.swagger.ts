@@ -50,6 +50,11 @@ export const packetSuccessResponseSchema = {
     },
     crcValid: { type: "boolean" },
     decoded: decodedSchema,
+    mergedHealth: {
+      ...decodedSchema,
+      nullable: true,
+      description: "Leitura 0x28/0x56 combinada do mesmo ciclo (últimos 5 min)",
+    },
     savedAt: { type: "string", example: "2026-05-25 14:30:00" },
   },
 };
@@ -69,6 +74,7 @@ const savedPacketSchema = {
     },
     crcValid: { type: "boolean" },
     decoded: { ...decodedSchema, nullable: true },
+    mergedHealth: { ...decodedSchema, nullable: true },
     decodeError: { type: "string", nullable: true },
     createdAt: { type: "string" },
   },

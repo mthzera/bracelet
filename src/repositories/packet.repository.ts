@@ -1,6 +1,13 @@
 import { getPool } from "../database/db.js";
 import type { PacketPayload } from "../schemas/packet.schema.js";
-import type { DecodedPacket } from "../services/packet-decoder.service.js";
+import {
+  decodePacket,
+  mergeHealthReadings,
+  PacketDecoderError,
+  type DecodedHealth,
+  type DecodedHrvHistory,
+  type DecodedPacket,
+} from "../services/packet-decoder.service.js";
 
 export type SavePacketInput = {
   payload: PacketPayload;
@@ -19,9 +26,12 @@ export type SavedPacket = {
   bytes: number[] | null;
   crcValid: boolean;
   decoded: DecodedPacket | null;
+  mergedHealth?: DecodedHealth | null;
   decodeError: string | null;
   createdAt: string;
 };
+
+const HEALTH_MERGE_WINDOW_MS = 5 * 60 * 1000;
 
 type PacketRow = {
   id: number;
@@ -35,6 +45,58 @@ type PacketRow = {
   decode_error: string | null;
   created_at: Date;
 };
+
+function isHealthDecoded(
+  decoded: DecodedPacket | null,
+): decoded is DecodedHealth | DecodedHrvHistory {
+  return decoded?.type === "0x28" || decoded?.type === "0x56";
+}
+
+function freshDecoded(packet: SavedPacket): DecodedPacket | null {
+  if (!packet.crcValid || !packet.rawHex) return packet.decoded;
+  try {
+    return decodePacket(packet.packetType, packet.rawHex).decoded;
+  } catch (err) {
+    if (!(err instanceof PacketDecoderError)) throw err;
+    return packet.decoded;
+  }
+}
+
+function attachMergedHealth(packets: SavedPacket[]): SavedPacket[] {
+  const byDevice = new Map<string, SavedPacket[]>();
+
+  for (const packet of packets) {
+    if (packet.packetType !== "0x28" && packet.packetType !== "0x56") continue;
+    const list = byDevice.get(packet.deviceMac) ?? [];
+    list.push(packet);
+    byDevice.set(packet.deviceMac, list);
+  }
+
+  for (const devicePackets of byDevice.values()) {
+    const sorted = [...devicePackets].sort(
+      (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+    );
+
+    for (let i = 0; i < sorted.length; i++) {
+      const anchor = sorted[i]!;
+      const anchorTime = new Date(anchor.createdAt).getTime();
+      const group = sorted.filter((packet) => {
+        const delta = Math.abs(new Date(packet.createdAt).getTime() - anchorTime);
+        return delta <= HEALTH_MERGE_WINDOW_MS;
+      });
+
+      const decodedGroup = group
+        .map((packet) => freshDecoded(packet))
+        .filter(isHealthDecoded);
+
+      if (decodedGroup.length === 0) continue;
+
+      anchor.mergedHealth = mergeHealthReadings(decodedGroup);
+    }
+  }
+
+  return packets;
+}
 
 function rowToSavedPacket(row: PacketRow): SavedPacket {
   return {
@@ -101,7 +163,7 @@ export async function listPackets(limit = 50): Promise<SavedPacket[]> {
     [safeLimit],
   );
 
-  return rows.map(rowToSavedPacket);
+  return attachMergedHealth(rows.map(rowToSavedPacket));
 }
 
 export async function getRecentHealthPackets(
@@ -126,5 +188,20 @@ export async function getRecentHealthPackets(
     [deviceMac, safeLimit],
   );
 
-  return rows.map(rowToSavedPacket);
+  return attachMergedHealth(rows.map(rowToSavedPacket));
+}
+
+export async function getMergedHealthForDevice(
+  deviceMac: string,
+  windowMinutes = 5,
+): Promise<DecodedHealth | null> {
+  const recent = await getRecentHealthPackets(deviceMac, 12);
+  const cutoff = Date.now() - windowMinutes * 60 * 1000;
+  const decoded = recent
+    .filter((packet) => new Date(packet.createdAt).getTime() >= cutoff)
+    .map((packet) => freshDecoded(packet))
+    .filter(isHealthDecoded);
+
+  if (decoded.length === 0) return null;
+  return mergeHealthReadings(decoded);
 }

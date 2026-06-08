@@ -200,6 +200,16 @@ export function healthMeasurementMode(typeByte: number): HealthMeasurementMode {
   }
 }
 
+function isPlausibleBloodPressure(systolic: number, diastolic: number): boolean {
+  return (
+    systolic > 0 &&
+    diastolic > 0 &&
+    systolic < 250 &&
+    diastolic < 200 &&
+    systolic > diastolic
+  );
+}
+
 function decodeBloodPressure(bytes: number[]): {
   systolicPressure: number;
   diastolicPressure: number;
@@ -213,7 +223,15 @@ function decodeBloodPressure(bytes: number[]): {
     bytes[4] === 0x4a &&
     bytes[5] === 0x0d;
 
-  if (isCalibrationPlaceholder || (systolic === 0 && diastolic === 0)) {
+  /** Valor fixo observado na 2208A em quase todo notify — não é leitura real. */
+  const isStaleBraceletBp = systolic === 0x75 && diastolic === 0x44;
+
+  if (
+    isCalibrationPlaceholder ||
+    isStaleBraceletBp ||
+    (systolic === 0 && diastolic === 0) ||
+    !isPlausibleBloodPressure(systolic, diastolic)
+  ) {
     return { systolicPressure: 0, diastolicPressure: 0 };
   }
 
@@ -236,23 +254,110 @@ function decodeHealth(bytes: number[]): DecodedHealth {
     throw new PacketDecoderError("Health packet (0x28) requires at least 10 bytes");
   }
 
-  const temperatureRaw = bytes[8] | (bytes[9] << 8);
-  const { systolicPressure, diastolicPressure } = decodeBloodPressure(bytes);
-
   const measurementType = bytes[1];
+  const measurementMode = healthMeasurementMode(measurementType);
+  const temperatureRaw = bytes[8] | (bytes[9] << 8);
+  const temperature = temperatureRaw > 0 ? temperatureRaw / 10 : 0;
+
+  let heartRate = 0;
+  let spo2 = 0;
+  let hrv = 0;
+  let fatigue = 0;
+  let systolicPressure = 0;
+  let diastolicPressure = 0;
+
+  switch (measurementType) {
+    case 0x01: {
+      if (bytes[4] > 0) hrv = bytes[4];
+      if (bytes[5] > 0) fatigue = bytes[5];
+      break;
+    }
+    case 0x02: {
+      if (bytes[2] > 0) heartRate = bytes[2];
+      if (heartRate > 0) {
+        const bp = decodeBloodPressure(bytes);
+        systolicPressure = bp.systolicPressure;
+        diastolicPressure = bp.diastolicPressure;
+      }
+      break;
+    }
+    case 0x03: {
+      if (bytes[3] > 0) spo2 = bytes[3];
+      if (bytes[2] > 0) heartRate = bytes[2];
+      break;
+    }
+    case 0x04: {
+      break;
+    }
+    case 0x05: {
+      const bp = decodeBloodPressure(bytes);
+      systolicPressure = bp.systolicPressure;
+      diastolicPressure = bp.diastolicPressure;
+      break;
+    }
+    default: {
+      if (bytes[2] > 0) heartRate = bytes[2];
+      if (bytes[3] > 0) spo2 = bytes[3];
+      if (bytes[4] > 0) hrv = bytes[4];
+      if (bytes[5] > 0) fatigue = bytes[5];
+      const bp = decodeBloodPressure(bytes);
+      systolicPressure = bp.systolicPressure;
+      diastolicPressure = bp.diastolicPressure;
+    }
+  }
 
   return {
     type: "0x28",
     measurementType,
-    measurementMode: healthMeasurementMode(measurementType),
-    heartRate: bytes[2],
-    spo2: bytes[3],
-    hrv: bytes[4],
-    fatigue: bytes[5],
+    measurementMode,
+    heartRate,
+    spo2,
+    hrv,
+    fatigue,
     systolicPressure,
     diastolicPressure,
-    temperature: temperatureRaw / 10,
+    temperature,
   };
+}
+
+function pickPositive(current: number, next: number): number {
+  return next > 0 ? next : current;
+}
+
+/** Combina leituras parciais 0x28/0x56 do mesmo ciclo de medição. */
+export function mergeHealthReadings(
+  decodedList: Array<DecodedHealth | DecodedHrvHistory>,
+): DecodedHealth {
+  const merged: DecodedHealth = {
+    type: "0x28",
+    measurementType: 0,
+    measurementMode: "unknown",
+    heartRate: 0,
+    spo2: 0,
+    hrv: 0,
+    fatigue: 0,
+    systolicPressure: 0,
+    diastolicPressure: 0,
+    temperature: 0,
+  };
+
+  for (const decoded of decodedList) {
+    if (decoded.type === "0x56") {
+      merged.hrv = pickPositive(merged.hrv, decoded.hrv);
+      merged.fatigue = pickPositive(merged.fatigue, decoded.fatigue);
+      continue;
+    }
+
+    merged.heartRate = pickPositive(merged.heartRate, decoded.heartRate);
+    merged.spo2 = pickPositive(merged.spo2, decoded.spo2);
+    merged.hrv = pickPositive(merged.hrv, decoded.hrv);
+    merged.fatigue = pickPositive(merged.fatigue, decoded.fatigue);
+    merged.systolicPressure = pickPositive(merged.systolicPressure, decoded.systolicPressure);
+    merged.diastolicPressure = pickPositive(merged.diastolicPressure, decoded.diastolicPressure);
+    merged.temperature = pickPositive(merged.temperature, decoded.temperature);
+  }
+
+  return merged;
 }
 
 function decodeRealtime(bytes: number[]): DecodedRealtime {

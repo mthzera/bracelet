@@ -4,39 +4,30 @@ import {
 } from "../repositories/clinical-alerts.repository.js";
 import { getRecentHealthPackets } from "../repositories/packet.repository.js";
 import type { PacketPayload } from "../schemas/packet.schema.js";
-import type { DecodedHealth, DecodedHrvHistory } from "../services/packet-decoder.service.js";
+import {
+  mergeHealthReadings,
+  type DecodedHealth,
+  type DecodedHrvHistory,
+} from "../services/packet-decoder.service.js";
 import {
   evaluateClinicalAlerts,
   vitalsFromDecodedHealth,
 } from "../services/clinical-alerts.service.js";
 import type { VitalsInput } from "../types/clinical-alerts.types.js";
 
-function pickNonZero(current: number, next: number): number {
-  return next > 0 ? next : current;
-}
-
-export function mergeVitalsFromHealthPackets(decodedList: DecodedHealth[]): VitalsInput {
-  const merged: VitalsInput = {
-    heartRate: 0,
-    systolic: 0,
-    diastolic: 0,
-    temperature: 0,
-    spo2: 0,
-    hrv: 0,
-    fatigue: 0,
+export function mergeVitalsFromHealthPackets(
+  decodedList: Array<DecodedHealth | DecodedHrvHistory>,
+): VitalsInput {
+  const merged = mergeHealthReadings(decodedList);
+  return {
+    heartRate: merged.heartRate,
+    systolic: merged.systolicPressure,
+    diastolic: merged.diastolicPressure,
+    temperature: merged.temperature,
+    spo2: merged.spo2,
+    hrv: merged.hrv,
+    fatigue: merged.fatigue,
   };
-
-  for (const d of decodedList) {
-    merged.heartRate = pickNonZero(merged.heartRate, d.heartRate);
-    merged.spo2 = pickNonZero(merged.spo2, d.spo2);
-    merged.hrv = pickNonZero(merged.hrv, d.hrv);
-    merged.fatigue = pickNonZero(merged.fatigue, d.fatigue);
-    merged.systolic = pickNonZero(merged.systolic, d.systolicPressure);
-    merged.diastolic = pickNonZero(merged.diastolic, d.diastolicPressure);
-    merged.temperature = pickNonZero(merged.temperature, d.temperature);
-  }
-
-  return merged;
 }
 
 function parseBloodPressure(value: string): { systolic: number; diastolic: number } {
@@ -112,7 +103,7 @@ export async function processClinicalAlertsFromRecentPackets(
   const recent = await getRecentHealthPackets(deviceMac, 12);
   const healthDecoded = recent
     .map((p) => p.decoded)
-    .filter((d): d is DecodedHealth => d?.type === "0x28");
+    .filter((d): d is DecodedHealth | DecodedHrvHistory => d?.type === "0x28" || d?.type === "0x56");
 
   if (healthDecoded.length === 0) return;
 
