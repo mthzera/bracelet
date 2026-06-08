@@ -62,6 +62,16 @@ bool capturedPressure = false;
  
  int readPhase = -1;
  unsigned long lastScanCmd = 0;
+
+struct VitalsMerge {
+  uint8_t heartRate;
+  uint8_t spo2;
+  uint8_t hrv;
+  uint8_t fatigue;
+  uint8_t sys;
+  uint8_t dia;
+  uint16_t tempRaw;
+};
  
  uint8_t calcCrc(uint8_t* p) {
    uint16_t s = 0;
@@ -454,16 +464,6 @@ void patchHeartSlotPressure(uint8_t sys, uint8_t dia) {
    advancePhase();
  }
  
-typedef struct {
-  uint8_t heartRate;
-  uint8_t spo2;
-  uint8_t hrv;
-  uint8_t fatigue;
-  uint8_t sys;
-  uint8_t dia;
-  uint16_t tempRaw;
-} VitalsMerge;
-
 void absorbPacket(VitalsMerge* m, uint8_t* data) {
   uint16_t tempRaw = (uint16_t)data[8] | ((uint16_t)data[9] << 8);
   if (tempRaw > 0) m->tempRaw = tempRaw;

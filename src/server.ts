@@ -24,6 +24,12 @@ async function main(): Promise<void> {
 
   const app = Fastify({
     logger: true,
+    ajv: {
+      customOptions: {
+        // OpenAPI usa `example`; AJV strict não reconhece essa keyword.
+        strict: false,
+      },
+    },
   });
 
   app.addHook("onClose", async () => {
