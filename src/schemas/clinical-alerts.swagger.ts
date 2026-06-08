@@ -44,6 +44,7 @@ export const clinicalAssessmentResponseSchema = {
     "overallStatus",
     "severity",
     "baseline",
+    "news2",
     "disclaimer",
     "createdAt",
   ],
@@ -74,7 +75,7 @@ export const clinicalAssessmentResponseSchema = {
     },
     alerts: { type: "array", items: alertItemSchema },
     notes: { type: "array", items: { type: "string" } },
-    riskScore: { type: "integer", example: 12 },
+    riskScore: { type: "integer", example: 3, description: "Pontuação total NEWS 2 parcial" },
     overallStatus: {
       type: "string",
       enum: ["STABLE", "ATTENTION", "ALERT", "CRITICAL"],
@@ -82,6 +83,32 @@ export const clinicalAssessmentResponseSchema = {
     },
     severity: { type: "string", enum: ["LOW", "MEDIUM", "HIGH", "CRITICAL"], example: "LOW" },
     baseline: { type: "object", additionalProperties: true },
+    news2: {
+      type: "object",
+      properties: {
+        totalScore: { type: "integer", example: 3 },
+        maxPossibleScore: { type: "integer", example: 12 },
+        responseLevel: {
+          type: "string",
+          enum: ["routine", "low", "medium", "urgent", "emergency"],
+          example: "medium",
+        },
+        components: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              parameter: { type: "string" },
+              label: { type: "string" },
+              score: { type: "integer", minimum: 0, maximum: 3 },
+              value: { type: "number" },
+              unit: { type: "string" },
+            },
+          },
+        },
+        unavailableParameters: { type: "array", items: { type: "string" } },
+      },
+    },
     disclaimer: { type: "string" },
     createdAt: { type: "string" },
   },
@@ -102,7 +129,7 @@ export const clinicalAlertsCatalogResponseSchema = {
   type: "object",
   required: ["version", "disclaimer", "alertTypes", "parameters"],
   properties: {
-    version: { type: "string", example: "1.0.0" },
+    version: { type: "string", example: "2.0.0" },
     disclaimer: { type: "string" },
     alertTypes: {
       type: "array",

@@ -1,96 +1,90 @@
 import type { AlertSeverity, ClinicalAlertType, OverallStatus } from "../types/clinical-alerts.types.js";
+import { NEWS2_RESPONSE_LEVELS } from "./news2.catalog.js";
 
 export const CLINICAL_DISCLAIMER =
-  "Triagem por tendência — não substitui diagnóstico clínico. Valores de pulseira podem variar por movimento, circulação e pigmentação da pele.";
+  "Triagem por NEWS 2 (versão brasileira) — parcial, pois a pulseira não mede frequência respiratória, consciência nem oxigênio suplementar. Não substitui diagnóstico clínico.";
 
 export type AlertTypeCatalogEntry = {
   type: ClinicalAlertType;
   label: string;
-  category: "heart_rate" | "blood_pressure" | "spo2" | "temperature" | "hrv" | "fatigue" | "combined";
+  category: "heart_rate" | "blood_pressure" | "spo2" | "temperature" | "hrv" | "fatigue" | "combined" | "news2";
   severities: AlertSeverity[];
   description: string;
 };
 
 export const CLINICAL_ALERT_TYPES: AlertTypeCatalogEntry[] = [
-  { type: "BRADICARDIA_LEVE", label: "Bradicardia leve", category: "heart_rate", severities: ["LOW"], description: "FC 45–49 bpm em repouso" },
-  { type: "TAQUICARDIA_LEVE", label: "Taquicardia leve", category: "heart_rate", severities: ["LOW"], description: "FC 101–119 bpm em repouso (2+ leituras)" },
-  { type: "FC_ALERTA", label: "FC em alerta", category: "heart_rate", severities: ["HIGH"], description: "FC <45 ou 120–139 bpm em repouso (2+ leituras)" },
-  { type: "FC_CRITICA", label: "FC crítica", category: "heart_rate", severities: ["CRITICAL"], description: "FC <40 ou ≥140 bpm em repouso" },
-  { type: "PA_ELEVADA", label: "Pressão elevada", category: "blood_pressure", severities: ["LOW"], description: "Sistólica 120–129 e diastólica <80" },
-  { type: "PA_ESTAGIO_1", label: "Hipertensão estágio 1", category: "blood_pressure", severities: ["MEDIUM"], description: "Sistólica ≥130 ou diastólica ≥80" },
-  { type: "PA_ESTAGIO_2", label: "Hipertensão estágio 2", category: "blood_pressure", severities: ["HIGH"], description: "Sistólica ≥140 ou diastólica ≥90 (2+ leituras)" },
-  { type: "PA_CRITICA", label: "Pressão crítica", category: "blood_pressure", severities: ["CRITICAL"], description: "Sistólica >180 ou diastólica >120" },
-  { type: "SPO2_ATENCAO", label: "SpO₂ em atenção", category: "spo2", severities: ["LOW"], description: "SpO₂ 93–94%" },
-  { type: "SPO2_BAIXA", label: "SpO₂ baixa", category: "spo2", severities: ["HIGH"], description: "SpO₂ 90–92% ou queda ≥4 p.p. vs basal" },
-  { type: "SPO2_CRITICA", label: "SpO₂ crítica", category: "spo2", severities: ["CRITICAL"], description: "SpO₂ <90% ou ≤92% em 2 leituras" },
-  { type: "TEMP_ELEVADA", label: "Temperatura elevada", category: "temperature", severities: ["LOW"], description: "37,5–37,9 °C (pele/punho)" },
-  { type: "FEBRE", label: "Febre", category: "temperature", severities: ["MEDIUM"], description: "38,0–38,9 °C" },
-  { type: "FEBRE_ALTA", label: "Febre alta", category: "temperature", severities: ["HIGH", "CRITICAL"], description: "≥39,0 °C (crítico se ≥39,5)" },
-  { type: "TEMP_BAIXA", label: "Temperatura baixa", category: "temperature", severities: ["MEDIUM"], description: "<35,5 °C" },
-  { type: "HRV_ATENCAO", label: "HRV abaixo do basal", category: "hrv", severities: ["LOW"], description: "Queda 15–25% vs baseline (requer calibração)" },
-  { type: "HRV_ALERTA", label: "Queda de HRV", category: "hrv", severities: ["MEDIUM", "HIGH"], description: "Queda 25–40%+ vs baseline" },
-  { type: "HRV_CRITICO_FUNCIONAL", label: "Estresse fisiológico", category: "hrv", severities: ["HIGH"], description: "HRV >40% abaixo + FC +10 bpm + fadiga alta" },
-  { type: "FADIGA_MODERADA", label: "Fadiga moderada", category: "fatigue", severities: ["LOW"], description: "Fadiga 40–59%" },
-  { type: "FADIGA_ALTA", label: "Fadiga alta", category: "fatigue", severities: ["MEDIUM"], description: "Fadiga 60–79%" },
-  { type: "FADIGA_CRITICA_FUNCIONAL", label: "Fadiga muito alta", category: "fatigue", severities: ["HIGH"], description: "Fadiga ≥80%" },
-  { type: "POSSIVEL_FADIGA_FISIOLOGICA", label: "Possível fadiga fisiológica", category: "combined", severities: ["MEDIUM"], description: "HRV −25% + fadiga ≥60% + FC +10 bpm vs basal" },
-  { type: "POSSIVEL_ESTRESSE_INFECCIOSO", label: "Possível quadro febril", category: "combined", severities: ["MEDIUM"], description: "Temp ≥37,8 + FC +10 bpm + HRV −20%" },
-  { type: "POSSIVEL_RISCO_RESPIRATORIO", label: "Possível risco respiratório", category: "combined", severities: ["HIGH"], description: "SpO₂ baixa/queda + FC ≥100 em repouso" },
-  { type: "POSSIVEL_ESTRESSE_CARDIOVASCULAR", label: "Possível estresse cardiovascular", category: "combined", severities: ["HIGH"], description: "PA ≥140/90 + FC ≥100 + HRV −25%" },
-  { type: "ALERTA_CRITICO", label: "Alerta crítico imediato", category: "combined", severities: ["CRITICAL"], description: "SpO₂ <90, PA >180/120, FC ≥140 repouso ou temp ≥39,5" },
+  { type: "BRADICARDIA_LEVE", label: "Bradicardia leve", category: "heart_rate", severities: ["LOW"], description: "NEWS 2 Pulso = 1 (41–50 bpm)" },
+  { type: "TAQUICARDIA_LEVE", label: "Pulso levemente elevado", category: "heart_rate", severities: ["LOW"], description: "NEWS 2 Pulso = 1 (91–110 bpm)" },
+  { type: "FC_ALERTA", label: "Pulso elevado", category: "heart_rate", severities: ["MEDIUM"], description: "NEWS 2 Pulso = 2 (111–130 bpm)" },
+  { type: "FC_CRITICA", label: "Pulso crítico", category: "heart_rate", severities: ["HIGH"], description: "NEWS 2 Pulso = 3 (≤40 ou ≥131 bpm)" },
+  { type: "PA_ESTAGIO_1", label: "PAS levemente baixa", category: "blood_pressure", severities: ["LOW"], description: "NEWS 2 PAS = 1 (101–110 mmHg)" },
+  { type: "PA_ESTAGIO_2", label: "PAS baixa", category: "blood_pressure", severities: ["MEDIUM"], description: "NEWS 2 PAS = 2 (91–100 mmHg)" },
+  { type: "PA_CRITICA", label: "PAS crítica", category: "blood_pressure", severities: ["HIGH"], description: "NEWS 2 PAS = 3 (≤90 ou ≥220 mmHg)" },
+  { type: "SPO2_ATENCAO", label: "SpO₂ levemente reduzida", category: "spo2", severities: ["LOW"], description: "NEWS 2 SpO₂ Escala 1 = 1 (94–95%)" },
+  { type: "SPO2_BAIXA", label: "SpO₂ baixa", category: "spo2", severities: ["MEDIUM"], description: "NEWS 2 SpO₂ Escala 1 = 2 (92–93%)" },
+  { type: "SPO2_CRITICA", label: "SpO₂ crítica", category: "spo2", severities: ["HIGH"], description: "NEWS 2 SpO₂ Escala 1 = 3 (≤91%)" },
+  { type: "TEMP_ELEVADA", label: "Temperatura levemente baixa", category: "temperature", severities: ["LOW"], description: "NEWS 2 Temperatura = 1 (35,1–36,0 °C)" },
+  { type: "FEBRE", label: "Febre leve", category: "temperature", severities: ["LOW"], description: "NEWS 2 Temperatura = 1 (38,1–39,0 °C)" },
+  { type: "FEBRE_ALTA", label: "Temperatura muito elevada", category: "temperature", severities: ["MEDIUM"], description: "NEWS 2 Temperatura = 2 (≥39,1 °C)" },
+  { type: "TEMP_BAIXA", label: "Hipotermia", category: "temperature", severities: ["HIGH"], description: "NEWS 2 Temperatura = 3 (≤35,0 °C)" },
+  { type: "NEWS2_RESPOSTA_URGENTE", label: "NEWS 2 — resposta urgente", category: "news2", severities: ["HIGH"], description: "Pontuação 5–6 ou parâmetro isolado com pontuação 3" },
+  { type: "NEWS2_RESPOSTA_EMERGENCIA", label: "NEWS 2 — emergência", category: "news2", severities: ["CRITICAL"], description: "Pontuação total ≥ 7" },
 ];
 
 export const CLINICAL_PARAMETERS = {
+  scoringSystem: "NEWS2-BR",
+  news2: {
+    measurableParameters: ["pulso", "pressao_sistolica", "spo2_escala_1", "temperatura"],
+    unavailableParameters: [
+      "frequencia_respiratoria",
+      "spo2_escala_2",
+      "suplementacao_oxigenio",
+      "consciencia",
+    ],
+    pulse: {
+      score3: { max: 40, minHigh: 131 },
+      score2: { min: 111, max: 130 },
+      score1: [{ min: 41, max: 50 }, { min: 91, max: 110 }],
+      score0: { min: 51, max: 90 },
+    },
+    systolic: {
+      score3: { max: 90, minHigh: 220 },
+      score2: { min: 91, max: 100 },
+      score1: { min: 101, max: 110 },
+      score0: { min: 111, max: 219 },
+    },
+    spo2Scale1: {
+      score3: { max: 91 },
+      score2: { min: 92, max: 93 },
+      score1: { min: 94, max: 95 },
+      score0: { min: 96 },
+    },
+    temperature: {
+      score3: { max: 35.0 },
+      score1Low: { min: 35.1, max: 36.0 },
+      score0: { min: 36.1, max: 38.0 },
+      score1High: { min: 38.1, max: 39.0 },
+      score2: { min: 39.1 },
+    },
+    responseLevels: NEWS2_RESPONSE_LEVELS,
+  },
   baseline: {
     minRestingSamples: 5,
     calibrationDays: 7,
-    hrvDeviationPercent: { normal: 15, attention: 25, alert: 40 },
-  },
-  persistence: {
-    consecutiveReadings: 2,
-  },
-  heartRateResting: {
-    normal: { min: 50, max: 100 },
-    bradycardiaMild: { min: 45, max: 49 },
-    tachycardiaMild: { min: 101, max: 119 },
-    alert: { below: 45, highMin: 120, highMax: 139 },
-    critical: { below: 40, from: 140 },
-  },
-  bloodPressure: {
-    elevated: { systolicMin: 120, systolicMax: 129, diastolicMax: 79 },
-    stage1: { systolicMin: 130, diastolicMin: 80 },
-    stage2: { systolicMin: 140, diastolicMin: 90 },
-    critical: { systolicAbove: 180, diastolicAbove: 120 },
-  },
-  spo2: {
-    normalFrom: 95,
-    attention: { min: 93, max: 94 },
-    low: { min: 90, max: 92 },
-    criticalBelow: 90,
-    baselineDropPoints: 4,
-  },
-  temperature: {
-    normal: { min: 35.8, max: 37.4 },
-    elevated: { min: 37.5, max: 37.9 },
-    fever: { min: 38.0, max: 38.9 },
-    highFeverFrom: 39.0,
-    criticalFrom: 39.5,
-    lowBelow: 35.5,
-  },
-  fatigue: {
-    low: { max: 39 },
-    moderate: { min: 40, max: 59 },
-    high: { min: 60, max: 79 },
-    criticalFrom: 80,
+    note: "Baseline usado apenas para notas de HRV; alertas seguem NEWS 2 absoluto.",
   },
   overallStatus: ["STABLE", "ATTENTION", "ALERT", "CRITICAL"] as OverallStatus[],
   severity: ["LOW", "MEDIUM", "HIGH", "CRITICAL"] as AlertSeverity[],
-  riskScore: { min: 0, max: 100 },
+  riskScore: {
+    min: 0,
+    max: 12,
+    description: "Pontuação total NEWS 2 parcial (4 parâmetros × 3 pontos).",
+  },
 };
 
 export function getClinicalAlertsCatalog() {
   return {
-    version: "1.0.0",
+    version: "2.0.0",
     disclaimer: CLINICAL_DISCLAIMER,
     alertTypes: CLINICAL_ALERT_TYPES,
     parameters: CLINICAL_PARAMETERS,

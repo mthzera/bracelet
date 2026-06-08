@@ -30,7 +30,13 @@ export type ClinicalAlertType =
   | "POSSIVEL_ESTRESSE_INFECCIOSO"
   | "POSSIVEL_RISCO_RESPIRATORIO"
   | "POSSIVEL_ESTRESSE_CARDIOVASCULAR"
-  | "ALERTA_CRITICO";
+  | "ALERTA_CRITICO"
+  | "NEWS2_RESPOSTA_URGENTE"
+  | "NEWS2_RESPOSTA_EMERGENCIA";
+
+import type { News2Assessment } from "../config/news2.catalog.js";
+
+export type { News2Assessment };
 
 export type VitalsInput = {
   heartRate: number;
@@ -75,6 +81,7 @@ export type ClinicalAssessment = {
   overallStatus: OverallStatus;
   severity: AlertSeverity;
   baseline: PatientBaseline;
+  news2: News2Assessment;
   disclaimer: string;
 };
 

@@ -15,9 +15,23 @@ import {
   CLINICAL_PARAMETERS,
 } from "../config/clinical-alerts.catalog.js";
 
+import {
+  NEWS2_SCORE_TO_SEVERITY,
+  NEWS2_UNAVAILABLE_PARAMETERS,
+  NEWS2_RESPONSE_LEVELS,
+  type News2Assessment,
+  type News2Component,
+  type News2Score,
+  news2ResponseToOverallStatus,
+  resolveNews2ResponseLevel,
+  scoreNews2Pulse,
+  scoreNews2SpO2Scale1,
+  scoreNews2Systolic,
+  scoreNews2Temperature,
+} from "../config/news2.catalog.js";
+
 const BASELINE_MIN_SAMPLES = CLINICAL_PARAMETERS.baseline.minRestingSamples;
 const BASELINE_CALIBRATION_DAYS = CLINICAL_PARAMETERS.baseline.calibrationDays;
-const PERSISTENCE_READINGS = CLINICAL_PARAMETERS.persistence.consecutiveReadings;
 
 const DISCLAIMER = CLINICAL_DISCLAIMER;
 
@@ -84,526 +98,300 @@ function hrvDropPercent(current: number, baseline: number): number {
   return ((baseline - current) / baseline) * 100;
 }
 
-function countConsecutive(
-  history: RecentVitalsSnapshot[],
-  predicate: (v: VitalsInput) => boolean,
-  includeCurrent: boolean,
-  current: VitalsInput,
-): number {
-  let count = includeCurrent && predicate(current) ? 1 : 0;
-  for (const snap of history) {
-    if (!predicate(snap.vitals)) break;
-    count++;
-  }
-  return count;
+type ParameterAlertMapping = {
+  parameter: News2Component["parameter"];
+  score: News2Score;
+  type: ClinicalAlertType;
+  message: string;
+  reason: (value: number, score: News2Score) => string;
+};
+
+const PULSE_ALERTS: ParameterAlertMapping[] = [
+  {
+    parameter: "pulso",
+    score: 3,
+    type: "FC_CRITICA",
+    message: "Pulso fora da faixa segura (NEWS 2 = 3).",
+    reason: (v) => `Pulso ${v} bpm — NEWS 2: ≤40 ou ≥131 bpm.`,
+  },
+  {
+    parameter: "pulso",
+    score: 2,
+    type: "FC_ALERTA",
+    message: "Pulso elevado (NEWS 2 = 2).",
+    reason: (v) => `Pulso ${v} bpm — NEWS 2: 111–130 bpm.`,
+  },
+];
+
+const SYSTOLIC_ALERTS: ParameterAlertMapping[] = [
+  {
+    parameter: "pressao_sistolica",
+    score: 3,
+    type: "PA_CRITICA",
+    message: "Pressão sistólica crítica (NEWS 2 = 3).",
+    reason: (v) => `PAS ${v} mmHg — NEWS 2: ≤90 ou ≥220 mmHg.`,
+  },
+  {
+    parameter: "pressao_sistolica",
+    score: 2,
+    type: "PA_ESTAGIO_2",
+    message: "Pressão sistólica baixa (NEWS 2 = 2).",
+    reason: (v) => `PAS ${v} mmHg — NEWS 2: 91–100 mmHg.`,
+  },
+  {
+    parameter: "pressao_sistolica",
+    score: 1,
+    type: "PA_ESTAGIO_1",
+    message: "Pressão sistólica levemente baixa (NEWS 2 = 1).",
+    reason: (v) => `PAS ${v} mmHg — NEWS 2: 101–110 mmHg.`,
+  },
+];
+
+const SPO2_ALERTS: ParameterAlertMapping[] = [
+  {
+    parameter: "spo2",
+    score: 3,
+    type: "SPO2_CRITICA",
+    message: "SpO₂ crítica (NEWS 2 = 3).",
+    reason: (v) => `SpO₂ ${v}% — NEWS 2 Escala 1: ≤91%.`,
+  },
+  {
+    parameter: "spo2",
+    score: 2,
+    type: "SPO2_BAIXA",
+    message: "SpO₂ baixa (NEWS 2 = 2).",
+    reason: (v) => `SpO₂ ${v}% — NEWS 2 Escala 1: 92–93%.`,
+  },
+  {
+    parameter: "spo2",
+    score: 1,
+    type: "SPO2_ATENCAO",
+    message: "SpO₂ levemente reduzida (NEWS 2 = 1).",
+    reason: (v) => `SpO₂ ${v}% — NEWS 2 Escala 1: 94–95%.`,
+  },
+];
+
+const TEMPERATURE_ALERTS: ParameterAlertMapping[] = [
+  {
+    parameter: "temperatura",
+    score: 3,
+    type: "TEMP_BAIXA",
+    message: "Hipotermia (NEWS 2 = 3).",
+    reason: (v) => `Temperatura ${v} °C — NEWS 2: ≤35,0 °C.`,
+  },
+  {
+    parameter: "temperatura",
+    score: 2,
+    type: "FEBRE_ALTA",
+    message: "Temperatura muito elevada (NEWS 2 = 2).",
+    reason: (v) => `Temperatura ${v} °C — NEWS 2: ≥39,1 °C.`,
+  },
+];
+
+const PARAMETER_ALERTS: ParameterAlertMapping[] = [
+  ...PULSE_ALERTS,
+  ...SYSTOLIC_ALERTS,
+  ...SPO2_ALERTS,
+  ...TEMPERATURE_ALERTS,
+];
+
+function buildNews2Components(vitals: VitalsInput): News2Component[] {
+  const scorers: Array<{
+    parameter: News2Component["parameter"];
+    label: string;
+    unit: string;
+    value: number;
+    score: News2Score | null;
+  }> = [
+    {
+      parameter: "pulso",
+      label: "Pulso",
+      unit: "bpm",
+      value: vitals.heartRate,
+      score: scoreNews2Pulse(vitals.heartRate),
+    },
+    {
+      parameter: "pressao_sistolica",
+      label: "Pressão arterial sistólica",
+      unit: "mmHg",
+      value: vitals.systolic,
+      score: scoreNews2Systolic(vitals.systolic),
+    },
+    {
+      parameter: "spo2",
+      label: "SpO₂ (Escala 1)",
+      unit: "%",
+      value: vitals.spo2,
+      score: scoreNews2SpO2Scale1(vitals.spo2),
+    },
+    {
+      parameter: "temperatura",
+      label: "Temperatura",
+      unit: "°C",
+      value: vitals.temperature,
+      score: scoreNews2Temperature(vitals.temperature),
+    },
+  ];
+
+  return scorers
+    .filter((s): s is typeof s & { score: News2Score } => s.score != null)
+    .map((s) => ({
+      parameter: s.parameter,
+      label: s.label,
+      score: s.score,
+      value: s.value,
+      unit: s.unit,
+    }));
 }
 
-function evaluateHeartRate(
-  vitals: VitalsInput,
-  context: VitalsContext,
-  history: RecentVitalsSnapshot[],
+function computeNews2Assessment(vitals: VitalsInput): News2Assessment {
+  const components = buildNews2Components(vitals);
+  const totalScore = components.reduce((sum, c) => sum + c.score, 0);
+  const maxComponentScore = components.reduce<News2Score>(
+    (max, c) => (c.score > max ? c.score : max),
+    0,
+  );
+  const responseLevel = resolveNews2ResponseLevel(totalScore, maxComponentScore);
+
+  return {
+    totalScore,
+    maxPossibleScore: 4 * 3,
+    components,
+    unavailableParameters: [...NEWS2_UNAVAILABLE_PARAMETERS],
+    responseLevel,
+  };
+}
+
+function addTemperatureScore1Alert(component: News2Component, alerts: ClinicalAlert[]): void {
+  const isLow = component.value <= 36.0;
+  addAlert(
+    alerts,
+    isLow ? "TEMP_ELEVADA" : "FEBRE",
+    "LOW",
+    isLow ? "Temperatura levemente baixa (NEWS 2 = 1)." : "Febre leve (NEWS 2 = 1).",
+    isLow
+      ? `Temperatura ${component.value} °C — NEWS 2: 35,1–36,0 °C.`
+      : `Temperatura ${component.value} °C — NEWS 2: 38,1–39,0 °C.`,
+  );
+}
+
+function addPulseScore1Alert(component: News2Component, alerts: ClinicalAlert[]): void {
+  const isBradycardia = component.value <= 50;
+  addAlert(
+    alerts,
+    isBradycardia ? "BRADICARDIA_LEVE" : "TAQUICARDIA_LEVE",
+    "LOW",
+    isBradycardia
+      ? "Bradicardia leve (NEWS 2 = 1)."
+      : "Pulso levemente elevado (NEWS 2 = 1).",
+    isBradycardia
+      ? `Pulso ${component.value} bpm — NEWS 2: 41–50 bpm.`
+      : `Pulso ${component.value} bpm — NEWS 2: 91–110 bpm.`,
+  );
+}
+
+function addParameterAlerts(
+  components: News2Component[],
   alerts: ClinicalAlert[],
   notes: string[],
 ): void {
-  const hr = vitals.heartRate;
-  const resting = context.isResting !== false;
-
-  if (hr <= 0) {
-    notes.push("FC ausente ou inválida na leitura.");
-    return;
-  }
-
-  if (!resting) {
-    notes.push("FC avaliada sem flag de repouso — limites de repouso não aplicados.");
-    if (hr >= 140) {
-      addAlert(
-        alerts,
-        "FC_CRITICA",
-        "CRITICAL",
-        "Frequência cardíaca muito elevada.",
-        `FC ${hr} bpm (atividade ou repouso não confirmado).`,
-      );
+  for (const component of components) {
+    if (component.score === 0) {
+      notes.push(`${component.label}: ${component.value} ${component.unit} (NEWS 2 = 0).`);
+      continue;
     }
-    return;
-  }
 
-  if (hr < 40) {
+    if (component.parameter === "pulso" && component.score === 1) {
+      addPulseScore1Alert(component, alerts);
+      continue;
+    }
+
+    if (component.parameter === "temperatura" && component.score === 1) {
+      addTemperatureScore1Alert(component, alerts);
+      continue;
+    }
+
+    const mapping = PARAMETER_ALERTS.find(
+      (m) => m.parameter === component.parameter && m.score === component.score,
+    );
+    if (!mapping) continue;
+
+    const severity = NEWS2_SCORE_TO_SEVERITY[component.score];
+    if (!severity) continue;
+
     addAlert(
       alerts,
-      "FC_CRITICA",
-      "CRITICAL",
-      "Bradicardia crítica em repouso.",
-      `FC ${hr} bpm < 40.`,
+      mapping.type,
+      severity,
+      mapping.message,
+      mapping.reason(component.value, component.score),
     );
-    return;
-  }
-
-  if (hr >= 140) {
-    addAlert(
-      alerts,
-      "FC_CRITICA",
-      "CRITICAL",
-      "Taquicardia crítica em repouso.",
-      `FC ${hr} bpm ≥ 140 em repouso.`,
-    );
-    return;
-  }
-
-  const lowAlert = (v: VitalsInput) => v.heartRate < 45;
-  const lowAttention = (v: VitalsInput) => v.heartRate >= 45 && v.heartRate <= 49;
-  const highAttention = (v: VitalsInput) => v.heartRate >= 101 && v.heartRate <= 119;
-  const highAlert = (v: VitalsInput) => v.heartRate >= 120 && v.heartRate <= 139;
-
-  if (hr >= 50 && hr <= 100) {
-    notes.push(`FC ${hr} bpm normal em repouso.`);
-    return;
-  }
-
-  if (lowAttention({ heartRate: hr } as VitalsInput) || hr < 45) {
-    if (hr < 45) {
-      const streak = countConsecutive(history, lowAlert, true, vitals);
-      if (streak >= PERSISTENCE_READINGS) {
-        addAlert(
-          alerts,
-          "FC_ALERTA",
-          "HIGH",
-          "Bradicardia em repouso — monitorar.",
-          `FC ${hr} bpm < 45 por ${streak} leitura(s).`,
-        );
-      }
-    } else {
-      addAlert(
-        alerts,
-        "BRADICARDIA_LEVE",
-        "LOW",
-        "FC levemente baixa em repouso.",
-        `FC ${hr} bpm (45–49).`,
-      );
-    }
-    return;
-  }
-
-  if (highAttention({ heartRate: hr } as VitalsInput)) {
-    const streak = countConsecutive(history, highAttention, true, vitals);
-    if (streak >= PERSISTENCE_READINGS) {
-      addAlert(
-        alerts,
-        "TAQUICARDIA_LEVE",
-        "LOW",
-        "Taquicardia leve em repouso — verificar tendência.",
-        `FC ${hr} bpm (101–119) por ${streak} leitura(s).`,
-      );
-    } else {
-      notes.push(`FC ${hr} bpm acima do repouso ideal; aguardando confirmação.`);
-    }
-    return;
-  }
-
-  if (highAlert({ heartRate: hr } as VitalsInput)) {
-    const streak = countConsecutive(history, highAlert, true, vitals);
-    if (streak >= PERSISTENCE_READINGS) {
-      addAlert(
-        alerts,
-        "FC_ALERTA",
-        "HIGH",
-        "Taquicardia em repouso — monitorar.",
-        `FC ${hr} bpm (120–139) por ${streak} leitura(s).`,
-      );
-    }
   }
 }
 
-function evaluateBloodPressure(
-  vitals: VitalsInput,
-  history: RecentVitalsSnapshot[],
-  alerts: ClinicalAlert[],
-  notes: string[],
-): void {
-  const { systolic: sys, diastolic: dia } = vitals;
-
-  if (sys <= 0 && dia <= 0) {
-    notes.push("Pressão arterial ausente na leitura.");
-    return;
-  }
-
-  if (sys > 180 || dia > 120) {
+function addAggregateNews2Alerts(news2: News2Assessment, alerts: ClinicalAlert[]): void {
+  if (news2.responseLevel === "emergency") {
     addAlert(
       alerts,
-      "PA_CRITICA",
+      "NEWS2_RESPOSTA_EMERGENCIA",
       "CRITICAL",
-      "Pressão arterial em faixa de emergência.",
-      `Pressão ${sys}/${dia} mmHg — critério AHA severo.`,
+      "NEWS 2: resposta clínica de emergência.",
+      `Pontuação NEWS 2 = ${news2.totalScore} (≥7). ${NEWS2_RESPONSE_LEVELS.emergency.label}.`,
     );
     return;
   }
 
-  const stage2 = (v: VitalsInput) => v.systolic >= 140 || v.diastolic >= 90;
-  if (stage2(vitals)) {
-    const streak = countConsecutive(history, stage2, true, vitals);
-    if (streak >= PERSISTENCE_READINGS) {
-      addAlert(
-        alerts,
-        "PA_ESTAGIO_2",
-        "HIGH",
-        "Hipertensão estágio 2.",
-        `Pressão ${sys}/${dia} mmHg em ${streak} leitura(s).`,
-      );
-    } else {
-      addAlert(
-        alerts,
-        "PA_ESTAGIO_1",
-        "MEDIUM",
-        "Pressão elevada — confirmar segunda leitura.",
-        `Pressão ${sys}/${dia} mmHg (aguardando confirmação estágio 2).`,
-      );
-    }
-    return;
-  }
+  if (news2.responseLevel === "urgent") {
+    const reason =
+      news2.totalScore >= 5
+        ? `Pontuação NEWS 2 = ${news2.totalScore} (5–6).`
+        : `Parâmetro com pontuação 3 isolada (NEWS 2 = ${news2.totalScore}).`;
 
-  if (sys >= 130 || dia >= 80) {
     addAlert(
       alerts,
-      "PA_ESTAGIO_1",
-      "MEDIUM",
-      "Hipertensão estágio 1.",
-      `Pressão ${sys}/${dia} mmHg.`,
-    );
-    return;
-  }
-
-  if (sys >= 120 && sys <= 129 && dia < 80) {
-    addAlert(
-      alerts,
-      "PA_ELEVADA",
-      "LOW",
-      "Pressão sistólica em faixa elevada. Monitorar tendência.",
-      `Pressão ${sys}/${dia}: sistólica em faixa elevada, sem critério de urgência.`,
-    );
-    return;
-  }
-
-  if (sys > 0 || dia > 0) {
-    notes.push(`Pressão ${sys}/${dia} mmHg dentro da faixa normal ideal.`);
-  }
-}
-
-function evaluateSpO2(
-  vitals: VitalsInput,
-  baseline: PatientBaseline,
-  history: RecentVitalsSnapshot[],
-  alerts: ClinicalAlert[],
-  notes: string[],
-): void {
-  const spo2 = vitals.spo2;
-  if (spo2 <= 0) {
-    notes.push("SpO₂ ausente na leitura.");
-    return;
-  }
-
-  if (spo2 < 90) {
-    addAlert(
-      alerts,
-      "SPO2_CRITICA",
-      "CRITICAL",
-      "Saturação crítica.",
-      `SpO₂ ${spo2}% < 90%.`,
-    );
-    return;
-  }
-
-  const lowBand = (v: VitalsInput) => v.spo2 >= 90 && v.spo2 <= 92;
-  if (lowBand(vitals)) {
-    const streak = countConsecutive(history, lowBand, true, vitals);
-    if (streak >= PERSISTENCE_READINGS) {
-      addAlert(
-        alerts,
-        "SPO2_CRITICA",
-        "CRITICAL",
-        "Saturação baixa persistente.",
-        `SpO₂ ${spo2}% ≤ 92% por ${streak} leitura(s).`,
-      );
-    } else {
-      addAlert(
-        alerts,
-        "SPO2_BAIXA",
-        "HIGH",
-        "Saturação baixa — confirmar tendência.",
-        `SpO₂ ${spo2}% (90–92%).`,
-      );
-    }
-  } else if (spo2 >= 93 && spo2 <= 94) {
-    addAlert(
-      alerts,
-      "SPO2_ATENCAO",
-      "LOW",
-      "SpO₂ levemente abaixo do ideal.",
-      `SpO₂ ${spo2}%.`,
-    );
-  } else if (spo2 >= 95) {
-    notes.push(`SpO₂ ${spo2}% normal.`);
-  }
-
-  if (baseline.calibrated && baseline.spo2 != null && baseline.spo2 - spo2 >= 4) {
-    addAlert(
-      alerts,
-      "SPO2_BAIXA",
+      "NEWS2_RESPOSTA_URGENTE",
       "HIGH",
-      "Queda de SpO₂ em relação ao basal do paciente.",
-      `SpO₂ ${spo2}% vs basal ${Math.round(baseline.spo2)}% (queda ≥ 4 p.p.).`,
+      "NEWS 2: resposta clínica urgente.",
+      `${reason} ${NEWS2_RESPONSE_LEVELS.urgent.label}.`,
     );
   }
 }
 
-function evaluateTemperature(vitals: VitalsInput, alerts: ClinicalAlert[], notes: string[]): void {
-  const temp = vitals.temperature;
-  if (temp <= 0) {
-    notes.push("Temperatura ausente na leitura.");
-    return;
-  }
+function noteMissingParameters(vitals: VitalsInput, notes: string[]): void {
+  if (vitals.heartRate <= 0) notes.push("Pulso ausente — não pontuado no NEWS 2.");
+  if (vitals.systolic <= 0) notes.push("Pressão sistólica ausente — não pontuada no NEWS 2.");
+  if (vitals.spo2 <= 0) notes.push("SpO₂ ausente — não pontuada no NEWS 2.");
+  if (vitals.temperature <= 0) notes.push("Temperatura ausente — não pontuada no NEWS 2.");
 
-  if (temp >= 39.5) {
-    addAlert(
-      alerts,
-      "FEBRE_ALTA",
-      "CRITICAL",
-      "Temperatura muito elevada.",
-      `Temperatura ${temp} °C ≥ 39,5 °C.`,
-    );
-    return;
-  }
-
-  if (temp >= 39.0) {
-    addAlert(
-      alerts,
-      "FEBRE_ALTA",
-      "HIGH",
-      "Febre alta.",
-      `Temperatura ${temp} °C.`,
-    );
-    return;
-  }
-
-  if (temp >= 38.0) {
-    addAlert(alerts, "FEBRE", "MEDIUM", "Febre.", `Temperatura ${temp} °C.`);
-    return;
-  }
-
-  if (temp >= 37.5) {
-    addAlert(
-      alerts,
-      "TEMP_ELEVADA",
-      "LOW",
-      "Temperatura levemente elevada (pele/punho).",
-      `Temperatura ${temp} °C.`,
-    );
-    return;
-  }
-
-  if (temp < 35.5) {
-    addAlert(
-      alerts,
-      "TEMP_BAIXA",
-      "MEDIUM",
-      "Temperatura baixa.",
-      `Temperatura ${temp} °C < 35,5 °C.`,
-    );
-    return;
-  }
-
-  if (temp >= 35.8 && temp <= 37.4) {
-    notes.push(`Temperatura ${temp} °C normal.`);
-  }
+  notes.push(
+    "NEWS 2 parcial: frequência respiratória, consciência e oxigênio suplementar não são medidos pela pulseira.",
+  );
+  notes.push("SpO₂ avaliada pela Escala 1 (ar ambiente assumido).");
 }
 
-function evaluateFatigue(vitals: VitalsInput, alerts: ClinicalAlert[], notes: string[]): void {
-  const f = vitals.fatigue;
-  if (f < 0) return;
-
-  if (f >= 80) {
-    addAlert(
-      alerts,
-      "FADIGA_CRITICA_FUNCIONAL",
-      "HIGH",
-      "Fadiga muito alta (score da pulseira).",
-      `Fadiga ${f}%.`,
-    );
-  } else if (f >= 60) {
-    addAlert(alerts, "FADIGA_ALTA", "MEDIUM", "Fadiga alta.", `Fadiga ${f}%.`);
-  } else if (f >= 40) {
-    addAlert(alerts, "FADIGA_MODERADA", "LOW", "Fadiga moderada.", `Fadiga ${f}%.`);
-  } else {
-    notes.push(`Fadiga ${f}% baixa.`);
-  }
-}
-
-function evaluateHrv(
+function noteSupplementaryMetrics(
   vitals: VitalsInput,
   baseline: PatientBaseline,
   context: VitalsContext,
-  alerts: ClinicalAlert[],
   notes: string[],
-): { hrvDrop: number; hrAboveBaseline: number; fatigueHigh: boolean } {
-  const hrv = vitals.hrv;
-  let hrvDrop = 0;
-  let hrAboveBaseline = 0;
-  const fatigueHigh = vitals.fatigue >= 60;
-
-  if (hrv <= 0) {
-    notes.push("HRV ausente na leitura.");
-    return { hrvDrop, hrAboveBaseline, fatigueHigh };
-  }
-
-  if (!baseline.calibrated || baseline.hrv == null) {
+): void {
+  if (vitals.hrv > 0 && baseline.calibrated && baseline.hrv != null) {
+    const drop = hrvDropPercent(vitals.hrv, baseline.hrv);
     notes.push(
-      `HRV ${hrv} ms — baseline individual em calibração (${baseline.sampleCount}/${BASELINE_MIN_SAMPLES} leituras em repouso).`,
+      `HRV ${vitals.hrv} ms (baseline ~${Math.round(baseline.hrv)} ms, variação ${drop >= 0 ? "−" : "+"}${Math.abs(Math.round(drop))}%).`,
     );
-    if (context.isResting !== false) {
-      notes.push(`HRV ${hrv} ms favorável se medido em repouso.`);
-    }
-    return { hrvDrop, hrAboveBaseline, fatigueHigh };
-  }
-
-  hrvDrop = hrvDropPercent(hrv, baseline.hrv);
-
-  if (hrvDrop <= 15) {
-    notes.push(`HRV ${hrv} ms dentro do padrão individual (baseline ~${Math.round(baseline.hrv)} ms).`);
-  } else if (hrvDrop <= 25) {
-    addAlert(
-      alerts,
-      "HRV_ATENCAO",
-      "LOW",
-      "HRV abaixo do baseline — atenção.",
-      `HRV ${hrv} ms (~${Math.round(hrvDrop)}% abaixo do basal).`,
-    );
-  } else if (hrvDrop <= 40) {
-    addAlert(
-      alerts,
-      "HRV_ALERTA",
-      "MEDIUM",
-      "Queda relevante de HRV vs baseline.",
-      `HRV ${hrv} ms (~${Math.round(hrvDrop)}% abaixo do basal).`,
-    );
-  } else {
-    addAlert(
-      alerts,
-      "HRV_ALERTA",
-      "HIGH",
-      "HRV bem abaixo do baseline.",
-      `HRV ${hrv} ms (>40% abaixo do basal).`,
+  } else if (vitals.hrv > 0) {
+    notes.push(
+      `HRV ${vitals.hrv} ms — baseline em calibração (${baseline.sampleCount}/${BASELINE_MIN_SAMPLES} leituras).`,
     );
   }
 
-  if (baseline.heartRate != null) {
-    hrAboveBaseline = vitals.heartRate - baseline.heartRate;
+  if (vitals.fatigue >= 0) {
+    notes.push(`Fadiga da pulseira: ${vitals.fatigue}%.`);
   }
 
-  const resting = context.isResting !== false;
-  if (
-    resting &&
-    hrvDrop > 40 &&
-    hrAboveBaseline >= 10 &&
-    fatigueHigh
-  ) {
-    addAlert(
-      alerts,
-      "HRV_CRITICO_FUNCIONAL",
-      "HIGH",
-      "Padrão de estresse fisiológico (HRV + FC + fadiga).",
-      `HRV -${Math.round(hrvDrop)}%, FC +${Math.round(hrAboveBaseline)} bpm vs basal, fadiga ${vitals.fatigue}%.`,
-    );
-  }
-
-  return { hrvDrop, hrAboveBaseline, fatigueHigh };
-}
-
-function evaluateCombinedAlerts(
-  vitals: VitalsInput,
-  context: VitalsContext,
-  baseline: PatientBaseline,
-  metrics: { hrvDrop: number; hrAboveBaseline: number; fatigueHigh: boolean },
-  alerts: ClinicalAlert[],
-): void {
-  const resting = context.isResting !== false;
-
-  if (
-    baseline.calibrated &&
-    metrics.hrvDrop >= 25 &&
-    vitals.fatigue >= 60 &&
-    resting &&
-    metrics.hrAboveBaseline >= 10
-  ) {
-    addAlert(
-      alerts,
-      "POSSIVEL_FADIGA_FISIOLOGICA",
-      "MEDIUM",
-      "Possível fadiga fisiológica (HRV + fadiga + FC).",
-      "Combinação: HRV ≥25% abaixo do basal, fadiga ≥60%, FC repouso ≥10 bpm acima do basal.",
-    );
-  }
-
-  if (
-    baseline.calibrated &&
-    vitals.temperature >= 37.8 &&
-    resting &&
-    metrics.hrAboveBaseline >= 10 &&
-    metrics.hrvDrop >= 20
-  ) {
-    addAlert(
-      alerts,
-      "POSSIVEL_ESTRESSE_INFECCIOSO",
-      "MEDIUM",
-      "Possível estresse febril/infeccioso.",
-      "Temperatura elevada + FC acima do basal + queda de HRV.",
-    );
-  }
-
-  const spo2Low = vitals.spo2 > 0 && vitals.spo2 <= 92;
-  const spo2Drop =
-    baseline.calibrated &&
-    baseline.spo2 != null &&
-    vitals.spo2 > 0 &&
-    baseline.spo2 - vitals.spo2 >= 4;
-
-  if (resting && vitals.heartRate >= 100 && (spo2Low || spo2Drop)) {
-    addAlert(
-      alerts,
-      "POSSIVEL_RISCO_RESPIRATORIO",
-      "HIGH",
-      "Possível risco cardiorrespiratório.",
-      "SpO₂ baixa ou em queda + FC elevada em repouso.",
-    );
-  }
-
-  if (
-    resting &&
-    (vitals.systolic >= 140 || vitals.diastolic >= 90) &&
-    vitals.heartRate >= 100 &&
-    metrics.hrvDrop >= 25
-  ) {
-    addAlert(
-      alerts,
-      "POSSIVEL_ESTRESSE_CARDIOVASCULAR",
-      "HIGH",
-      "Possível estresse cardiovascular.",
-      "PA elevada + FC repouso alta + HRV abaixo do basal.",
-    );
-  }
-
-  const criticalImmediate =
-    (vitals.spo2 > 0 && vitals.spo2 < 90) ||
-    vitals.systolic >= 180 ||
-    vitals.diastolic >= 120 ||
-    (resting && vitals.heartRate >= 140) ||
-    vitals.temperature >= 39.5;
-
-  if (criticalImmediate) {
-    addAlert(
-      alerts,
-      "ALERTA_CRITICO",
-      "CRITICAL",
-      "Critério de alerta imediato atingido.",
-      "SpO₂ crítica, PA de emergência, FC crítica em repouso ou temperatura muito alta.",
-    );
+  if (context.isResting === false) {
+    notes.push("Leitura sem confirmação de repouso — interpretar pulso com cautela.");
   }
 }
 
@@ -612,13 +400,6 @@ const SEVERITY_RANK: Record<AlertSeverity, number> = {
   MEDIUM: 2,
   HIGH: 3,
   CRITICAL: 4,
-};
-
-const SEVERITY_SCORE: Record<AlertSeverity, number> = {
-  LOW: 8,
-  MEDIUM: 18,
-  HIGH: 35,
-  CRITICAL: 60,
 };
 
 function maxSeverity(alerts: ClinicalAlert[]): AlertSeverity {
@@ -631,24 +412,28 @@ function maxSeverity(alerts: ClinicalAlert[]): AlertSeverity {
   return max;
 }
 
-function computeRiskScore(alerts: ClinicalAlert[]): number {
-  if (alerts.length === 0) return 0;
-  const actionable = alerts;
-  const sum = actionable.reduce((acc, a) => acc + SEVERITY_SCORE[a.severity], 0);
-  return Math.min(100, Math.round(sum / actionable.length));
+function overallStatusFromNews2(
+  news2: News2Assessment,
+  alerts: ClinicalAlert[],
+): OverallStatus {
+  if (
+    news2.responseLevel === "emergency" ||
+    alerts.some((a) => a.type === "NEWS2_RESPOSTA_EMERGENCIA")
+  ) {
+    return "CRITICAL";
+  }
+
+  if (
+    news2.responseLevel === "urgent" ||
+    alerts.some((a) => a.type === "NEWS2_RESPOSTA_URGENTE")
+  ) {
+    return "ALERT";
+  }
+
+  return news2ResponseToOverallStatus(news2.responseLevel);
 }
 
-function overallStatus(severity: AlertSeverity, alerts: ClinicalAlert[]): OverallStatus {
-  const hasCritical = alerts.some(
-    (a) => a.severity === "CRITICAL" || a.type === "ALERTA_CRITICO",
-  );
-  if (hasCritical || severity === "CRITICAL") return "CRITICAL";
-  if (severity === "HIGH" || alerts.some((a) => a.severity === "HIGH")) return "ALERT";
-  if (severity === "MEDIUM" || alerts.some((a) => a.severity === "MEDIUM")) return "ATTENTION";
-  return "STABLE";
-}
-
-/** Camadas 1–3: absoluto, tendência (baseline/histórico) e combinado. */
+/** Avaliação clínica baseada no NEWS 2 (versão brasileira). */
 export function evaluateClinicalAlerts(input: EvaluateInput): ClinicalAssessment {
   const context: VitalsContext = {
     isResting: true,
@@ -663,18 +448,15 @@ export function evaluateClinicalAlerts(input: EvaluateInput): ClinicalAssessment
   const alerts: ClinicalAlert[] = [];
   const notes: string[] = [];
 
-  evaluateHeartRate(input.vitals, context, history, alerts, notes);
-  evaluateBloodPressure(input.vitals, history, alerts, notes);
-  evaluateSpO2(input.vitals, baseline, history, alerts, notes);
-  evaluateTemperature(input.vitals, alerts, notes);
-  evaluateFatigue(input.vitals, alerts, notes);
+  const news2 = computeNews2Assessment(input.vitals);
 
-  const hrvMetrics = evaluateHrv(input.vitals, baseline, context, alerts, notes);
-  evaluateCombinedAlerts(input.vitals, context, baseline, hrvMetrics, alerts);
+  addParameterAlerts(news2.components, alerts, notes);
+  addAggregateNews2Alerts(news2, alerts);
+  noteMissingParameters(input.vitals, notes);
+  noteSupplementaryMetrics(input.vitals, baseline, context, notes);
 
-  const severity = maxSeverity(alerts);
-  const riskScore = computeRiskScore(alerts);
-  const status = overallStatus(severity, alerts);
+  const severity = alerts.length === 0 ? "LOW" : maxSeverity(alerts);
+  const overallStatus = overallStatusFromNews2(news2, alerts);
 
   return {
     deviceMac: input.deviceMac,
@@ -683,10 +465,11 @@ export function evaluateClinicalAlerts(input: EvaluateInput): ClinicalAssessment
     context,
     alerts,
     notes,
-    riskScore,
-    overallStatus: status,
-    severity: alerts.length === 0 ? "LOW" : severity,
+    riskScore: news2.totalScore,
+    overallStatus,
+    severity,
     baseline,
+    news2,
     disclaimer: DISCLAIMER,
   };
 }

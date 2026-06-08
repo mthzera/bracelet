@@ -21,6 +21,7 @@ type AssessmentRow = {
   overall_status: string;
   severity: string;
   baseline: ClinicalAssessment["baseline"];
+  news2: ClinicalAssessment["news2"];
   disclaimer: string;
   created_at: Date;
 };
@@ -39,6 +40,13 @@ function rowToSaved(row: AssessmentRow): SavedClinicalAssessment {
     overallStatus: row.overall_status as SavedClinicalAssessment["overallStatus"],
     severity: row.severity as SavedClinicalAssessment["severity"],
     baseline: row.baseline,
+    news2: row.news2 ?? {
+      totalScore: 0,
+      maxPossibleScore: 12,
+      components: [],
+      unavailableParameters: [],
+      responseLevel: "routine",
+    },
     disclaimer: row.disclaimer,
     createdAt: row.created_at.toISOString(),
   };
@@ -64,9 +72,10 @@ export async function saveClinicalAssessment(
         overall_status,
         severity,
         baseline,
-        disclaimer
+        disclaimer,
+        news2
       )
-      VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8, $9, $10, $11::jsonb, $12)
+      VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8, $9, $10, $11::jsonb, $12, $13::jsonb)
       RETURNING *
     `,
     [
@@ -82,6 +91,7 @@ export async function saveClinicalAssessment(
       assessment.severity,
       JSON.stringify(assessment.baseline),
       assessment.disclaimer,
+      JSON.stringify(assessment.news2),
     ],
   );
 

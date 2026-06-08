@@ -44,8 +44,14 @@ async function migrate(client: PoolClient): Promise<void> {
       severity TEXT NOT NULL,
       baseline JSONB NOT NULL DEFAULT '{}',
       disclaimer TEXT NOT NULL,
+      news2 JSONB NOT NULL DEFAULT '{}',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+  `);
+
+  await client.query(`
+    ALTER TABLE vital_assessments
+    ADD COLUMN IF NOT EXISTS news2 JSONB NOT NULL DEFAULT '{}';
   `);
 
   await client.query(
