@@ -489,6 +489,46 @@
     return document.getElementById('deviceSelect').value;
   }
 
+  /** Vitais mesclados (0x28) — mesmo critério do histórico. */
+  function healthView(p) {
+    if (!p) return null;
+    return p.mergedHealth || p.decoded;
+  }
+
+  function isHealthPacket(p) {
+    const t = field(p, 'packetType', 'packet_type');
+    return t === '0x28' || t === '0x56' || !!p.mergedHealth;
+  }
+
+  function latestVital(getValue) {
+    const mac = selectedDeviceMac();
+    const device = mac ? devices.find(d => d.deviceMac === mac) : null;
+    if (device?.mergedHealth) {
+      const v = getValue(device.mergedHealth);
+      if (v > 0) return { value: v, time: device.lastSeenAt };
+    }
+    for (const p of packets) {
+      if (!isHealthPacket(p)) continue;
+      const view = healthView(p);
+      if (!view) continue;
+      const v = getValue(view);
+      if (v > 0) {
+        return { value: v, time: field(p, 'createdAt', 'created_at') };
+      }
+    }
+    return null;
+  }
+
+  function crcIcon(packetType, crcValid) {
+    // 0x13 não tem byte CRC na pulseira — não é falha
+    if (packetType === '0x13') {
+      return '<span style="color:var(--muted)" title="Bateria sem CRC">—</span>';
+    }
+    return crcValid
+      ? '<span style="color:var(--accent2)">&#x2713;</span>'
+      : '<span style="color:var(--danger)">&#x2717;</span>';
+  }
+
   async function fetchDevices() {
     try {
       const res = await fetch(`${apiBase()}/bracelets/devices`);
@@ -570,24 +610,24 @@
       document.getElementById('sumMac').textContent = '—';
     }
 
-    // Latest heart rate from 0x28 or 0x09
-    const withHR = packets.find(p => p.decoded?.heartRate != null);
-    if (withHR) {
-      document.getElementById('sumHR').innerHTML = withHR.decoded.heartRate + '<span class="unit">bpm</span>';
-      document.getElementById('sumHRTime').textContent = relTime(field(withHR, 'createdAt', 'created_at'));
+    const hr = latestVital(v => v.heartRate);
+    if (hr) {
+      document.getElementById('sumHR').innerHTML = hr.value + '<span class="unit">bpm</span>';
+      document.getElementById('sumHRTime').textContent = hr.time ? relTime(hr.time) : '';
+    } else {
+      document.getElementById('sumHR').innerHTML = '—<span class="unit">bpm</span>';
+      document.getElementById('sumHRTime').textContent = '';
     }
 
-    // SpO2
-    const withSpo2 = packets.find(p => p.decoded?.spo2 != null);
-    if (withSpo2) {
-      document.getElementById('sumSpo2').innerHTML = withSpo2.decoded.spo2 + '<span class="unit">%</span>';
-    }
+    const spo2 = latestVital(v => v.spo2);
+    document.getElementById('sumSpo2').innerHTML = spo2
+      ? spo2.value + '<span class="unit">%</span>'
+      : '—<span class="unit">%</span>';
 
-    // Temp
-    const withTemp = packets.find(p => p.decoded?.temperature != null);
-    if (withTemp) {
-      document.getElementById('sumTemp').innerHTML = withTemp.decoded.temperature + '<span class="unit">°C</span>';
-    }
+    const temp = latestVital(v => v.temperature);
+    document.getElementById('sumTemp').innerHTML = temp
+      ? temp.value + '<span class="unit">°C</span>'
+      : '—<span class="unit">°C</span>';
 
     // Steps
     const withSteps = packets.find(p => p.decoded?.steps != null);
@@ -612,8 +652,12 @@
   }
 
   function renderPanels() {
-    // Health panel
-    const h = packets.find(p => p.decoded?.type === '0x28' || p.mergedHealth);
+    // Health panel — pacote com vitais válidos (usa mergedHealth)
+    const h = packets.find(p => {
+      if (!isHealthPacket(p)) return false;
+      const v = healthView(p);
+      return v && (v.heartRate > 0 || v.spo2 > 0 || v.temperature > 0);
+    });
     const healthEl = document.getElementById('healthPanel');
     if (h) {
       const d = h.mergedHealth || h.decoded;
@@ -710,7 +754,7 @@
       const packetType = field(p, 'packetType', 'packet_type');
       const badge = badgeFor(packetType);
       const crcValid = field(p, 'crcValid', 'crc_valid');
-      const crcIcon = crcValid ? '<span style="color:var(--accent2)">&#x2713;</span>' : '<span style="color:var(--danger)">&#x2717;</span>';
+      const crc = crcIcon(packetType, crcValid);
       const summary = summarize(p);
       const patientName = p.patient?.patientName;
       return `
@@ -720,7 +764,7 @@
           <td class="mono">${patientName ? patientName + '<br>' : ''}${field(p, 'deviceMac', 'device_mac') || '—'}</td>
           <td><span class="badge ${badge.cls}">${packetType}</span></td>
           <td>${p.source || '—'}</td>
-          <td>${crcIcon}</td>
+          <td>${crc}</td>
           <td>${summary}</td>
         </tr>
         <tr class="detail-row" id="${id}">
