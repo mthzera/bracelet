@@ -561,7 +561,7 @@
       document.getElementById('sumPatient').textContent = patient.patientName;
       document.getElementById('sumMac').textContent =
         (device?.deviceMac || field(packets[0], 'deviceMac', 'device_mac') || '—') +
-        (patient.room ? ` · Leito ${patient.room}` : '');
+        (patient.email ? ` · ${patient.email}` : '');
     } else if (packets.length > 0) {
       document.getElementById('sumPatient').textContent = 'MAC não cadastrado';
       document.getElementById('sumMac').textContent = field(packets[0], 'deviceMac', 'device_mac') || '—';

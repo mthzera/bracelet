@@ -1,20 +1,20 @@
 const patientInfoSchema = {
   type: "object",
-  required: ["patientId", "patientName", "room", "age"],
+  required: ["patientId", "patientName", "age", "email"],
   properties: {
     patientId: { type: "string", example: "P001" },
-    patientName: { type: "string", example: "Maria Silva" },
-    room: { type: "string", example: "101" },
-    age: { type: "integer", example: 68 },
+    patientName: { type: "string", example: "Ana Clara" },
+    age: { type: "integer", example: 22 },
+    email: { type: "string", example: "Ana.trindade@anery.com.br" },
   },
 } as const;
 
 const resolvedPatientSchema = {
   type: "object",
-  required: ["deviceMac", "label", "patientId", "patientName", "room", "age"],
+  required: ["deviceMac", "label", "patientId", "patientName", "age", "email"],
   properties: {
     deviceMac: { type: "string", example: "E6:64:0D:30:D3:F9" },
-    label: { type: "string", example: "Pulseira 1" },
+    label: { type: "string", example: "Bracelet 1" },
     ...patientInfoSchema.properties,
   },
 } as const;
