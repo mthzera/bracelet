@@ -139,7 +139,7 @@ export const postPacketRouteSchema = {
   tags: ["bracelets"],
   summary: "Receive and decode a BLE packet",
   description:
-    "Accepts a raw hex packet from the ESP32 gateway, validates CRC (sum of all bytes except last & 0xFF === last byte), decodes supported types (0x13, 0x22, 0x28, 0x09), and persists the result in SQLite.",
+    "Accepts a raw hex packet from the ESP32 gateway. CRC is validated for 16-byte packets (sum of all bytes except last & 0xFF === last byte); 0x13 battery notifies are short packets without CRC. Decodes supported types (0x13, 0x22, 0x28, 0x56, 0x09) and persists the result.",
   body: packetBodySchema,
   response: {
     200: {

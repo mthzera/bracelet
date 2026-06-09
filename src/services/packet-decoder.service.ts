@@ -382,14 +382,23 @@ function decodeRealtime(bytes: number[]): DecodedRealtime {
   };
 }
 
+/** 2208A battery notify is a short packet (often 8 bytes) without CRC in the last byte. */
+function skipsCrcValidation(typeByte: number): boolean {
+  return typeByte === 0x13;
+}
+
 export function decodePacket(packetType: string, rawHex: string): {
   bytes: number[];
   decoded: DecodedPacket;
+  crcValid: boolean;
 } {
   const typeByte = parsePacketType(packetType);
   const bytes = rawHexToBytes(rawHex);
 
-  validateCrc(bytes);
+  const crcValid = !skipsCrcValidation(typeByte);
+  if (crcValid) {
+    validateCrc(bytes);
+  }
 
   if (bytes[0] !== typeByte) {
     throw new PacketDecoderError(
@@ -421,5 +430,5 @@ export function decodePacket(packetType: string, rawHex: string): {
       throw new PacketDecoderError(`Unsupported packet type: ${typeHex}`);
   }
 
-  return { bytes, decoded };
+  return { bytes, decoded, crcValid };
 }

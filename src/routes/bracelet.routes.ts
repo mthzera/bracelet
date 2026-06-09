@@ -62,12 +62,12 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     );
 
     try {
-      const { bytes, decoded } = decodePacket(payload.packetType, payload.rawHex);
+      const { bytes, decoded, crcValid } = decodePacket(payload.packetType, payload.rawHex);
 
       const saved = await savePacket({
         payload,
         bytes,
-        crcValid: true,
+        crcValid,
         decoded,
       });
 
@@ -82,7 +82,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
         packetType: payload.packetType,
         source: payload.source,
         bytes,
-        crcValid: true,
+        crcValid,
         decoded,
         mergedHealth,
         savedAt: saved.createdAt,
@@ -93,7 +93,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
           id: saved.id,
           deviceMac: payload.deviceMac,
           packetType: payload.packetType,
-          crcValid: true,
+          crcValid,
           decoded,
         },
         "Bracelet packet decoded and saved",
