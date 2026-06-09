@@ -20,13 +20,19 @@ import {
 import {
   processClinicalAlertsFromDecoded,
   processClinicalAlertsAfterHealthPacket,
-  vitalsFromMetricsOrDecoded,
 } from "../services/clinical-alerts.processor.js";
 import {
   decodePacket,
   PacketDecoderError,
   rawHexToBytes,
 } from "../services/packet-decoder.service.js";
+import { vitalsFromDecodedHealth } from "../services/clinical-alerts.service.js";
+import {
+  enrichDecodedHealthFromMetrics,
+  hasMandatoryVitals,
+  mandatoryVitalsFromDecoded,
+  MANDATORY_VITALS_ERROR,
+} from "../services/vitals-validation.service.js";
 
 export async function braceletRoutes(app: FastifyInstance): Promise<void> {
   app.get("/bracelets/devices", { schema: getDevicesRouteSchema }, async (_request, reply) => {
@@ -85,7 +91,18 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     );
 
     try {
-      const { bytes, decoded, crcValid } = decodePacket(payload.packetType, payload.rawHex);
+      let { bytes, decoded, crcValid } = decodePacket(payload.packetType, payload.rawHex);
+
+      if (decoded.type === "0x28") {
+        let healthDecoded = decoded;
+        if (payload.metrics) {
+          healthDecoded = enrichDecodedHealthFromMetrics(healthDecoded, payload.metrics);
+        }
+        if (!hasMandatoryVitals(mandatoryVitalsFromDecoded(healthDecoded))) {
+          throw new PacketDecoderError(MANDATORY_VITALS_ERROR);
+        }
+        decoded = healthDecoded;
+      }
 
       const saved = await savePacket({
         payload,
@@ -124,20 +141,15 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       );
 
       try {
-        const metricsVitals = vitalsFromMetricsOrDecoded(
-          payload.metrics,
-          decoded.type === "0x28" ? decoded : undefined,
-        );
-
-        if (metricsVitals) {
+        if (decoded.type === "0x28") {
           await processClinicalAlertsAfterHealthPacket({
             deviceMac: payload.deviceMac,
             source: payload.source,
             packetId: saved.id,
             measuredAt: saved.createdAt,
-            vitals: metricsVitals,
+            vitals: vitalsFromDecodedHealth(decoded),
           });
-        } else if (decoded.type === "0x28" || decoded.type === "0x56") {
+        } else if (decoded.type === "0x56") {
           await processClinicalAlertsFromDecoded(
             payload.deviceMac,
             payload.source,

@@ -274,11 +274,12 @@ function decodeHealth(bytes: number[]): DecodedHealth {
     }
     case 0x02: {
       if (bytes[2] > 0) heartRate = bytes[2];
-      if (heartRate > 0) {
-        const bp = decodeBloodPressure(bytes);
-        systolicPressure = bp.systolicPressure;
-        diastolicPressure = bp.diastolicPressure;
-      }
+      if (bytes[3] > 0) spo2 = bytes[3];
+      if (bytes[4] > 0) hrv = bytes[4];
+      if (bytes[5] > 0) fatigue = bytes[5];
+      const bp = decodeBloodPressure(bytes);
+      systolicPressure = bp.systolicPressure;
+      diastolicPressure = bp.diastolicPressure;
       break;
     }
     case 0x03: {

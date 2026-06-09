@@ -14,6 +14,7 @@ import {
   vitalsFromDecodedHealth,
 } from "../services/clinical-alerts.service.js";
 import type { VitalsInput } from "../types/clinical-alerts.types.js";
+import { hasMandatoryVitals } from "./vitals-validation.service.js";
 
 export function mergeVitalsFromHealthPackets(
   decodedList: Array<DecodedHealth | DecodedHrvHistory>,
@@ -51,24 +52,13 @@ export function vitalsFromPacketMetrics(
     fatigue: metrics.fatigue ?? 0,
   };
 
-  const hasData =
-    vitals.heartRate > 0 ||
-    vitals.spo2 > 0 ||
-    vitals.hrv > 0 ||
-    vitals.systolic > 0 ||
-    vitals.temperature > 0;
-
-  return hasData ? vitals : null;
-}
-
-function hasEnoughVitals(vitals: VitalsInput): boolean {
-  const signals =
-    (vitals.heartRate > 0 ? 1 : 0) +
-    (vitals.spo2 > 0 ? 1 : 0) +
-    (vitals.hrv > 0 ? 1 : 0) +
-    (vitals.systolic > 0 ? 1 : 0) +
-    (vitals.temperature > 0 ? 1 : 0);
-  return signals >= 2;
+  return hasMandatoryVitals({
+    heartRate: vitals.heartRate,
+    spo2: vitals.spo2,
+    temperature: vitals.temperature,
+  })
+    ? vitals
+    : null;
 }
 
 /** Backend-only: roda após ingestão de pacote de saúde (0x28 / 0x56 / metrics). */
@@ -79,7 +69,7 @@ export async function processClinicalAlertsAfterHealthPacket(input: {
   measuredAt: string;
   vitals: VitalsInput;
 }): Promise<void> {
-  if (!hasEnoughVitals(input.vitals)) return;
+  if (!hasMandatoryVitals(input.vitals)) return;
 
   const history = await getRecentVitalsHistory(input.deviceMac, 10);
 
