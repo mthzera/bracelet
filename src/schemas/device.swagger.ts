@@ -41,7 +41,7 @@ export const getDevicesRouteSchema = {
   tags: ["bracelets"],
   summary: "List registered test bracelets with latest vitals",
   description:
-    "Returns the 4 configured bracelets (MAC → patient mapping) with last seen time, battery, and merged health per device.",
+    "Returns the 4 configured bracelets. patient/label/deviceMac are fixed; battery, mergedHealth, online and lastSeenAt come from real packets in the database.",
   response: {
     200: {
       description: "Registered devices overview",

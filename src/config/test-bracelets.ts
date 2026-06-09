@@ -1,4 +1,7 @@
-/** Cadastro fixo para testes com 4 pulseiras. */
+/**
+ * Cadastro fixo: MAC, label e dados do paciente (nome, idade, email).
+ * Medições (HR, SpO2, bateria, etc.) vêm dos pacotes reais no banco — não ficam aqui.
+ */
 export type PatientInfo = {
   patientId: string;
   patientName: string;
