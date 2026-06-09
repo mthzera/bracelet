@@ -89,7 +89,7 @@ async function buildReportPngBuffer(
   patientName: string,
   label: string,
   windowMinutes: number,
-  summaryText: string,
+  summary: VitalsSummary,
   overallStatus: string | null,
   chartBase64: string | null,
 ): Promise<Buffer> {
@@ -97,7 +97,7 @@ async function buildReportPngBuffer(
     patientName,
     label,
     windowMinutes,
-    summaryText,
+    summary,
     overallStatus,
     chartPngBase64: chartBase64,
   });
@@ -123,7 +123,7 @@ export async function buildVitalsReport(
       patient.patientName,
       label,
       windowMinutes,
-      summaryText,
+      summary,
       overallStatus,
       chartImage?.base64 ?? null,
     );
