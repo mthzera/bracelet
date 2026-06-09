@@ -41,7 +41,7 @@ function buildHeaderSvg(input: {
 }): { svg: string; height: number } {
   const bannerH = 78;
   const cardsTop = bannerH + 20;
-  const cardH = 88;
+  const cardH = 128;
   const cardW = 220;
   const cardGap = 14;
   const statusH = input.overallStatus ? 42 : 0;
@@ -54,15 +54,19 @@ function buildHeaderSvg(input: {
   const metricCard = (
     x: number,
     title: string,
-    value: string,
-    range: string,
+    latestLine: string,
+    avgLine: string,
+    rangeLine: string,
     accent: string,
     tint: string,
   ) => `
     <rect x="${x}" y="${cardsTop}" width="${cardW}" height="${cardH}" rx="12" fill="${tint}" stroke="${accent}" stroke-width="2"/>
-    <text x="${x + 16}" y="${cardsTop + 26}" font-family="Arial,Helvetica,sans-serif" font-size="13" font-weight="bold" fill="${accent}">${escapeXml(title)}</text>
-    <text x="${x + 16}" y="${cardsTop + 56}" font-family="Arial,Helvetica,sans-serif" font-size="24" font-weight="bold" fill="#0f172a">${escapeXml(value)}</text>
-    <text x="${x + 16}" y="${cardsTop + 76}" font-family="Arial,Helvetica,sans-serif" font-size="12" fill="#64748b">${escapeXml(range)}</text>
+    <text x="${x + 16}" y="${cardsTop + 22}" font-family="Arial,Helvetica,sans-serif" font-size="13" font-weight="bold" fill="${accent}">${escapeXml(title)}</text>
+    <text x="${x + 16}" y="${cardsTop + 46}" font-family="Arial,Helvetica,sans-serif" font-size="12" fill="#64748b">Última medição</text>
+    <text x="${x + 16}" y="${cardsTop + 66}" font-family="Arial,Helvetica,sans-serif" font-size="20" font-weight="bold" fill="#0f172a">${escapeXml(latestLine)}</text>
+    <text x="${x + 16}" y="${cardsTop + 84}" font-family="Arial,Helvetica,sans-serif" font-size="12" fill="#64748b">Média do período</text>
+    <text x="${x + 16}" y="${cardsTop + 102}" font-family="Arial,Helvetica,sans-serif" font-size="15" font-weight="bold" fill="#334155">${escapeXml(avgLine)}</text>
+    <text x="${x + 16}" y="${cardsTop + 120}" font-family="Arial,Helvetica,sans-serif" font-size="11" fill="#94a3b8">${escapeXml(rangeLine)}</text>
   `;
 
   const hr = input.summary.heartRate;
@@ -75,7 +79,8 @@ function buildHeaderSvg(input: {
           PADDING,
           "BPM",
           String(hr.latest),
-          `min ${hr.min} · max ${hr.max}`,
+          String(Math.round(hr.avg)),
+          `menor ${hr.min} · maior ${hr.max}`,
           "#e11d48",
           "#fff1f2",
         ),
@@ -83,15 +88,17 @@ function buildHeaderSvg(input: {
           PADDING + cardW + cardGap,
           "SpO2",
           `${spo2.latest}%`,
-          `min ${spo2.min}% · max ${spo2.max}%`,
+          `${Math.round(spo2.avg)}%`,
+          `menor ${spo2.min}% · maior ${spo2.max}%`,
           "#0284c7",
           "#eff6ff",
         ),
         metricCard(
           PADDING + (cardW + cardGap) * 2,
           "Temperatura",
-          `${temp.latest}°C`,
-          `min ${temp.min}°C · max ${temp.max}°C`,
+          `${temp.latest.toFixed(1)}°C`,
+          `${temp.avg.toFixed(1)}°C`,
+          `menor ${temp.min.toFixed(1)}°C · maior ${temp.max.toFixed(1)}°C`,
           "#d97706",
           "#fffbeb",
         ),

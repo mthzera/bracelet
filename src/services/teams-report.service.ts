@@ -62,9 +62,9 @@ function formatSummary(summary: VitalsSummary): string {
 
   return [
     `Leituras: ${summary.dataPointCount}`,
-    `BPM: ${hr.latest} (min ${hr.min} / max ${hr.max})`,
-    `SpO2: ${spo2.latest}% (min ${spo2.min}% / max ${spo2.max}%)`,
-    `Temp: ${temp.latest}°C (min ${temp.min}°C / max ${temp.max}°C)`,
+    `BPM — última: ${hr.latest} | média: ${Math.round(hr.avg)} (min ${hr.min} / max ${hr.max})`,
+    `SpO2 — última: ${spo2.latest}% | média: ${Math.round(spo2.avg)}% (min ${spo2.min}% / max ${spo2.max}%)`,
+    `Temp — última: ${temp.latest.toFixed(1)}°C | média: ${temp.avg.toFixed(1)}°C (min ${temp.min.toFixed(1)} / max ${temp.max.toFixed(1)})`,
   ].join("\n");
 }
 

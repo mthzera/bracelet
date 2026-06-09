@@ -165,20 +165,29 @@ export async function fetchVitalsChartImage(
   };
 }
 
-export type VitalsSummary = {
-  dataPointCount: number;
-  heartRate: { min: number; max: number; latest: number };
-  spo2: { min: number; max: number; latest: number };
-  temperature: { min: number; max: number; latest: number };
+export type VitalsMetricSummary = {
+  min: number;
+  max: number;
+  latest: number;
+  avg: number;
 };
 
-function summarizeMetric(values: number[]): { min: number; max: number; latest: number } {
+export type VitalsSummary = {
+  dataPointCount: number;
+  heartRate: VitalsMetricSummary;
+  spo2: VitalsMetricSummary;
+  temperature: VitalsMetricSummary;
+};
+
+function summarizeMetric(values: number[]): VitalsMetricSummary {
   const valid = values.filter((v) => v > 0);
-  if (valid.length === 0) return { min: 0, max: 0, latest: 0 };
+  if (valid.length === 0) return { min: 0, max: 0, latest: 0, avg: 0 };
+  const sum = valid.reduce((acc, v) => acc + v, 0);
   return {
     min: Math.min(...valid),
     max: Math.max(...valid),
     latest: valid[valid.length - 1]!,
+    avg: sum / valid.length,
   };
 }
 
