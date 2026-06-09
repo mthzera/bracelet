@@ -362,7 +362,7 @@
     <select id="deviceSelect" onchange="onDeviceChange()" title="Filtrar por pulseira">
       <option value="">Todas as pulseiras</option>
     </select>
-    <input class="api-input" id="apiBase" value="https://bracelet-pn7r.onrender.com" placeholder="API base URL" />
+    <input class="api-input" id="apiBase" placeholder="API base URL" title="Use /dashboard na API ou cole a URL do Render" />
     <div class="spinner" id="spinner"></div>
     <button class="secondary active" id="autoRefreshBtn" title="Toggle auto-refresh">&#x21BB; Auto</button>
     <button onclick="fetchPackets()">Refresh</button>
@@ -475,9 +475,47 @@
   let autoRefresh = true;
   let refreshTimer = null;
   const REFRESH_INTERVAL = 5000;
+  const DEFAULT_API = 'https://bracelet-pn7r.onrender.com';
+
+  function normalizeMac(mac) {
+    return (mac || '').trim().toUpperCase();
+  }
+
+  function initApiBase() {
+    const input = document.getElementById('apiBase');
+    const saved = localStorage.getItem('braceletApiBase');
+    if (saved) {
+      input.value = saved;
+      return;
+    }
+    if (window.location.protocol !== 'file:' && window.location.host) {
+      input.value = window.location.origin;
+      return;
+    }
+    input.value = DEFAULT_API;
+  }
 
   function apiBase() {
-    return document.getElementById('apiBase').value.replace(/\/$/, '');
+    const raw = document.getElementById('apiBase').value.trim().replace(/\/$/, '');
+    const base = raw || DEFAULT_API;
+    localStorage.setItem('braceletApiBase', base);
+    return base;
+  }
+
+  async function checkApiHealth() {
+    try {
+      const res = await fetch(`${apiBase()}/health`, { signal: AbortSignal.timeout(30000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return true;
+    } catch (e) {
+      setStatus('error', 'API offline');
+      toast(
+        'API indisponível. Se usa Render, aguarde ~1 min (cold start) e clique Refresh. ' +
+        'Melhor: abra https://bracelet-pn7r.onrender.com/dashboard — ' + e.message,
+        'err'
+      );
+      return false;
+    }
   }
 
   function field(obj, camel, snake) {
@@ -502,7 +540,7 @@
 
   function latestVital(getValue) {
     const mac = selectedDeviceMac();
-    const device = mac ? devices.find(d => d.deviceMac === mac) : null;
+    const device = mac ? devices.find(d => normalizeMac(d.deviceMac) === normalizeMac(mac)) : null;
     if (device?.mergedHealth) {
       const v = getValue(device.mergedHealth);
       if (v > 0) return { value: v, time: device.lastSeenAt };
@@ -594,8 +632,8 @@
     document.getElementById('sumTotal').textContent = packets.length;
 
     const deviceMac = selectedDeviceMac();
-    const device = devices.find(d => d.deviceMac === deviceMac);
-    const patientFromPacket = packets.find(p => field(p, 'patient', 'patient'))?.patient;
+    const device = devices.find(d => normalizeMac(d.deviceMac) === normalizeMac(deviceMac));
+    const patientFromPacket = packets.find(p => p.patient)?.patient;
     const patient = device?.patient || patientFromPacket;
     if (patient) {
       document.getElementById('sumPatient').textContent = patient.patientName;
@@ -631,24 +669,26 @@
 
     // Steps
     const withSteps = packets.find(p => p.decoded?.steps != null);
-    if (withSteps) {
-      document.getElementById('sumSteps').textContent = withSteps.decoded.steps.toLocaleString();
-    }
+    document.getElementById('sumSteps').textContent = withSteps
+      ? withSteps.decoded.steps.toLocaleString()
+      : '—';
 
-    // Battery
-    const bat = packets.find(p => p.decoded?.type === '0x13');
-    if (bat) {
-      const pct = bat.decoded.battery;
-      const color = pct > 50 ? 'var(--accent2)' : pct > 20 ? 'var(--warn)' : 'var(--danger)';
-      document.getElementById('sumBatVal').innerHTML = pct + '<span class="unit">%</span>';
-      document.getElementById('sumBatBar').style.width = pct + '%';
+    // Battery — API devices ou pacote 0x13
+    const batPacket = packets.find(p => p.decoded?.type === '0x13');
+    const batPct = device?.battery ?? batPacket?.decoded?.battery ?? null;
+    if (batPct != null) {
+      const color = batPct > 50 ? 'var(--accent2)' : batPct > 20 ? 'var(--warn)' : 'var(--danger)';
+      document.getElementById('sumBatVal').innerHTML = batPct + '<span class="unit">%</span>';
+      document.getElementById('sumBatBar').style.width = batPct + '%';
       document.getElementById('sumBatBar').style.background = color;
+    } else {
+      document.getElementById('sumBatVal').innerHTML = '—<span class="unit">%</span>';
+      document.getElementById('sumBatBar').style.width = '0%';
     }
 
     // Last update
-    if (packets.length > 0) {
-      document.getElementById('sumLastUpdate').textContent = relTime(field(packets[0], 'createdAt', 'created_at'));
-    }
+    const lastAt = device?.lastSeenAt || (packets.length > 0 ? field(packets[0], 'createdAt', 'created_at') : null);
+    document.getElementById('sumLastUpdate').textContent = lastAt ? relTime(lastAt) : '—';
   }
 
   function renderPanels() {
@@ -883,8 +923,17 @@
     }
   }
 
+  document.getElementById('apiBase').addEventListener('change', () => {
+    localStorage.setItem('braceletApiBase', apiBase());
+    fetchDevices().then(() => fetchPackets());
+  });
+
   // Init
-  fetchDevices().then(() => fetchPackets()).then(scheduleRefresh);
+  initApiBase();
+  checkApiHealth()
+    .then(() => fetchDevices())
+    .then(() => fetchPackets())
+    .then(scheduleRefresh);
 </script>
 </body>
 </html>

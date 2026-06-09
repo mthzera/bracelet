@@ -47,11 +47,30 @@ async function main(): Promise<void> {
       }
 
       const normalized = origin.replace(/\/$/, "");
-      callback(null, allowedOrigins.has(normalized) ? origin : false);
+      if (allowedOrigins.has(normalized)) {
+        callback(null, origin);
+        return;
+      }
+
+      // Dashboard local (Live Server, Vite, etc.) em localhost
+      try {
+        const host = new URL(normalized).hostname;
+        if (host === "localhost" || host === "127.0.0.1") {
+          callback(null, origin);
+          return;
+        }
+      } catch {
+        callback(null, false);
+        return;
+      }
+
+      callback(null, false);
     },
   });
 
   app.get("/health", async () => ({ status: "ok" }));
+
+  app.get("/", async (_req, reply) => reply.redirect("/dashboard"));
 
   app.get("/dashboard", async (_req, reply) => {
     const html = fs.readFileSync(
