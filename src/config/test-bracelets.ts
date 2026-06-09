@@ -15,6 +15,19 @@ export type TestBracelet = {
   patient: PatientInfo;
 };
 
+/** Nomes para dropdown no Swagger (GET /bracelets/reports/vitals). */
+export const REPORT_PATIENT_NAMES = [
+  "Ana Clara",
+  "Carlos",
+  "Bárbara Mascarenhas",
+  "Daniela",
+] as const;
+
+export function findBraceletByPatientName(name: string): TestBracelet | undefined {
+  const key = name.trim().toLowerCase();
+  return TEST_BRACELETS.find((b) => b.patient.patientName.toLowerCase() === key);
+}
+
 export const TEST_BRACELETS: TestBracelet[] = [
   {
     deviceMac: "E6:64:0D:30:D3:F9",

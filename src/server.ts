@@ -4,6 +4,7 @@ import path from "node:path";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { closeDatabase, initDatabase } from "./database/db.js";
+import { stopTeamsReportScheduler, startTeamsReportScheduler } from "./jobs/teams-report.scheduler.js";
 import { registerApiWithDocs } from "./plugins/swagger.plugin.js";
 
 function parseAllowedOrigins(value: string | undefined): Set<string> | null {
@@ -33,6 +34,7 @@ async function main(): Promise<void> {
   });
 
   app.addHook("onClose", async () => {
+    stopTeamsReportScheduler();
     await closeDatabase();
   });
 
@@ -75,6 +77,8 @@ async function main(): Promise<void> {
 
   await app.listen({ port, host });
   app.log.info({ port, host }, "Server listening");
+
+  startTeamsReportScheduler(app.log);
 }
 
 main();

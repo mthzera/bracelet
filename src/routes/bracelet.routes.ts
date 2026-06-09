@@ -8,6 +8,10 @@ import {
 import { packetPayloadSchema } from "../schemas/packet.schema.js";
 import { getDevicesRouteSchema } from "../schemas/device.swagger.js";
 import {
+  getVitalsReportImageRouteSchema,
+  getVitalsReportRouteSchema,
+} from "../schemas/report.swagger.js";
+import {
   getPacketRouteSchema,
   postPacketRouteSchema,
 } from "../schemas/packet.swagger.js";
@@ -33,12 +37,75 @@ import {
   mandatoryVitalsFromDecoded,
   MANDATORY_VITALS_ERROR,
 } from "../services/vitals-validation.service.js";
+import { DEFAULT_VITALS_REPORT_WINDOW_MINUTES } from "../config/teams-report.config.js";
+import {
+  buildAllVitalsReports,
+  buildVitalsReportPngByPatientName,
+  buildVitalsReportByPatientName,
+} from "../services/teams-report.service.js";
+
+function resolveReportWindowMinutes(value: number | undefined): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(Math.max(value, 5), 1440)
+    : DEFAULT_VITALS_REPORT_WINDOW_MINUTES;
+}
 
 export async function braceletRoutes(app: FastifyInstance): Promise<void> {
   app.get("/bracelets/devices", { schema: getDevicesRouteSchema }, async (_request, reply) => {
     const devices = await buildDevicesOverview();
     return reply.status(200).send({ devices });
   });
+
+  app.get(
+    "/bracelets/reports/vitals",
+    { schema: getVitalsReportRouteSchema },
+    async (request, reply) => {
+      const query = request.query as { patientName?: string; windowMinutes?: number };
+      const windowMinutes = resolveReportWindowMinutes(query.windowMinutes);
+
+      if (query.patientName?.trim()) {
+        const report = await buildVitalsReportByPatientName(query.patientName, windowMinutes);
+        if (!report) {
+          return reply.status(404).send({
+            error: "patientName not registered",
+            patientName: query.patientName,
+          });
+        }
+        return reply.status(200).send({ report });
+      }
+
+      const reports = await buildAllVitalsReports(windowMinutes);
+      return reply.status(200).send({ windowMinutes, reports });
+    },
+  );
+
+  app.get(
+    "/bracelets/reports/vitals/image",
+    { schema: getVitalsReportImageRouteSchema },
+    async (request, reply) => {
+      const query = request.query as { patientName?: string; windowMinutes?: number };
+
+      if (!query.patientName?.trim()) {
+        return reply.status(400).send({ error: "patientName is required" });
+      }
+
+      const windowMinutes = resolveReportWindowMinutes(query.windowMinutes);
+
+      const png = await buildVitalsReportPngByPatientName(query.patientName, windowMinutes);
+      if (!png) {
+        return reply.status(404).send({
+          error: "Paciente não encontrado ou sem medições para gerar gráfico",
+          patientName: query.patientName,
+        });
+      }
+
+      const safeName = png.patientName.replace(/[^\w\s-]/g, "").replace(/\s+/g, "-");
+      return reply
+        .header("Content-Type", "image/png")
+        .header("Content-Disposition", `attachment; filename="relatorio-${safeName}.png"`)
+        .send(png.buffer);
+    },
+  );
 
   app.get("/bracelets/devices/registry", async (_request, reply) => {
     return reply.status(200).send({
