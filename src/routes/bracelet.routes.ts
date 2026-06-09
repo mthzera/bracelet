@@ -184,10 +184,10 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
         decoded,
       });
 
-      const mergedHealth =
-        decoded.type === "0x28" || decoded.type === "0x56"
-          ? await getMergedHealthForDevice(payload.deviceMac)
-          : null;
+      const isHealthPacket = decoded.type === "0x28" || decoded.type === "0x56";
+      const mergedHealth = isHealthPacket
+        ? await getMergedHealthForDevice(payload.deviceMac)
+        : null;
 
       const response = {
         id: saved.id,
@@ -231,6 +231,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
             decoded,
           );
         }
+        // Tipos raw, históricos e dispositivo (0x27, 0x53, 0x18, etc.) não geram alertas clínicos.
       } catch (alertErr) {
         request.log.error({ err: alertErr }, "Clinical assessment after packet failed");
       }

@@ -8,6 +8,13 @@ export type DecodedMac = {
   mac: string;
 };
 
+export type DecodedFirmware = {
+  type: "0x27";
+  major: number;
+  minor: number;
+  patch: number;
+};
+
 export type HealthMeasurementMode =
   | "hrv"
   | "heart"
@@ -50,12 +57,45 @@ export type DecodedRealtime = {
   spo2: number;
 };
 
+/** Pacote 0x53 — sono (histórico). */
+export type DecodedSleep = {
+  type: "0x53";
+  recordId: number;
+  date: string;
+  time: string;
+  sleepMinutes: number;
+};
+
+/** Pacote 0x18 — esporte em tempo real. */
+export type DecodedSport = {
+  type: "0x18";
+  heartRate: number;
+  steps: number;
+  caloriesRaw: number;
+  exerciseTime: number;
+};
+
+/**
+ * Pacotes de histórico sem decoder específico (0x51, 0x52, 0x54, 0x55, 0x5C,
+ * 0x60, 0x62, 0x65, 0x66) e qualquer tipo desconhecido.
+ * Salvo como-está para inspeção posterior.
+ */
+export type DecodedRaw = {
+  type: "raw";
+  originalType: string;
+  bytesReceived: number;
+};
+
 export type DecodedPacket =
   | DecodedBattery
   | DecodedMac
+  | DecodedFirmware
   | DecodedHealth
   | DecodedHrvHistory
-  | DecodedRealtime;
+  | DecodedRealtime
+  | DecodedSleep
+  | DecodedSport
+  | DecodedRaw;
 
 export type HealthMeasurementKind = "hrv" | "heartRate" | "spo2" | "temperature";
 
@@ -146,6 +186,23 @@ export function validateCrc(bytes: number[]): void {
   }
 }
 
+/**
+ * Pacotes que não têm CRC no último byte — ou porque são curtos por design (0x13),
+ * ou porque o ESP32 trunca em 16 bytes e o CRC real está além da janela capturada.
+ * Apenas 0x22 e 0x28 são sempre 16 bytes com CRC correto na posição 15.
+ * 0x56 tem decoder existente e resposta 16 bytes — mantém validação.
+ */
+function skipsCrcValidation(typeByte: number): boolean {
+  switch (typeByte) {
+    case 0x22: // MAC — resposta 16 bytes do dispositivo
+    case 0x28: // Health — ESP32 monta com CRC explícito
+    case 0x56: // HRV History — resposta 16 bytes com CRC
+      return false;
+    default:
+      return true;
+  }
+}
+
 function formatMacFromBytes(bytes: number[]): string {
   return bytes.map((b) => b.toString(16).padStart(2, "0").toUpperCase()).join(":");
 }
@@ -167,6 +224,43 @@ function decodeMac(bytes: number[]): DecodedMac {
   return {
     type: "0x22",
     mac: formatMacFromBytes(bytes.slice(1, 7)),
+  };
+}
+
+function decodeFirmware(bytes: number[]): DecodedFirmware {
+  return {
+    type: "0x27",
+    major: bytes[1] ?? 0,
+    minor: bytes[2] ?? 0,
+    patch: bytes[3] ?? 0,
+  };
+}
+
+function decodeSleep(bytes: number[]): DecodedSleep {
+  const recordId = (bytes[1] ?? 0) | ((bytes[2] ?? 0) << 8);
+  const yy = bytes[3] ?? 0;
+  const mo = bytes[4] ?? 0;
+  const dd = bytes[5] ?? 0;
+  const hh = bytes[6] ?? 0;
+  const mm = bytes[7] ?? 0;
+  const ss = bytes[8] ?? 0;
+  const segLen = bytes[9] ?? 0;
+  return {
+    type: "0x53",
+    recordId,
+    date: `20${String(yy).padStart(2, "0")}-${String(mo).padStart(2, "0")}-${String(dd).padStart(2, "0")}`,
+    time: `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`,
+    sleepMinutes: segLen * 5,
+  };
+}
+
+function decodeSport(bytes: number[]): DecodedSport {
+  return {
+    type: "0x18",
+    heartRate: bytes[1] ?? 0,
+    steps: readUint32LE(bytes, 2),
+    caloriesRaw: readUint32LE(bytes, 6),
+    exerciseTime: readUint32LE(bytes, 10),
   };
 }
 
@@ -361,31 +455,32 @@ export function mergeHealthReadings(
   return merged;
 }
 
+/**
+ * O ESP32 trunca todos os pacotes em 16 bytes via storeHex().
+ * O pacote real do 0x09 tem 26 bytes, mas só os primeiros 16 chegam.
+ * Lê o que estiver disponível e usa 0 para campos ausentes.
+ */
 function decodeRealtime(bytes: number[]): DecodedRealtime {
-  if (bytes.length < 26) {
+  if (bytes.length < 2) {
     throw new PacketDecoderError(
-      `Realtime packet (0x09) requires at least 26 bytes (got ${bytes.length})`,
+      `Realtime packet (0x09) requires at least 2 bytes (got ${bytes.length})`,
     );
   }
 
-  const temperatureRaw = bytes[22] | ((bytes[23] ?? 0) << 8);
+  const temperatureRaw =
+    bytes.length >= 24 ? ((bytes[22] ?? 0) | ((bytes[23] ?? 0) << 8)) : 0;
 
   return {
     type: "0x09",
-    steps: readUint32LE(bytes, 1),
-    caloriesKcal: readUint32LE(bytes, 5) / 100,
-    distanceKm: readUint32LE(bytes, 9) / 100,
-    movementTimeRaw: readUint32LE(bytes, 13),
-    fastMovementTimeRaw: readUint32LE(bytes, 17),
-    heartRate: bytes[21],
+    steps: bytes.length >= 5 ? readUint32LE(bytes, 1) : 0,
+    caloriesKcal: bytes.length >= 9 ? readUint32LE(bytes, 5) / 100 : 0,
+    distanceKm: bytes.length >= 13 ? readUint32LE(bytes, 9) / 100 : 0,
+    movementTimeRaw: bytes.length >= 17 ? readUint32LE(bytes, 13) : 0,
+    fastMovementTimeRaw: bytes.length >= 21 ? readUint32LE(bytes, 17) : 0,
+    heartRate: bytes.length >= 22 ? (bytes[21] ?? 0) : 0,
     temperature: temperatureRaw / 10,
-    spo2: bytes[24],
+    spo2: bytes.length >= 25 ? (bytes[24] ?? 0) : 0,
   };
-}
-
-/** 2208A battery notify is a short packet (often 8 bytes) without CRC in the last byte. */
-function skipsCrcValidation(typeByte: number): boolean {
-  return typeByte === 0x13;
 }
 
 export function decodePacket(packetType: string, rawHex: string): {
@@ -407,8 +502,6 @@ export function decodePacket(packetType: string, rawHex: string): {
     );
   }
 
-  const typeHex = `0x${typeByte.toString(16).padStart(2, "0")}` as DecodedPacket["type"];
-
   let decoded: DecodedPacket;
 
   switch (typeByte) {
@@ -418,8 +511,17 @@ export function decodePacket(packetType: string, rawHex: string): {
     case 0x22:
       decoded = decodeMac(bytes);
       break;
+    case 0x27:
+      decoded = decodeFirmware(bytes);
+      break;
     case 0x28:
       decoded = decodeHealth(bytes);
+      break;
+    case 0x53:
+      decoded = decodeSleep(bytes);
+      break;
+    case 0x18:
+      decoded = decodeSport(bytes);
       break;
     case 0x56:
       decoded = decodeHrvHistory(bytes);
@@ -428,7 +530,13 @@ export function decodePacket(packetType: string, rawHex: string): {
       decoded = decodeRealtime(bytes);
       break;
     default:
-      throw new PacketDecoderError(`Unsupported packet type: ${typeHex}`);
+      // Tipos de histórico (0x51, 0x52, 0x54, 0x55, 0x5C, 0x60, 0x62, 0x65, 0x66)
+      // e quaisquer outros tipos futuros — salva como raw para inspeção.
+      decoded = {
+        type: "raw",
+        originalType: `0x${typeByte.toString(16).padStart(2, "0")}`,
+        bytesReceived: bytes.length,
+      };
   }
 
   return { bytes, decoded, crcValid };
