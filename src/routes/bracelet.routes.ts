@@ -92,9 +92,15 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       const windowMinutes = resolveReportWindowMinutes(query.windowMinutes);
 
       const png = await buildVitalsReportPngByPatientName(query.patientName, windowMinutes);
-      if (!png) {
-        return reply.status(404).send({
-          error: "Paciente não encontrado ou sem medições para gerar gráfico",
+      if (!png.ok) {
+        if (png.reason === "patient_not_found") {
+          return reply.status(404).send({
+            error: "Paciente não cadastrado",
+            patientName: query.patientName,
+          });
+        }
+        return reply.status(500).send({
+          error: "Falha ao gerar imagem do relatório",
           patientName: query.patientName,
         });
       }

@@ -111,6 +111,7 @@ export async function fetchVitalsChartImage(
   const res = await fetch("https://quickchart.io/chart", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(20_000),
     body: JSON.stringify({
       chart: buildVitalsChartConfig(patientName, points),
       width: 700,
@@ -121,7 +122,7 @@ export async function fetchVitalsChartImage(
   });
 
   if (!res.ok) {
-    const fallback = await fetch(chartUrl);
+    const fallback = await fetch(chartUrl, { signal: AbortSignal.timeout(20_000) });
     if (!fallback.ok) return null;
     const buf = Buffer.from(await fallback.arrayBuffer());
     return {

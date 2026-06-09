@@ -14,10 +14,10 @@ export type VitalsReportImageInput = {
   windowMinutes: number;
   summaryText: string;
   overallStatus: string | null;
-  chartPngBase64: string;
+  chartPngBase64?: string | null;
 };
 
-/** Monta PNG único: cabeçalho com resumo + gráfico embutido. */
+/** Monta PNG único: cabeçalho com resumo e gráfico embutido (quando houver dados). */
 export async function composeVitalsReportPng(input: VitalsReportImageInput): Promise<Buffer> {
   const headerLines = [
     `Relatório pulseira — ${input.patientName}`,
@@ -33,9 +33,10 @@ export async function composeVitalsReportPng(input: VitalsReportImageInput): Pro
   const padding = 24;
   const chartWidth = 700;
   const chartHeight = 320;
+  const hasChart = Boolean(input.chartPngBase64);
   const headerHeight = padding + headerLines.length * lineHeight + 16;
-  const totalHeight = headerHeight + chartHeight + padding;
-  const totalWidth = chartWidth + padding * 2;
+  const totalHeight = hasChart ? headerHeight + chartHeight + padding : headerHeight + padding;
+  const totalWidth = hasChart ? chartWidth + padding * 2 : 520;
 
   const textElements = headerLines
     .map((line, index) => {
@@ -46,11 +47,15 @@ export async function composeVitalsReportPng(input: VitalsReportImageInput): Pro
     })
     .join("\n");
 
+  const chartElement = hasChart
+    ? `<image x="${padding}" y="${headerHeight}" width="${chartWidth}" height="${chartHeight}" href="data:image/png;base64,${input.chartPngBase64}"/>`
+    : "";
+
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${totalWidth}" height="${totalHeight}">
   <rect width="100%" height="100%" fill="#ffffff"/>
   ${textElements}
-  <image x="${padding}" y="${headerHeight}" width="${chartWidth}" height="${chartHeight}" href="data:image/png;base64,${input.chartPngBase64}"/>
+  ${chartElement}
 </svg>`;
 
   return sharp(Buffer.from(svg)).png().toBuffer();

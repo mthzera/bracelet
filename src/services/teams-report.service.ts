@@ -91,7 +91,7 @@ async function buildReportPngBuffer(
   windowMinutes: number,
   summaryText: string,
   overallStatus: string | null,
-  chartBase64: string,
+  chartBase64: string | null,
 ): Promise<Buffer> {
   return composeVitalsReportPng({
     patientName,
@@ -118,16 +118,18 @@ export async function buildVitalsReport(
   const overallStatus = latestAssessment?.overallStatus ?? null;
 
   let reportPngBase64: string | null = null;
-  if (chartImage?.base64) {
+  try {
     const reportBuffer = await buildReportPngBuffer(
       patient.patientName,
       label,
       windowMinutes,
       summaryText,
       overallStatus,
-      chartImage.base64,
+      chartImage?.base64 ?? null,
     );
     reportPngBase64 = reportBuffer.toString("base64");
+  } catch {
+    reportPngBase64 = null;
   }
 
   return {
@@ -154,15 +156,34 @@ export async function buildVitalsReport(
   };
 }
 
+export type VitalsReportPngResult =
+  | { ok: true; buffer: Buffer; patientName: string; dataPointCount: number }
+  | { ok: false; reason: "patient_not_found" | "image_generation_failed" };
+
 export async function buildVitalsReportPngByPatientName(
   patientName: string,
   windowMinutes: number,
-): Promise<{ buffer: Buffer; patientName: string } | null> {
-  const report = await buildVitalsReportByPatientName(patientName, windowMinutes);
-  if (!report?.chartImageBase64) return null;
+): Promise<VitalsReportPngResult> {
+  const bracelet = findBraceletByPatientName(patientName);
+  if (!bracelet) {
+    return { ok: false, reason: "patient_not_found" };
+  }
+
+  const report = await buildVitalsReport(
+    bracelet.deviceMac,
+    bracelet.label,
+    bracelet.patient,
+    windowMinutes,
+  );
+
+  if (!report.chartImageBase64) {
+    return { ok: false, reason: "image_generation_failed" };
+  }
 
   return {
+    ok: true,
     patientName: report.patient.patientName,
+    dataPointCount: report.dataPointCount,
     buffer: Buffer.from(report.chartImageBase64, "base64"),
   };
 }

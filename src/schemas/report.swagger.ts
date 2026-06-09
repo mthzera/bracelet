@@ -77,7 +77,15 @@ export const getVitalsReportImageRouteSchema = {
       properties: { error: { type: "string" } },
     },
     404: {
-      description: "Paciente não encontrado ou sem dados",
+      description: "Paciente não cadastrado",
+      type: "object",
+      properties: {
+        error: { type: "string" },
+        patientName: { type: "string" },
+      },
+    },
+    500: {
+      description: "Falha ao gerar imagem do relatório",
       type: "object",
       properties: {
         error: { type: "string" },

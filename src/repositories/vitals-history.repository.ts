@@ -1,6 +1,10 @@
 import { getPool } from "../database/db.js";
 import type { VitalsInput } from "../types/clinical-alerts.types.js";
-import type { DecodedHealth } from "../services/packet-decoder.service.js";
+import {
+  mergeHealthReadings,
+  type DecodedHealth,
+  type DecodedHrvHistory,
+} from "../services/packet-decoder.service.js";
 
 export type VitalsHistoryPoint = {
   measuredAt: string;
@@ -10,6 +14,14 @@ export type VitalsHistoryPoint = {
   systolic: number;
   diastolic: number;
 };
+
+const HEALTH_MERGE_WINDOW_MS = 5 * 60 * 1000;
+
+function isHealthDecoded(
+  decoded: DecodedHealth | DecodedHrvHistory | null | undefined,
+): decoded is DecodedHealth | DecodedHrvHistory {
+  return decoded?.type === "0x28" || decoded?.type === "0x56";
+}
 
 function vitalsFromDecoded(decoded: DecodedHealth): VitalsHistoryPoint | null {
   if (decoded.heartRate <= 0 && decoded.spo2 <= 0 && decoded.temperature <= 0) {
@@ -39,6 +51,59 @@ function vitalsFromAssessment(vitals: VitalsInput, measuredAt: string): VitalsHi
   };
 }
 
+type PacketRow = {
+  created_at: Date;
+  decoded: DecodedHealth | DecodedHrvHistory | null;
+};
+
+function clusterPacketRows(rows: PacketRow[]): PacketRow[][] {
+  const sorted = [...rows].sort(
+    (a, b) => a.created_at.getTime() - b.created_at.getTime(),
+  );
+  const groups: PacketRow[][] = [];
+  let current: PacketRow[] = [];
+
+  for (const row of sorted) {
+    if (current.length === 0) {
+      current.push(row);
+      continue;
+    }
+
+    const lastTime = current[current.length - 1]!.created_at.getTime();
+    const rowTime = row.created_at.getTime();
+    if (rowTime - lastTime <= HEALTH_MERGE_WINDOW_MS) {
+      current.push(row);
+    } else {
+      groups.push(current);
+      current = [row];
+    }
+  }
+
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
+function pointsFromMergedPackets(rows: PacketRow[]): VitalsHistoryPoint[] {
+  const points: VitalsHistoryPoint[] = [];
+
+  for (const group of clusterPacketRows(rows)) {
+    const decodedList = group
+      .map((row) => row.decoded)
+      .filter(isHealthDecoded);
+
+    if (decodedList.length === 0) continue;
+
+    const merged = mergeHealthReadings(decodedList);
+    const point = vitalsFromDecoded(merged);
+    if (!point) continue;
+
+    point.measuredAt = group[0]!.created_at.toISOString();
+    points.push(point);
+  }
+
+  return points;
+}
+
 export async function getVitalsHistoryForDevice(
   deviceMac: string,
   windowMinutes: number,
@@ -66,15 +131,12 @@ export async function getVitalsHistoryForDevice(
     if (point) byTime.set(point.measuredAt, point);
   }
 
-  const { rows: packets } = await pool.query<{
-    created_at: Date;
-    decoded: DecodedHealth | null;
-  }>(
+  const { rows: packets } = await pool.query<PacketRow>(
     `
       SELECT created_at, decoded
       FROM packets
       WHERE UPPER(device_mac) = $1
-        AND packet_type = '0x28'
+        AND packet_type IN ('0x28', '0x56')
         AND decoded IS NOT NULL
         AND created_at >= now() - ($2::int * interval '1 minute')
       ORDER BY created_at ASC
@@ -82,13 +144,9 @@ export async function getVitalsHistoryForDevice(
     [mac, windowMinutes],
   );
 
-  for (const row of packets) {
-    if (!row.decoded || row.decoded.type !== "0x28") continue;
-    const base = vitalsFromDecoded(row.decoded);
-    if (!base) continue;
-    const measuredAt = row.created_at.toISOString();
-    if (!byTime.has(measuredAt)) {
-      byTime.set(measuredAt, { ...base, measuredAt });
+  for (const point of pointsFromMergedPackets(packets)) {
+    if (!byTime.has(point.measuredAt)) {
+      byTime.set(point.measuredAt, point);
     }
   }
 
