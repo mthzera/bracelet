@@ -6,10 +6,17 @@ import {
   savePacket,
 } from "../repositories/packet.repository.js";
 import { packetPayloadSchema } from "../schemas/packet.schema.js";
+import { getDevicesRouteSchema } from "../schemas/device.swagger.js";
 import {
   getPacketRouteSchema,
   postPacketRouteSchema,
 } from "../schemas/packet.swagger.js";
+import {
+  buildDevicesOverview,
+  enrichWithPatient,
+  listRegisteredBracelets,
+  resolvePatientForMac,
+} from "../services/device-registry.service.js";
 import {
   processClinicalAlertsFromDecoded,
   processClinicalAlertsAfterHealthPacket,
@@ -22,15 +29,31 @@ import {
 } from "../services/packet-decoder.service.js";
 
 export async function braceletRoutes(app: FastifyInstance): Promise<void> {
+  app.get("/bracelets/devices", { schema: getDevicesRouteSchema }, async (_request, reply) => {
+    const devices = await buildDevicesOverview();
+    return reply.status(200).send({ devices });
+  });
+
+  app.get("/bracelets/devices/registry", async (_request, reply) => {
+    return reply.status(200).send({
+      devices: listRegisteredBracelets().map((bracelet) => ({
+        deviceMac: bracelet.deviceMac,
+        label: bracelet.label,
+        patient: bracelet.patient,
+      })),
+    });
+  });
+
   app.get("/bracelets/packets", { schema: getPacketRouteSchema }, async (request, reply) => {
-    const query = request.query as { limit?: number };
+    const query = request.query as { limit?: number; deviceMac?: string };
     const limit = typeof query.limit === "number" && Number.isFinite(query.limit) ? query.limit : 50;
+    const deviceMac = typeof query.deviceMac === "string" ? query.deviceMac : undefined;
 
-    request.log.info({ limit }, "Listing bracelet packets");
+    request.log.info({ limit, deviceMac }, "Listing bracelet packets");
 
-    const packets = await listPackets(limit);
+    const packets = (await listPackets(limit, deviceMac)).map(enrichWithPatient);
 
-    request.log.info({ limit, count: packets.length }, "Listed bracelet packets");
+    request.log.info({ limit, deviceMac, count: packets.length }, "Listed bracelet packets");
 
     return reply.status(200).send({ packets });
   });
@@ -85,6 +108,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
         crcValid,
         decoded,
         mergedHealth,
+        patient: resolvePatientForMac(payload.deviceMac),
         savedAt: saved.createdAt,
       };
 
@@ -170,6 +194,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
           deviceMac: payload.deviceMac,
           packetType: payload.packetType,
           source: payload.source,
+          patient: resolvePatientForMac(payload.deviceMac),
           savedAt: saved.createdAt,
         });
       }

@@ -359,6 +359,9 @@
   <span class="status-dot" id="statusDot"></span>
   <span id="statusText" style="font-size:13px;color:var(--muted);">—</span>
   <div class="header-right">
+    <select id="deviceSelect" onchange="onDeviceChange()" title="Filtrar por pulseira">
+      <option value="">Todas as pulseiras</option>
+    </select>
     <input class="api-input" id="apiBase" value="https://bracelet-pn7r.onrender.com" placeholder="API base URL" />
     <div class="spinner" id="spinner"></div>
     <button class="secondary active" id="autoRefreshBtn" title="Toggle auto-refresh">&#x21BB; Auto</button>
@@ -398,8 +401,9 @@
       </div>
     </div>
     <div class="summary-card">
-      <div class="label">Device MAC</div>
-      <div class="value mono" id="sumMac" style="font-size:14px">—</div>
+      <div class="label">Paciente</div>
+      <div class="value" id="sumPatient" style="font-size:15px">—</div>
+      <div class="sub mono" id="sumMac" style="font-size:12px">—</div>
     </div>
     <div class="summary-card">
       <div class="label">Last Update</div>
@@ -467,6 +471,7 @@
 
 <script>
   let packets = [];
+  let devices = [];
   let autoRefresh = true;
   let refreshTimer = null;
   const REFRESH_INTERVAL = 5000;
@@ -475,22 +480,64 @@
     return document.getElementById('apiBase').value.replace(/\/$/, '');
   }
 
+  function field(obj, camel, snake) {
+    if (!obj) return undefined;
+    return obj[camel] !== undefined ? obj[camel] : obj[snake];
+  }
+
+  function selectedDeviceMac() {
+    return document.getElementById('deviceSelect').value;
+  }
+
+  async function fetchDevices() {
+    try {
+      const res = await fetch(`${apiBase()}/bracelets/devices`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      devices = data.devices || [];
+      renderDeviceSelect();
+    } catch (e) {
+      toast('Falha ao carregar pulseiras: ' + e.message, 'err');
+    }
+  }
+
+  function renderDeviceSelect() {
+    const select = document.getElementById('deviceSelect');
+    const current = select.value;
+    select.innerHTML = '<option value="">Todas as pulseiras</option>' +
+      devices.map(d => {
+        const name = d.patient?.patientName || d.label;
+        const online = d.online ? ' ●' : '';
+        return `<option value="${d.deviceMac}">${name} (${d.deviceMac})${online}</option>`;
+      }).join('');
+    if (current && [...select.options].some(o => o.value === current)) {
+      select.value = current;
+    }
+  }
+
+  function onDeviceChange() {
+    fetchPackets();
+  }
+
   async function fetchPackets() {
     const limit = document.getElementById('limitSelect').value;
+    const deviceMac = selectedDeviceMac();
     const spinner = document.getElementById('spinner');
     spinner.classList.add('active');
     try {
-      const res = await fetch(`${apiBase()}/bracelets/packets?limit=${limit}`);
+      const qs = new URLSearchParams({ limit });
+      if (deviceMac) qs.set('deviceMac', deviceMac);
+      const res = await fetch(`${apiBase()}/bracelets/packets?${qs}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       packets = Array.isArray(data) ? data : (data.packets || data.data || []);
-      setStatus('live', `${packets.length} packets`);
+      setStatus('live', `${packets.length} pacotes`);
       updateSummary();
       renderPanels();
       renderTable();
     } catch (e) {
       setStatus('error', e.message);
-      toast('Failed to fetch: ' + e.message, 'err');
+      toast('Falha ao buscar pacotes: ' + e.message, 'err');
     } finally {
       spinner.classList.remove('active');
     }
@@ -506,11 +553,28 @@
   function updateSummary() {
     document.getElementById('sumTotal').textContent = packets.length;
 
+    const deviceMac = selectedDeviceMac();
+    const device = devices.find(d => d.deviceMac === deviceMac);
+    const patientFromPacket = packets.find(p => field(p, 'patient', 'patient'))?.patient;
+    const patient = device?.patient || patientFromPacket;
+    if (patient) {
+      document.getElementById('sumPatient').textContent = patient.patientName;
+      document.getElementById('sumMac').textContent =
+        (device?.deviceMac || field(packets[0], 'deviceMac', 'device_mac') || '—') +
+        (patient.room ? ` · Leito ${patient.room}` : '');
+    } else if (packets.length > 0) {
+      document.getElementById('sumPatient').textContent = 'MAC não cadastrado';
+      document.getElementById('sumMac').textContent = field(packets[0], 'deviceMac', 'device_mac') || '—';
+    } else {
+      document.getElementById('sumPatient').textContent = '—';
+      document.getElementById('sumMac').textContent = '—';
+    }
+
     // Latest heart rate from 0x28 or 0x09
     const withHR = packets.find(p => p.decoded?.heartRate != null);
     if (withHR) {
       document.getElementById('sumHR').innerHTML = withHR.decoded.heartRate + '<span class="unit">bpm</span>';
-      document.getElementById('sumHRTime').textContent = relTime(withHR.created_at);
+      document.getElementById('sumHRTime').textContent = relTime(field(withHR, 'createdAt', 'created_at'));
     }
 
     // SpO2
@@ -541,15 +605,9 @@
       document.getElementById('sumBatBar').style.background = color;
     }
 
-    // MAC
-    const macPkt = packets.find(p => p.decoded?.type === '0x22' && p.decoded?.mac);
-    const anyMac = packets.find(p => p.device_mac);
-    const mac = macPkt?.decoded?.mac || anyMac?.device_mac;
-    if (mac) document.getElementById('sumMac').textContent = mac;
-
     // Last update
     if (packets.length > 0) {
-      document.getElementById('sumLastUpdate').textContent = relTime(packets[0].created_at);
+      document.getElementById('sumLastUpdate').textContent = relTime(field(packets[0], 'createdAt', 'created_at'));
     }
   }
 
@@ -588,7 +646,7 @@
           <span class="metric-name">Mode</span>
           <span class="badge badge-health">${d.measurementMode ?? '—'}</span>
         </div>
-        <div style="margin-top:10px;font-size:12px;color:var(--muted)">${relTime(h.created_at)}</div>
+        <div style="margin-top:10px;font-size:12px;color:var(--muted)">${relTime(field(h, 'createdAt', 'created_at'))}</div>
       `;
     } else {
       healthEl.innerHTML = '<div class="no-data">No health data yet</div>';
@@ -628,7 +686,7 @@
           <span class="metric-name">&#x23F1;&#xFE0F; Active Time</span>
           <span><span class="metric-val">${d.movementTimeRaw ?? '—'}</span><span class="metric-unit">raw</span></span>
         </div>
-        <div style="margin-top:10px;font-size:12px;color:var(--muted)">${relTime(r.created_at)}</div>
+        <div style="margin-top:10px;font-size:12px;color:var(--muted)">${relTime(field(r, 'createdAt', 'created_at'))}</div>
       `;
     } else {
       realtimeEl.innerHTML = '<div class="no-data">No realtime data yet</div>';
@@ -637,7 +695,9 @@
 
   function renderTable() {
     const filter = document.getElementById('filterType').value;
-    const rows = filter ? packets.filter(p => p.packet_type === filter) : packets;
+    const rows = filter
+      ? packets.filter(p => field(p, 'packetType', 'packet_type') === filter)
+      : packets;
     const tbody = document.getElementById('tableBody');
 
     if (rows.length === 0) {
@@ -647,15 +707,18 @@
 
     tbody.innerHTML = rows.map((p, i) => {
       const id = `row-${p.id}`;
-      const badge = badgeFor(p.packet_type);
-      const crcIcon = p.crc_valid ? '<span style="color:var(--accent2)">&#x2713;</span>' : '<span style="color:var(--danger)">&#x2717;</span>';
+      const packetType = field(p, 'packetType', 'packet_type');
+      const badge = badgeFor(packetType);
+      const crcValid = field(p, 'crcValid', 'crc_valid');
+      const crcIcon = crcValid ? '<span style="color:var(--accent2)">&#x2713;</span>' : '<span style="color:var(--danger)">&#x2717;</span>';
       const summary = summarize(p);
+      const patientName = p.patient?.patientName;
       return `
         <tr onclick="toggleDetail('${id}')">
           <td>${p.id}</td>
-          <td class="timestamp">${formatTime(p.created_at)}</td>
-          <td class="mono">${p.device_mac || '—'}</td>
-          <td><span class="badge ${badge.cls}">${p.packet_type}</span></td>
+          <td class="timestamp">${formatTime(field(p, 'createdAt', 'created_at'))}</td>
+          <td class="mono">${patientName ? patientName + '<br>' : ''}${field(p, 'deviceMac', 'device_mac') || '—'}</td>
+          <td><span class="badge ${badge.cls}">${packetType}</span></td>
           <td>${p.source || '—'}</td>
           <td>${crcIcon}</td>
           <td>${summary}</td>
@@ -685,7 +748,8 @@
   }
 
   function summarize(p) {
-    if (p.decode_error) return `<span class="error-msg">${p.decode_error}</span>`;
+    const decodeError = field(p, 'decodeError', 'decode_error');
+    if (decodeError) return `<span class="error-msg">${decodeError}</span>`;
     const d = p.decoded;
     if (!d) return '<span style="color:var(--muted)">—</span>';
     if (d.type === '0x13') return `Battery: <b>${d.battery}%</b>`;
@@ -702,9 +766,11 @@
   }
 
   function renderDetail(p) {
-    if (p.decode_error) {
-      return `<div class="error-msg">Decode error: ${p.decode_error}</div>
-              <div style="margin-top:8px;color:var(--muted);font-size:12px">Raw hex: <span class="mono">${p.raw_hex || '—'}</span></div>`;
+    const decodeError = field(p, 'decodeError', 'decode_error');
+    const rawHex = field(p, 'rawHex', 'raw_hex');
+    if (decodeError) {
+      return `<div class="error-msg">Decode error: ${decodeError}</div>
+              <div style="margin-top:8px;color:var(--muted);font-size:12px">Raw hex: <span class="mono">${rawHex || '—'}</span></div>`;
     }
     const d = p.decoded || {};
     const entries = Object.entries(d).filter(([k]) => k !== 'type');
@@ -718,7 +784,7 @@
       `).join('')}
       <div class="detail-kv">
         <div class="k">Raw Hex</div>
-        <div class="v mono" style="font-size:11px;word-break:break-all">${p.raw_hex || '—'}</div>
+        <div class="v mono" style="font-size:11px;word-break:break-all">${rawHex || '—'}</div>
       </div>
     </div>`;
   }
@@ -766,6 +832,7 @@
     clearTimeout(refreshTimer);
     if (autoRefresh) {
       refreshTimer = setTimeout(async () => {
+        await fetchDevices();
         await fetchPackets();
         scheduleRefresh();
       }, REFRESH_INTERVAL);
@@ -773,7 +840,7 @@
   }
 
   // Init
-  fetchPackets().then(scheduleRefresh);
+  fetchDevices().then(() => fetchPackets()).then(scheduleRefresh);
 </script>
 </body>
 </html>

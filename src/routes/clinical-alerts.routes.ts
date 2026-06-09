@@ -9,6 +9,7 @@ import {
   getClinicalAssessmentsRouteSchema,
   getLatestClinicalAssessmentRouteSchema,
 } from "../schemas/clinical-alerts.swagger.js";
+import { enrichWithPatient, resolvePatientForMac } from "../services/device-registry.service.js";
 
 export async function clinicalAlertsRoutes(app: FastifyInstance): Promise<void> {
   app.get(
@@ -40,7 +41,10 @@ export async function clinicalAlertsRoutes(app: FastifyInstance): Promise<void> 
         });
       }
 
-      return reply.status(200).send(assessment);
+      return reply.status(200).send({
+        ...assessment,
+        patient: resolvePatientForMac(assessment.deviceMac),
+      });
     },
   );
 
@@ -52,7 +56,9 @@ export async function clinicalAlertsRoutes(app: FastifyInstance): Promise<void> 
       const limit =
         typeof query.limit === "number" && Number.isFinite(query.limit) ? query.limit : 50;
 
-      const assessments = await listClinicalAssessments(query.deviceMac, limit);
+      const assessments = (await listClinicalAssessments(query.deviceMac, limit)).map(
+        enrichWithPatient,
+      );
 
       return reply.status(200).send({ assessments });
     },

@@ -1,5 +1,6 @@
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { packetPayloadSchema } from "./packet.schema.js";
+import { patientFieldSchema } from "./device.swagger.js";
 
 function flattenZodJsonSchema(schema: typeof packetPayloadSchema): Record<string, unknown> {
   const json = zodToJsonSchema(schema, {
@@ -55,6 +56,7 @@ export const packetSuccessResponseSchema = {
       nullable: true,
       description: "Leitura 0x28/0x56 combinada do mesmo ciclo (últimos 5 min)",
     },
+    patient: patientFieldSchema,
     savedAt: { type: "string", example: "2026-05-25 14:30:00" },
   },
 };
@@ -77,6 +79,7 @@ const savedPacketSchema = {
     mergedHealth: { ...decodedSchema, nullable: true },
     decodeError: { type: "string", nullable: true },
     createdAt: { type: "string" },
+    patient: patientFieldSchema,
   },
 };
 
@@ -124,6 +127,11 @@ export const getPacketRouteSchema = {
         maximum: 200,
         default: 50,
         description: "Max number of records to return",
+      },
+      deviceMac: {
+        type: "string",
+        description: "Filter packets by bracelet MAC (case-insensitive)",
+        example: "E6:64:0D:30:D3:F9",
       },
     },
   },

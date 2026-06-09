@@ -149,21 +149,59 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
   return rowToSavedPacket(result.rows[0] as PacketRow);
 }
 
-export async function listPackets(limit = 50): Promise<SavedPacket[]> {
+export async function listPackets(limit = 50, deviceMac?: string): Promise<SavedPacket[]> {
   const pool = getPool();
   const safeLimit = Math.min(Math.max(limit, 1), 200);
+
+  const params: Array<string | number> = [safeLimit];
+  let deviceFilter = "";
+
+  if (deviceMac?.trim()) {
+    params.push(deviceMac.trim().toUpperCase());
+    deviceFilter = "WHERE UPPER(device_mac) = $2";
+  }
 
   const { rows } = await pool.query<PacketRow>(
     `
       SELECT id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at
       FROM packets
+      ${deviceFilter}
       ORDER BY id DESC
       LIMIT $1
     `,
-    [safeLimit],
+    params,
   );
 
   return attachMergedHealth(rows.map(rowToSavedPacket));
+}
+
+export async function getLatestPacketForDevice(
+  deviceMac: string,
+  packetType?: string,
+): Promise<SavedPacket | null> {
+  const pool = getPool();
+  const params: string[] = [deviceMac.trim().toUpperCase()];
+  let typeFilter = "";
+
+  if (packetType?.trim()) {
+    params.push(packetType.trim().toLowerCase());
+    typeFilter = "AND LOWER(packet_type) = $2";
+  }
+
+  const { rows } = await pool.query<PacketRow>(
+    `
+      SELECT id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at
+      FROM packets
+      WHERE UPPER(device_mac) = $1
+        ${typeFilter}
+      ORDER BY id DESC
+      LIMIT 1
+    `,
+    params,
+  );
+
+  if (rows.length === 0) return null;
+  return rowToSavedPacket(rows[0] as PacketRow);
 }
 
 export async function getRecentHealthPackets(
