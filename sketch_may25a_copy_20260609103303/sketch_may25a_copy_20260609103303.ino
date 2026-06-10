@@ -45,10 +45,12 @@ const uint16_t AUTO_SPO2_INTERVAL_MIN = 1;
 const uint16_t AUTO_TEMP_INTERVAL_MIN = 1;
 const uint16_t AUTO_HRV_INTERVAL_MIN = 1;
 
-// Coleta curta para pegar pressão pelo 0x28.
-// Pressão não tem histórico dedicado no PDF.
-const unsigned long PRESSURE_SAMPLE_MS = 20000UL;
-const unsigned long PRINT_028_EVERY_MS = 5000UL;
+// A pressão (FF/GG do 0x28) é CALCULADA pela pulseira a partir da análise de
+// onda de pulso, que roda na medição de HRV (0x28 AA=0x01). Por isso fazemos
+// uma varredura de HRV antes do modo cardíaco, para forçar o recálculo da PA.
+const unsigned long HRV_SAMPLE_MS = 45000UL;      // tempo p/ o algoritmo de PA/HRV convergir
+const unsigned long PRESSURE_SAMPLE_MS = 30000UL; // medição de FC + leitura da PA calculada
+const unsigned long PRINT_028_EVERY_MS = 3000UL;
 const unsigned long SAVE_028_EVERY_MS = 5000UL;
 
 unsigned long lastPrint028 = 0;
@@ -340,6 +342,16 @@ void startBpmPressure() {
 
 void stopBpmPressure() {
   sendCmd(0x28, 0x02, 0x00);
+}
+
+void startHrvMeasurement() {
+  // 0x28 AA=0x01 BB=0x01 — medição de HRV. É aqui que a pulseira faz a análise
+  // de onda de pulso e recalcula a pressão arterial (FF/GG do 0x28).
+  sendCmd(0x28, 0x01, 0x01);
+}
+
+void stopHrvMeasurement() {
+  sendCmd(0x28, 0x01, 0x00);
 }
 
 // ===================== HISTÓRICOS =====================
@@ -788,28 +800,37 @@ void configureAutoThenSleep() {
 
 // ===================== CICLO 2: LER HISTÓRICO + PRESSÃO =====================
 
-void collectPressureRealtime() {
-  Serial.println("[APP] Coletando pressão calculada via 0x28 modo 0x02...");
+void sampleActive028(unsigned long durationMs) {
+  unsigned long start = millis();
+  while (millis() - start < durationMs) {
+    delay(500);
+  }
+}
 
+void collectPressureRealtime() {
   capturePressureEnabled = true;
   lastPrint028 = 0;
   lastSave028 = 0;
 
+  // 1) Medição de HRV: força a pulseira a refazer a análise de onda de pulso,
+  //    que é o que recalcula a pressão arterial (FF/GG). Sem isso, a PA fica
+  //    no último valor calculado (parecia "travada").
+  Serial.println("[APP] Medindo HRV (0x28 01 01) para recalcular a pressão...");
+  startHrvMeasurement();
+  sampleActive028(HRV_SAMPLE_MS);
+  stopHrvMeasurement();
+  delay(800);
+
+  // 2) Medição de FC: lê BPM ao vivo e a pressão já recalculada (FF/GG).
+  Serial.println("[APP] Medindo FC + pressão calculada (0x28 02 01)...");
   startBpmPressure();
-
-  unsigned long start = millis();
-
-  while (millis() - start < PRESSURE_SAMPLE_MS) {
-    delay(500);
-  }
-
+  sampleActive028(PRESSURE_SAMPLE_MS);
   stopBpmPressure();
-
   delay(1000);
 
   capturePressureEnabled = false;
 
-  Serial.println("[APP] Coleta curta de pressão finalizada.");
+  Serial.println("[APP] Coleta de HRV + pressão finalizada.");
 }
 
 void readHistoriesToFile() {
