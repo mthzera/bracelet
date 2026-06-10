@@ -1,4 +1,4 @@
-import type { PacketPayload } from "../schemas/packet.schema.js";
+import type { PacketMetrics } from "../schemas/packet.schema.js";
 import type { DecodedHealth } from "./packet-decoder.service.js";
 
 export type MandatoryVitals = {
@@ -35,7 +35,7 @@ function parseBloodPressure(value: string): { systolic: number; diastolic: numbe
 /** Alinha decoded com metrics do ESP32 para histórico e alertas usarem os mesmos valores. */
 export function enrichDecodedHealthFromMetrics(
   decoded: DecodedHealth,
-  metrics: NonNullable<PacketPayload["metrics"]>,
+  metrics: PacketMetrics,
 ): DecodedHealth {
   const bp = metrics.bloodPressure
     ? parseBloodPressure(metrics.bloodPressure)

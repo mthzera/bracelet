@@ -15,6 +15,7 @@ export type SavePacketInput = {
   crcValid: boolean;
   decoded?: DecodedPacket;
   decodeError?: string;
+  receivedAtMs?: number;
 };
 
 export type SavedPacket = {
@@ -119,6 +120,11 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
   const bytesJson = input.bytes ? JSON.stringify(input.bytes) : null;
   const decodedJson = input.decoded ? JSON.stringify(input.decoded) : null;
 
+  const createdAt =
+    input.receivedAtMs !== undefined
+      ? new Date(input.receivedAtMs).toISOString()
+      : null;
+
   const result = await pool.query<PacketRow>(
     `
       INSERT INTO packets (
@@ -129,9 +135,10 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
         bytes,
         crc_valid,
         decoded,
-        decode_error
+        decode_error,
+        created_at
       )
-      VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8)
+      VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, COALESCE($9::timestamptz, now()))
       RETURNING id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at
     `,
     [
@@ -143,6 +150,7 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
       input.crcValid,
       decodedJson,
       input.decodeError ?? null,
+      createdAt,
     ],
   );
 

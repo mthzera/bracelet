@@ -1,8 +1,8 @@
 import { zodToJsonSchema } from "zod-to-json-schema";
-import { packetPayloadSchema } from "./packet.schema.js";
+import { packetBatchPayloadSchema } from "./packet.schema.js";
 import { patientFieldSchema } from "./device.swagger.js";
 
-function flattenZodJsonSchema(schema: typeof packetPayloadSchema): Record<string, unknown> {
+function flattenZodJsonSchema(schema: typeof packetBatchPayloadSchema): Record<string, unknown> {
   const json = zodToJsonSchema(schema, {
     $refStrategy: "none",
     target: "openApi3",
@@ -20,7 +20,7 @@ function flattenZodJsonSchema(schema: typeof packetPayloadSchema): Record<string
 }
 
 /** Flat OpenAPI body schema (no $ref wrapper). */
-export const packetBodySchema = flattenZodJsonSchema(packetPayloadSchema);
+export const packetBodySchema = flattenZodJsonSchema(packetBatchPayloadSchema);
 
 const decodedSchema = {
   type: "object",
@@ -28,23 +28,14 @@ const decodedSchema = {
   description: "Decoded packet (0x13 battery, 0x22 MAC, 0x28 health, 0x56 HRV history, 0x09 realtime)",
 } as const;
 
-export const packetSuccessResponseSchema = {
+const packetResultSchema = {
   type: "object",
-  required: [
-    "id",
-    "deviceMac",
-    "packetType",
-    "source",
-    "bytes",
-    "crcValid",
-    "decoded",
-    "savedAt",
-  ],
+  required: ["ok", "packetType", "receivedAtMs", "savedAt"],
   properties: {
+    ok: { type: "boolean" },
     id: { type: "integer", description: "Database record ID" },
-    deviceMac: { type: "string", example: "E6:64:0D:30:D3:F9" },
     packetType: { type: "string", example: "0x28" },
-    source: { type: "string", example: "ESP32" },
+    receivedAtMs: { type: "integer", example: 123456 },
     bytes: {
       type: "array",
       items: { type: "integer", minimum: 0, maximum: 255 },
@@ -56,8 +47,22 @@ export const packetSuccessResponseSchema = {
       nullable: true,
       description: "Leitura 0x28/0x56 combinada do mesmo ciclo (últimos 5 min)",
     },
+    error: { type: "string", description: "Present when ok is false" },
+    savedAt: { type: "string", example: "2026-05-25T14:30:00.000Z" },
+  },
+};
+
+export const packetBatchSuccessResponseSchema = {
+  type: "object",
+  required: ["deviceMac", "source", "results"],
+  properties: {
+    deviceMac: { type: "string", example: "E6:64:0D:30:D3:F9" },
+    source: { type: "string", example: "ESP32" },
     patient: patientFieldSchema,
-    savedAt: { type: "string", example: "2026-05-25 14:30:00" },
+    results: {
+      type: "array",
+      items: packetResultSchema,
+    },
   },
 };
 
@@ -102,18 +107,6 @@ export const validationErrorResponseSchema = {
   },
 };
 
-export const decodeErrorResponseSchema = {
-  type: "object",
-  properties: {
-    id: { type: "integer", description: "Database record ID" },
-    error: { type: "string", example: "CRC mismatch" },
-    deviceMac: { type: "string" },
-    packetType: { type: "string" },
-    source: { type: "string" },
-    savedAt: { type: "string" },
-  },
-};
-
 export const getPacketRouteSchema = {
   tags: ["bracelets"],
   summary: "List saved BLE packets",
@@ -145,22 +138,18 @@ export const getPacketRouteSchema = {
 
 export const postPacketRouteSchema = {
   tags: ["bracelets"],
-  summary: "Receive and decode a BLE packet",
+  summary: "Receive and decode BLE packets (batch)",
   description:
-    "Accepts a raw hex packet from the ESP32 gateway. CRC is validated for 16-byte packets (sum of all bytes except last & 0xFF === last byte); 0x13 battery notifies are short packets without CRC. Decodes supported types (0x13, 0x22, 0x28, 0x56, 0x09) and persists the result.",
+    "Accepts a batch of raw hex packets from the ESP32 gateway for a single device. CRC is validated for 16-byte packets (sum of all bytes except last & 0xFF === last byte); 0x13 battery notifies are short packets without CRC. Decodes supported types (0x13, 0x22, 0x28, 0x56, 0x09) and persists each result. receivedAtMs is stored as created_at (Unix epoch milliseconds).",
   body: packetBodySchema,
   response: {
     200: {
-      description: "Packet decoded and saved",
-      ...packetSuccessResponseSchema,
+      description: "Batch processed (each item reports ok or decode error)",
+      ...packetBatchSuccessResponseSchema,
     },
     400: {
       description: "Validation error",
       ...validationErrorResponseSchema,
-    },
-    422: {
-      description: "Decode or CRC error (still saved to DB)",
-      ...decodeErrorResponseSchema,
     },
   },
 };

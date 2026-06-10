@@ -3,7 +3,7 @@ import {
   saveClinicalAssessment,
 } from "../repositories/clinical-alerts.repository.js";
 import { getRecentHealthPackets } from "../repositories/packet.repository.js";
-import type { PacketPayload } from "../schemas/packet.schema.js";
+import type { PacketMetrics } from "../schemas/packet.schema.js";
 import {
   mergeHealthReadings,
   type DecodedHealth,
@@ -38,7 +38,7 @@ function parseBloodPressure(value: string): { systolic: number; diastolic: numbe
 }
 
 export function vitalsFromPacketMetrics(
-  metrics: NonNullable<PacketPayload["metrics"]>,
+  metrics: PacketMetrics,
 ): VitalsInput | null {
   const bp = metrics.bloodPressure ? parseBloodPressure(metrics.bloodPressure) : { systolic: 0, diastolic: 0 };
 
@@ -132,7 +132,7 @@ export async function processClinicalAlertsFromDecoded(
 }
 
 export function vitalsFromMetricsOrDecoded(
-  metrics: PacketPayload["metrics"],
+  metrics: PacketMetrics | undefined,
   decoded?: DecodedHealth,
 ): VitalsInput | null {
   if (metrics) {

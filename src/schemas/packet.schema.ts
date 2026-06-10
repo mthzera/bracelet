@@ -6,7 +6,7 @@ const packetTypeRegex = /^0x[0-9A-Fa-f]{1,2}$/i;
 
 const rawHexRegex = /^([0-9A-Fa-f]{2}\s*)+$/;
 
-const metricsSchema = z
+export const metricsSchema = z
   .object({
     mode: z.string().min(1),
     type: z.string().min(1),
@@ -22,11 +22,10 @@ const metricsSchema = z
   .passthrough()
   .optional();
 
-export const packetPayloadSchema = z
+export type PacketMetrics = NonNullable<z.infer<typeof metricsSchema>>;
+
+const packetItemSchema = z
   .object({
-    deviceMac: z
-      .string()
-      .regex(macAddressRegex, "deviceMac must be a valid MAC address (AA:BB:CC:DD:EE:FF)"),
     packetType: z
       .string()
       .regex(packetTypeRegex, 'packetType must be a hex literal (e.g. "0x28")'),
@@ -34,7 +33,7 @@ export const packetPayloadSchema = z
       .string()
       .min(1)
       .regex(rawHexRegex, "rawHex must be space-separated hex byte pairs"),
-    source: z.string().min(1),
+    receivedAtMs: z.number().int().nonnegative(),
     metrics: metricsSchema,
   })
   .superRefine((data, ctx) => {
@@ -64,4 +63,22 @@ export const packetPayloadSchema = z
     }
   });
 
-export type PacketPayload = z.infer<typeof packetPayloadSchema>;
+export const packetBatchPayloadSchema = z.object({
+  deviceMac: z
+    .string()
+    .regex(macAddressRegex, "deviceMac must be a valid MAC address (AA:BB:CC:DD:EE:FF)"),
+  source: z.string().min(1),
+  packets: z.array(packetItemSchema).min(1).max(50),
+});
+
+export type PacketBatchPayload = z.infer<typeof packetBatchPayloadSchema>;
+export type PacketItem = z.infer<typeof packetItemSchema>;
+
+/** Single packet fields used when persisting to the database. */
+export type PacketPayload = {
+  deviceMac: string;
+  source: string;
+  packetType: string;
+  rawHex: string;
+  metrics?: PacketMetrics;
+};
