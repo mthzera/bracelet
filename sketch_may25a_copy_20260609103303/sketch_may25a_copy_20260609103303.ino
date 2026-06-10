@@ -45,12 +45,10 @@ const uint16_t AUTO_SPO2_INTERVAL_MIN = 1;
 const uint16_t AUTO_TEMP_INTERVAL_MIN = 1;
 const uint16_t AUTO_HRV_INTERVAL_MIN = 1;
 
-// A pressão (FF/GG do 0x28) é CALCULADA pela pulseira a partir da análise de
-// onda de pulso, que roda na medição de HRV (0x28 AA=0x01). Por isso fazemos
-// uma varredura de HRV antes do modo cardíaco, para forçar o recálculo da PA.
-const unsigned long HRV_SAMPLE_MS = 45000UL;      // tempo p/ o algoritmo de PA/HRV convergir
-const unsigned long PRESSURE_SAMPLE_MS = 30000UL; // medição de FC + leitura da PA calculada
-const unsigned long PRINT_028_EVERY_MS = 3000UL;
+// Coleta curta para pegar pressão pelo 0x28.
+// Pressão não tem histórico dedicado no PDF.
+const unsigned long PRESSURE_SAMPLE_MS = 20000UL;
+const unsigned long PRINT_028_EVERY_MS = 5000UL;
 const unsigned long SAVE_028_EVERY_MS = 5000UL;
 
 unsigned long lastPrint028 = 0;
@@ -106,47 +104,6 @@ String packetTypeString(uint8_t type) {
   return String(buf);
 }
 
-// Fuso da pulseira (Brasília, sem horário de verão). O RTC da pulseira guarda
-// hora local; convertemos para epoch UTC somando o offset.
-const long BRACELET_TZ_OFFSET_SECONDS = -3 * 3600;
-
-uint8_t bcdToDec(uint8_t v) {
-  return ((v >> 4) & 0x0F) * 10 + (v & 0x0F);
-}
-
-// Dias desde 1970-01-01 (algoritmo de Howard Hinnant), sem depender de TZ.
-long long daysFromCivil(int y, unsigned m, unsigned d) {
-  y -= m <= 2;
-  long long era = (y >= 0 ? y : y - 399) / 400;
-  unsigned yoe = (unsigned)(y - era * 400);
-  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return era * 146097 + (long long)doe - 719468;
-}
-
-// Lê o timestamp BCD do registro de histórico (recordId em [1..2], data/hora
-// em [3..8] = yy mo dd hh mm ss). Retorna epoch em ms, ou 0 se implausível
-// (aí o chamador usa millis() e a API cai no now() do servidor).
-uint64_t historyMeasuredAtMs(uint8_t* data, size_t len) {
-  if (len < 9) return 0;
-
-  int year = 2000 + bcdToDec(data[3]);
-  int month = bcdToDec(data[4]);
-  int day = bcdToDec(data[5]);
-  int hour = bcdToDec(data[6]);
-  int minute = bcdToDec(data[7]);
-  int second = bcdToDec(data[8]);
-
-  if (year < 2020 || year > 2099 || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) {
-    return 0;
-  }
-
-  long long days = daysFromCivil(year, (unsigned)month, (unsigned)day);
-  long long localSecs = days * 86400LL + hour * 3600LL + minute * 60LL + second;
-  long long utcSecs = localSecs - BRACELET_TZ_OFFSET_SECONDS;
-  return (uint64_t)utcSecs * 1000ULL;
-}
-
 void printHeap(const char* label) {
   Serial.print("[MEM] ");
   Serial.print(label);
@@ -198,22 +155,19 @@ void clearPacketsFile() {
   Serial.println("[FS] Arquivo de pacotes limpo.");
 }
 
-void appendRawPacketToFile(const char* packetType, const String& rawHex, uint64_t receivedAtMs) {
+void appendRawPacketToFile(const char* packetType, const String& rawHex, uint32_t receivedAtMs) {
   File f = SPIFFS.open(PACKETS_FILE, FILE_APPEND);
   if (!f) {
     Serial.println("[FS] Falha ao abrir arquivo para append.");
     return;
   }
 
-  char tsBuf[21];
-  snprintf(tsBuf, sizeof(tsBuf), "%llu", (unsigned long long)receivedAtMs);
-
   f.print("{\"packetType\":\"");
   f.print(packetType);
   f.print("\",\"rawHex\":\"");
   f.print(rawHex);
   f.print("\",\"receivedAtMs\":");
-  f.print(tsBuf);
+  f.print(receivedAtMs);
   f.println("}");
 
   f.close();
@@ -342,16 +296,6 @@ void startBpmPressure() {
 
 void stopBpmPressure() {
   sendCmd(0x28, 0x02, 0x00);
-}
-
-void startHrvMeasurement() {
-  // 0x28 AA=0x01 BB=0x01 — medição de HRV. É aqui que a pulseira faz a análise
-  // de onda de pulso e recalcula a pressão arterial (FF/GG do 0x28).
-  sendCmd(0x28, 0x01, 0x01);
-}
-
-void stopHrvMeasurement() {
-  sendCmd(0x28, 0x01, 0x00);
 }
 
 // ===================== HISTÓRICOS =====================
@@ -662,28 +606,15 @@ void notifyCallback(
     type == 0x54 || type == 0x56 || type == 0x60 || type == 0x62 || type == 0x65 || type == 0x66) {
     String packetType = packetTypeString(type);
 
-    // Timestamp real da medição vem dentro do próprio registro de histórico.
-    // Se não for plausível, cai em millis() (a API usa now() do servidor).
-    uint64_t measuredAtMs = historyMeasuredAtMs(data, len);
-    if (measuredAtMs == 0) {
-      measuredAtMs = (uint64_t)millis();
-    }
-
     Serial.print("[HIST] ");
     Serial.print(packetType);
     Serial.print(" len=");
     Serial.print(len);
     Serial.print(" rawLen=");
-    Serial.print(rawStr.length());
-    Serial.print(" measuredAtMs=");
-    {
-      char tsBuf[21];
-      snprintf(tsBuf, sizeof(tsBuf), "%llu", (unsigned long long)measuredAtMs);
-      Serial.println(tsBuf);
-    }
+    Serial.println(rawStr.length());
 
     if (captureHistoryEnabled) {
-      appendRawPacketToFile(packetType.c_str(), rawStr, measuredAtMs);
+      appendRawPacketToFile(packetType.c_str(), rawStr, millis());
     }
 
     return;
@@ -800,37 +731,28 @@ void configureAutoThenSleep() {
 
 // ===================== CICLO 2: LER HISTÓRICO + PRESSÃO =====================
 
-void sampleActive028(unsigned long durationMs) {
-  unsigned long start = millis();
-  while (millis() - start < durationMs) {
-    delay(500);
-  }
-}
-
 void collectPressureRealtime() {
+  Serial.println("[APP] Coletando pressão calculada via 0x28 modo 0x02...");
+
   capturePressureEnabled = true;
   lastPrint028 = 0;
   lastSave028 = 0;
 
-  // 1) Medição de HRV: força a pulseira a refazer a análise de onda de pulso,
-  //    que é o que recalcula a pressão arterial (FF/GG). Sem isso, a PA fica
-  //    no último valor calculado (parecia "travada").
-  Serial.println("[APP] Medindo HRV (0x28 01 01) para recalcular a pressão...");
-  startHrvMeasurement();
-  sampleActive028(HRV_SAMPLE_MS);
-  stopHrvMeasurement();
-  delay(800);
-
-  // 2) Medição de FC: lê BPM ao vivo e a pressão já recalculada (FF/GG).
-  Serial.println("[APP] Medindo FC + pressão calculada (0x28 02 01)...");
   startBpmPressure();
-  sampleActive028(PRESSURE_SAMPLE_MS);
+
+  unsigned long start = millis();
+
+  while (millis() - start < PRESSURE_SAMPLE_MS) {
+    delay(500);
+  }
+
   stopBpmPressure();
+
   delay(1000);
 
   capturePressureEnabled = false;
 
-  Serial.println("[APP] Coleta de HRV + pressão finalizada.");
+  Serial.println("[APP] Coleta curta de pressão finalizada.");
 }
 
 void readHistoriesToFile() {
