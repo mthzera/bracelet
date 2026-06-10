@@ -38,10 +38,10 @@ const char* DEVICE_MAC = "e6:64:0d:30:d3:f9";
 
 // ── Intervalos ────────────────────────────────────────────────────────────────
 const unsigned long MEASURE_INTERVAL_MS    = 1UL * 60UL * 1000UL;
-const unsigned long PING_INTERVAL_MS       = 30UL * 1000UL;
+const unsigned long PING_INTERVAL_MS       = 5UL * 60UL * 1000UL;
 const unsigned long WIFI_RETRY_MS          = 10000UL;
 const unsigned long BLE_RETRY_DELAY_MS     = 10000UL;
-const unsigned long HTTP_RETRY_INTERVAL_MS = 5000UL;
+const unsigned long HTTP_RETRY_INTERVAL_MS = 30000UL;
 
 // ── Timeouts BLE ──────────────────────────────────────────────────────────────
 const unsigned long SPO2_WARMUP_MS         = 15000;
@@ -431,6 +431,7 @@ void handleBatteryPacket(uint8_t* data, size_t len) {
 }
 
 void handleMacPacket(uint8_t* data, size_t len) {
+  if (gotMacResp) return;
   if (len >= 7) {
     snprintf(deviceMacResp, sizeof(deviceMacResp),
              "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -444,6 +445,7 @@ void handleMacPacket(uint8_t* data, size_t len) {
 }
 
 void handleFirmwarePacket(uint8_t* data, size_t len) {
+  if (gotFirmware) return;
   if (len >= 4) {
     snprintf(deviceFirmware, sizeof(deviceFirmware),
              "V%u.%u.%u", data[1], data[2], data[3]);
@@ -514,46 +516,39 @@ void handleHealthPacket(uint8_t* data, size_t len) {
 
 void handleRealtimeActivityPacket(uint8_t* data, size_t len) {
   if (len < 22) return;
-  uint32_t steps     = readU32LE(data, 1);
-  uint32_t calRaw    = readU32LE(data, 5);
   uint32_t distRaw   = readU32LE(data, 9);
   uint32_t activeMs  = readU32LE(data, 13);
   uint32_t intenseMs = readU32LE(data, 17);
   uint8_t  hr        = data[21];
-  float    cal       = calRaw  / 100.0f;
   float    dist      = distRaw / 100.0f;
   uint16_t tempRaw   = (len >= 24) ? readU16LE(data, 22) : 0;
   uint8_t  spo2val   = (len >= 25) ? data[24] : 0;
 
-  Serial.printf("[BLE] Atividade — Passos=%u Cal=%.1f Dist=%.1fm HR=%u\n",
-                steps, cal, dist, hr);
+  Serial.printf("[BLE] Atividade — Dist=%.1fm HR=%u\n", dist, hr);
 
   char hex[50];
   storeHex(hex, sizeof(hex), data, len < 16 ? len : 16);
   char metricsJson[256];
   snprintf(metricsJson, sizeof(metricsJson),
-           "{\"steps\":%u,\"calories\":%.1f,\"distance\":%.1f,"
-           "\"activeTime\":%u,\"intenseTime\":%u,"
+           "{\"distance\":%.1f,\"activeTime\":%u,\"intenseTime\":%u,"
            "\"heartRate\":%u,\"temperature\":%.1f,\"spO2\":%u}",
-           steps, cal, dist, activeMs, intenseMs, hr, tempRaw / 10.0f, spo2val);
+           dist, activeMs, intenseMs, hr, tempRaw / 10.0f, spo2val);
   enqueuePacket("0x09", hex, metricsJson);
 }
 
 void handleSportRealtimePacket(uint8_t* data, size_t len) {
   if (len < 14) return;
   uint8_t  hr     = data[1];
-  uint32_t steps  = readU32LE(data, 2);
-  uint32_t calRaw = readU32LE(data, 6);
   uint32_t exTime = readU32LE(data, 10);
 
-  Serial.printf("[BLE] Esporte — HR=%u Passos=%u Tempo=%us\n", hr, steps, exTime);
+  Serial.printf("[BLE] Esporte — HR=%u Tempo=%us\n", hr, exTime);
 
   char hex[50];
   storeHex(hex, sizeof(hex), data, len < 16 ? len : 16);
-  char metricsJson[128];
+  char metricsJson[64];
   snprintf(metricsJson, sizeof(metricsJson),
-           "{\"heartRate\":%u,\"steps\":%u,\"calories\":%u,\"exerciseTime\":%u}",
-           hr, steps, calRaw, exTime);
+           "{\"heartRate\":%u,\"exerciseTime\":%u}",
+           hr, exTime);
   enqueuePacket("0x18", hex, metricsJson);
 }
 
@@ -740,15 +735,16 @@ bool connectToBraceletOnce() {
 
 bool connectToBracelet() {
   for (int attempt = 1; attempt <= BLE_CONNECT_MAX_ATTEMPTS; attempt++) {
+    yield();
     Serial.printf("[BLE] Tentativa %d/%d\n", attempt, BLE_CONNECT_MAX_ATTEMPTS);
     releaseBleStack();
     if (!startBleStack()) continue;
     if (connectToBraceletOnce()) return true;
     releaseBleStack();
     if (attempt < BLE_CONNECT_MAX_ATTEMPTS) {
-      // Aproveita a espera para processar WiFi e fila HTTP
       unsigned long t = millis();
       while (millis() - t < BLE_RETRY_DELAY_MS) {
+        yield();
         ensureWifi();
         delay(200);
       }
@@ -771,22 +767,7 @@ bool ensureBraceletConnected() {
   Serial.println("[BLE] Pulseira offline. Tentando reconectar...");
   bleState = BleState::RECONNECTING;
 
-  // Reconexão limpa sem derrubar WiFi
-  if (bleClient && bleClient->isConnected()) {
-    bleClient->disconnect();
-    delay(200);
-  }
-  bleClient = nullptr;
-  txChar = rxChar = nullptr;
-  bleLinkUp = false;
-
-  if (bleStackInitialized) {
-    BLEDevice::deinit(true);
-    bleStackInitialized = false;
-    delay(600);
-  }
-
-  if (!startBleStack() || !connectToBraceletOnce()) {
+  if (!connectToBracelet()) {
     bleState = BleState::DISCONNECTED;
     Serial.printf("[BLE] Reconexão falhou. Próxima tentativa em %lus.\n",
                   BLE_RETRY_DELAY_MS / 1000);
@@ -845,13 +826,15 @@ bool validateJsonPayload(const char* payload) {
   return ok;
 }
 
+bool isTimeSynced() {
+  struct tm ti;
+  if (!getLocalTime(&ti, 1000)) return false;
+  // Ano < 2024 indica que o NTP ainda não sincronizou
+  return (ti.tm_year + 1900) >= 2024;
+}
+
 bool doPost(const char* payload) {
   // ── 1. WiFi ──────────────────────────────────────────────────────────────
-  wl_status_t wifiStatus = (wl_status_t)WiFi.status();
-  Serial.printf("[HTTP] WiFi status: %d (%s)\n",
-                wifiStatus,
-                wifiStatus == WL_CONNECTED ? "CONECTADO" : "DESCONECTADO");
-
   if (!ensureWifi()) {
     Serial.println("[HTTP] ERRO: WiFi indisponível — POST abortado.");
     return false;
@@ -859,29 +842,42 @@ bool doPost(const char* payload) {
 
   // ── 2. Validação do payload ───────────────────────────────────────────────
   size_t payloadLen = strlen(payload);
-  Serial.printf("[HTTP] POST %s\n", API_URL);
-  Serial.printf("[HTTP] Payload (%u bytes):\n%s\n", payloadLen, payload);
+  Serial.printf("[HTTP] POST %s  (%u bytes)  heap=%u\n",
+                API_URL, payloadLen, ESP.getFreeHeap());
+  Serial.printf("[HTTP] Payload:\n%s\n", payload);
 
   if (!validateJsonPayload(payload)) {
     Serial.println("[HTTP] ERRO: payload inválido — POST abortado.");
     return false;
   }
 
-  // ── 3. Conexão SSL ────────────────────────────────────────────────────────
+  // ── 3. Monitor de heap — libera BLE se RAM insuficiente para TLS ──────────
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < 40000) {
+    Serial.printf("[HTTP] Heap baixo (%u bytes) — liberando BLE e tentando POST.\n", freeHeap);
+    releaseBleStack();
+    delay(300);
+    freeHeap = ESP.getFreeHeap();
+    Serial.printf("[HTTP] Heap após liberar BLE: %u bytes\n", freeHeap);
+    if (freeHeap < 40000) {
+      Serial.println("[HTTP] Heap ainda insuficiente — abortando.");
+      return false;
+    }
+  }
+
+  // ── 4. Conexão SSL ────────────────────────────────────────────────────────
   WiFiClientSecure sc;
   sc.setInsecure();
   sc.setHandshakeTimeout(30);
 
   HTTPClient http;
   http.setReuse(false);
-  http.setTimeout(20000);
+  http.setTimeout(30000);
 
-  Serial.printf("[HTTP] Conectando a %s...\n", API_URL);
   if (!http.begin(sc, API_URL)) {
     Serial.println("[HTTP] ERRO: http.begin() falhou (DNS ou SSL).");
     return false;
   }
-  Serial.println("[HTTP] http.begin() OK");
 
   http.addHeader("Content-Type", "application/json");
 
@@ -891,32 +887,15 @@ bool doPost(const char* payload) {
   unsigned long elapsed = millis() - t0;
 
   // ── 5. Resultado ──────────────────────────────────────────────────────────
-  Serial.printf("[HTTP] Status: %d  (em %lums)\n", code, elapsed);
+  Serial.printf("[HTTP] Status: %d  error=%s  (em %lums)\n",
+                code, http.errorToString(code).c_str(), elapsed);
 
   if (code <= 0) {
-    // Erros negativos do HTTPClient
-    switch (code) {
-      case HTTPC_ERROR_CONNECTION_REFUSED:
-        Serial.println("[HTTP] ERRO: conexão recusada pelo servidor."); break;
-      case HTTPC_ERROR_SEND_HEADER_FAILED:
-        Serial.println("[HTTP] ERRO: falha ao enviar headers."); break;
-      case HTTPC_ERROR_SEND_PAYLOAD_FAILED:
-        Serial.println("[HTTP] ERRO: falha ao enviar payload."); break;
-      case HTTPC_ERROR_NOT_CONNECTED:
-        Serial.println("[HTTP] ERRO: não conectado."); break;
-      case HTTPC_ERROR_CONNECTION_LOST:
-        Serial.println("[HTTP] ERRO: conexão perdida durante envio."); break;
-      case HTTPC_ERROR_READ_TIMEOUT:
-        Serial.println("[HTTP] ERRO: timeout aguardando resposta da API."); break;
-      default:
-        Serial.printf("[HTTP] ERRO HTTPClient: %d\n", code); break;
-    }
     Serial.printf("[HTTP] Payload que falhou:\n%s\n", payload);
     http.end();
     return false;
   }
 
-  // Response body
   String responseBody = http.getString();
   if (responseBody.length() > 0) {
     Serial.printf("[HTTP] Response:\n%s\n", responseBody.c_str());
@@ -927,7 +906,6 @@ bool doPost(const char* payload) {
     Serial.println("[HTTP] OK — pacote aceito pela API.");
   } else {
     Serial.printf("[HTTP] FALHA — API rejeitou (HTTP %d).\n", code);
-    Serial.printf("[HTTP] Payload rejeitado:\n%s\n", payload);
   }
 
   http.end();
@@ -1217,6 +1195,36 @@ void pingServerPeriodically() {
 //  SETUP & LOOP
 // ════════════════════════════════════════════════════════════════════════════
 
+void waitForApiWarmup() {
+  Serial.println("[API] Aguardando API acordar (cold start Render)...");
+  unsigned long t = millis();
+  while (millis() - t < 60000) {
+    yield();
+    WiFiClientSecure sc;
+    sc.setInsecure();
+    sc.setHandshakeTimeout(30);
+    HTTPClient h;
+    h.setReuse(false);
+    h.setTimeout(10000);
+    String url = String(API_BASE) + "/health";
+    if (h.begin(sc, url)) {
+      int code = h.GET();
+      String body = h.getString();
+      h.end();
+      if (code == 200) {
+        Serial.printf("[API] Online (HTTP %d) — %s\n", code, body.c_str());
+        return;
+      }
+      Serial.printf("[API] Aguardando... (HTTP %d)\n", code);
+    } else {
+      h.end();
+      Serial.println("[API] Aguardando... (begin falhou)");
+    }
+    delay(5000);
+  }
+  Serial.println("[API] Timeout warm-up — continuando mesmo assim.");
+}
+
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
@@ -1234,11 +1242,12 @@ void setup() {
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
   WiFi.setSleep(false);
 
-  checkApiHealth();
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  waitForApiWarmup();
 
   resetMeasurementState();
   while (!connectToBracelet()) {
+    yield();
     Serial.printf("[BLE] Pulseira indisponível. Nova tentativa em %lus...\n",
                   BLE_RETRY_DELAY_MS / 1000);
     ensureWifi();
