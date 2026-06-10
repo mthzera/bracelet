@@ -245,7 +245,7 @@ export type CycleSummaryData = {
   temperature: number | null;
   hrv: number | null;
   fatigue: number | null;
-  bloodPressure: { systolic: number | null; diastolic: number | null };
+  bloodPressure: { systolic: number | null; diastolic: number | null; measuredAt: string | null };
   spo2: number | null;
   battery: number | null;
   sleepMinutes: number | null;
@@ -363,6 +363,7 @@ function buildCycleSummary(group: SavedPacket[]): CycleSummary | null {
   const fatigue56: number[] = [];
   const systolicValues: number[] = [];
   const diastolicValues: number[] = [];
+  let bloodPressureAt: string | null = null; // horário da leitura de PA mais recente
   const spo2Values: number[] = [];
   let battery: number | null = null;
   let firmware: string | null = null;
@@ -413,6 +414,7 @@ function buildCycleSummary(group: SavedPacket[]): CycleSummary | null {
           ) {
             systolicValues.push(decoded.systolicPressure);
             diastolicValues.push(decoded.diastolicPressure);
+            bloodPressureAt = packet.createdAt; // sorted asc -> fica com a leitura mais recente
           }
           if (isValidSpo2(decoded.spo2)) spo2Values.push(decoded.spo2);
         }
@@ -490,7 +492,7 @@ function buildCycleSummary(group: SavedPacket[]): CycleSummary | null {
     temperature,
     hrv,
     fatigue,
-    bloodPressure: { systolic, diastolic },
+    bloodPressure: { systolic, diastolic, measuredAt: systolic !== null ? bloodPressureAt : null },
     spo2,
     battery,
     sleepMinutes: sleep?.sleepMinutes ?? null,

@@ -160,6 +160,7 @@ const cycleSummaryItemSchema = {
           properties: {
             systolic: { type: "number", nullable: true, example: 127 },
             diastolic: { type: "number", nullable: true, example: 77 },
+            measuredAt: { type: "string", format: "date-time", nullable: true, description: "Horário da leitura de PA mais recente da janela" },
           },
         },
         spo2: { type: "number", nullable: true, example: null, description: "Opcional; null quando ausente" },

@@ -872,11 +872,20 @@
     return `<b>${sum.heartRate}</b> bpm${extra}`;
   }
 
+  function timeOnly(ts) {
+    if (!ts) return '';
+    return new Date(ts).toLocaleTimeString('pt-BR', { hour12: false });
+  }
+
   function bpCell(sum) {
     const bp = sum.bloodPressure || {};
-    return (bp.systolic != null && bp.diastolic != null)
-      ? `<b>${bp.systolic}/${bp.diastolic}</b>`
-      : '<span style="color:var(--muted)">--</span>';
+    if (bp.systolic == null || bp.diastolic == null) {
+      return '<span style="color:var(--muted)">--</span>';
+    }
+    const at = bp.measuredAt
+      ? `<div class="sm" style="color:var(--muted)">${timeOnly(bp.measuredAt)}</div>`
+      : '';
+    return `<b>${bp.systolic}/${bp.diastolic}</b>${at}`;
   }
 
   function renderTableHead() {
@@ -966,7 +975,7 @@
       ['Temperatura', v(sum.temperature, '°C')],
       ['HRV', v(sum.hrv, ' ms')],
       ['Fadiga', v(sum.fatigue, '')],
-      ['Pressão arterial', (bp.systolic != null && bp.diastolic != null) ? `${bp.systolic}/${bp.diastolic} mmHg` : dash],
+      ['Pressão arterial', (bp.systolic != null && bp.diastolic != null) ? `${bp.systolic}/${bp.diastolic} mmHg${bp.measuredAt ? ` <span style="color:var(--muted)">(${formatTime(bp.measuredAt)})</span>` : ''}` : dash],
       ['SpO2', v(sum.spo2, '%')],
       ['Sono', s.sleep ? `${s.sleep.sleepMinutes} min${s.sleep.date ? ` · ${s.sleep.date} ${s.sleep.time}` : ''}` : dash],
       ['Bateria', v(sum.battery, '%')],
