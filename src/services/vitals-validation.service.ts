@@ -83,34 +83,28 @@ export function mandatoryVitalsFromDecoded(decoded: {
   };
 }
 
-function parseBloodPressure(value: string): { systolic: number; diastolic: number } {
-  const match = value.match(/(\d+)\s*\/\s*(\d+)/);
-  if (!match) return { systolic: 0, diastolic: 0 };
-  return { systolic: Number(match[1]), diastolic: Number(match[2]) };
-}
-
-/** Alinha decoded com metrics do ESP32 para histórico e alertas usarem os mesmos valores. */
+/**
+ * O rawHex decodificado é a fonte de verdade; `metrics` (opcional) só preenche
+ * o que o decode não conseguiu (ex.: pacote truncado). Por isso o decoded tem
+ * preferência e o metrics entra como fallback quando o campo veio 0/ausente.
+ */
 export function enrichDecodedHealthFromMetrics(
   decoded: DecodedHealth,
   metrics: PacketMetrics,
 ): DecodedHealth {
-  const bp = metrics.bloodPressure
-    ? parseBloodPressure(metrics.bloodPressure)
-    : { systolic: 0, diastolic: 0 };
-
-  const heartRate = metrics.heartRate ?? 0;
-  const spO2 = metrics.spO2 ?? 0;
-  const temperature = metrics.temperature ?? 0;
+  const fallback = (decodedValue: number, metricValue: number | undefined): number => {
+    if (decodedValue > 0) return decodedValue;
+    return metricValue !== undefined && metricValue > 0 ? metricValue : decodedValue;
+  };
 
   return {
     ...decoded,
-    heartRate: heartRate > 0 ? heartRate : decoded.heartRate,
-    spo2: spO2 > 0 ? spO2 : decoded.spo2,
-    temperature: temperature > 0 ? temperature : decoded.temperature,
-    hrv: metrics.hrv !== undefined && metrics.hrv > 0 ? metrics.hrv : decoded.hrv,
-    fatigue:
-      metrics.fatigue !== undefined && metrics.fatigue > 0 ? metrics.fatigue : decoded.fatigue,
-    systolicPressure: bp.systolic > 0 ? bp.systolic : decoded.systolicPressure,
-    diastolicPressure: bp.diastolic > 0 ? bp.diastolic : decoded.diastolicPressure,
+    heartRate: fallback(decoded.heartRate, metrics.bpm),
+    spo2: fallback(decoded.spo2, metrics.spo2),
+    temperature: fallback(decoded.temperature, metrics.temperature),
+    hrv: fallback(decoded.hrv, metrics.hrv),
+    fatigue: fallback(decoded.fatigue, metrics.fatigue),
+    systolicPressure: fallback(decoded.systolicPressure, metrics.bloodPressureSystolic),
+    diastolicPressure: fallback(decoded.diastolicPressure, metrics.bloodPressureDiastolic),
   };
 }

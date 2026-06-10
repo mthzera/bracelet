@@ -16,6 +16,7 @@ export type SavePacketInput = {
   decoded?: DecodedPacket;
   decodeError?: string;
   receivedAtMs?: number;
+  ingestionBatchId?: string;
 };
 
 export type SavedPacket = {
@@ -29,6 +30,7 @@ export type SavedPacket = {
   decoded: DecodedPacket | null;
   mergedHealth?: DecodedHealth | null;
   decodeError: string | null;
+  ingestionBatchId: string | null;
   createdAt: string;
 };
 
@@ -44,6 +46,7 @@ type PacketRow = {
   crc_valid: boolean;
   decoded: DecodedPacket | null;
   decode_error: string | null;
+  ingestion_batch_id: string | null;
   created_at: Date;
 };
 
@@ -121,6 +124,7 @@ function rowToSavedPacket(row: PacketRow): SavedPacket {
     crcValid: row.crc_valid,
     decoded: row.decoded,
     decodeError: row.decode_error,
+    ingestionBatchId: row.ingestion_batch_id,
     createdAt: row.created_at.toISOString(),
   };
 }
@@ -147,10 +151,11 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
         crc_valid,
         decoded,
         decode_error,
+        ingestion_batch_id,
         created_at
       )
-      VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, COALESCE($9::timestamptz, now()))
-      RETURNING id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at
+      VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, $9, COALESCE($10::timestamptz, now()))
+      RETURNING id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, ingestion_batch_id, created_at
     `,
     [
       input.payload.deviceMac,
@@ -161,6 +166,7 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
       input.crcValid,
       decodedJson,
       input.decodeError ?? null,
+      input.ingestionBatchId ?? null,
       createdAt,
     ],
   );
@@ -182,7 +188,7 @@ export async function listPackets(limit = 50, deviceMac?: string): Promise<Saved
 
   const { rows } = await pool.query<PacketRow>(
     `
-      SELECT id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at
+      SELECT id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, ingestion_batch_id, created_at
       FROM packets
       ${deviceFilter}
       ORDER BY id DESC
@@ -209,7 +215,7 @@ export async function getLatestPacketForDevice(
 
   const { rows } = await pool.query<PacketRow>(
     `
-      SELECT id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at
+      SELECT id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, ingestion_batch_id, created_at
       FROM packets
       WHERE UPPER(device_mac) = $1
         ${typeFilter}
@@ -232,7 +238,7 @@ export async function getRecentHealthPackets(
 
   const { rows } = await pool.query<PacketRow>(
     `
-      SELECT id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at
+      SELECT id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, ingestion_batch_id, created_at
       FROM packets
       WHERE device_mac = $1
         AND packet_type IN ('0x28', '0x56')

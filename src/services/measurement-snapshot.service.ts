@@ -4,7 +4,15 @@ import {
   missingVitalFields,
 } from "./vitals-validation.service.js";
 import {
+  crcApplies,
   decodePacket,
+  isValidDiastolic,
+  isValidFatigue,
+  isValidHeartRate,
+  isValidHrv,
+  isValidSpo2,
+  isValidSystolic,
+  isValidTemperature,
   mergeHealthReadings,
   PacketDecoderError,
   type DecodedBattery,
@@ -16,8 +24,11 @@ import {
   type DecodedSleep,
 } from "./packet-decoder.service.js";
 
-/** Espaço entre pacotes do mesmo ciclo ESP32 (coleta BLE + histórico). */
-const CYCLE_GAP_MS = 3 * 60 * 1000;
+/**
+ * Janela de coleta BLE: a pulseira mede BPM por ~10 min (0x28 02 01) e logo
+ * depois o ESP32 puxa históricos. Pacotes dentro dessa janela formam 1 ciclo.
+ */
+const CYCLE_GAP_MS = 10 * 60 * 1000;
 
 export type SnapshotSleep = {
   date: string;
@@ -207,6 +218,321 @@ export function buildSnapshotsFromPackets(
   return snapshots;
 }
 
+// ── Consolidado por ciclo (formato para o front: 1 linha = 1 ciclo) ──────────
+
+export type CycleRawPacket = {
+  id: number;
+  packetType: string;
+  rawHex: string;
+  crcValid: boolean;
+  crcApplicable: boolean;
+  decodeError: string | null;
+  decoded: DecodedPacket | null;
+  receivedAt: string;
+};
+
+export type CycleCrcCounts = {
+  valid: number;
+  invalid: number;
+  notApplicable: number;
+};
+
+/** Resumo clínico do ciclo. null = ausente (o front mostra "--", nunca 0). */
+export type CycleSummaryData = {
+  heartRate: number | null;
+  heartRateMin: number | null;
+  heartRateMax: number | null;
+  temperature: number | null;
+  hrv: number | null;
+  fatigue: number | null;
+  bloodPressure: { systolic: number | null; diastolic: number | null };
+  spo2: number | null;
+  battery: number | null;
+  sleepMinutes: number | null;
+  firmware: string | null;
+};
+
+/** Quais famílias de pacote alimentaram este ciclo. */
+export type CycleSources = {
+  activePackets: boolean;
+  heartRateHistory: boolean;
+  hrvFatigueHistory: boolean;
+  temperatureHistory: boolean;
+};
+
+export type CycleSummary = {
+  cycleId: string;
+  deviceMac: string;
+  source: string;
+  startedAt: string;
+  endedAt: string;
+  summary: CycleSummaryData;
+  sources: CycleSources;
+  sleep: SnapshotSleep | null;
+  deviceMacReported: string | null;
+  packetTypes: string[];
+  packetsCount: number;
+  crc: CycleCrcCounts;
+  complete: boolean;
+  missing: string[];
+  rawPackets: CycleRawPacket[];
+};
+
+function newestMs(packets: SavedPacket[]): number {
+  return packets.reduce((latest, packet) => {
+    const ts = new Date(packet.createdAt).getTime();
+    return ts > latest ? ts : latest;
+  }, 0);
+}
+
+/**
+ * Agrupa pacotes por ciclo: prioriza ingestionBatchId quando presente;
+ * registros antigos (sem batch id) caem no agrupamento por janela de tempo.
+ */
+function groupPacketsByCycleKey(packets: SavedPacket[]): SavedPacket[][] {
+  const byBatchId = new Map<string, SavedPacket[]>();
+  const legacy: SavedPacket[] = [];
+
+  for (const packet of packets) {
+    if (packet.ingestionBatchId) {
+      const list = byBatchId.get(packet.ingestionBatchId) ?? [];
+      list.push(packet);
+      byBatchId.set(packet.ingestionBatchId, list);
+    } else {
+      legacy.push(packet);
+    }
+  }
+
+  const groups: SavedPacket[][] = [...byBatchId.values()];
+
+  // Registros antigos (sem batch id): agrupa por deviceMac + janela de tempo curta.
+  const legacyByDevice = new Map<string, SavedPacket[]>();
+  for (const packet of legacy) {
+    const list = legacyByDevice.get(packet.deviceMac) ?? [];
+    list.push(packet);
+    legacyByDevice.set(packet.deviceMac, list);
+  }
+  for (const devicePackets of legacyByDevice.values()) {
+    groups.push(...groupPacketsByCycle(devicePackets));
+  }
+
+  // Mais recentes primeiro.
+  return groups.sort((a, b) => newestMs(b) - newestMs(a));
+}
+
+function cycleIdForGroup(group: SavedPacket[]): string {
+  const batchId = group.find((packet) => packet.ingestionBatchId)?.ingestionBatchId;
+  if (batchId) return batchId;
+  const ids = group.map((packet) => packet.id);
+  return `win-${Math.min(...ids)}-${Math.max(...ids)}`;
+}
+
+function lastOf(values: number[]): number | null {
+  return values.length > 0 ? (values[values.length - 1] ?? null) : null;
+}
+
+/**
+ * Consolida a janela de coleta em um único resumo clínico.
+ * - heartRate: valores válidos do 0x28 (preferência) com último/min/máx; se não
+ *   houver ativos, usa o histórico 0x54/0x55.
+ * - temperature: último válido do 0x28; senão 0x62/0x65.
+ * - hrv/fatigue: do 0x28 quando válidos; senão histórico 0x56.
+ * - bloodPressure: data[6]/data[7] do 0x28 quando ambos válidos.
+ * - spo2: data[3] do 0x28 (opcional); senão 0x60/0x66.
+ * Campos sem valor válido ficam null.
+ */
+function buildCycleSummary(group: SavedPacket[]): CycleSummary | null {
+  if (group.length === 0) return null;
+
+  const sorted = [...group].sort(
+    (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+  );
+
+  const hrActive: number[] = [];
+  const hrHistory: number[] = [];
+  let tempActive: number | null = null;
+  let tempHistory: number | null = null;
+  let hrvActive: number | null = null;
+  let hrvHistory: number | null = null;
+  let fatigueActive: number | null = null;
+  let fatigueHistory: number | null = null;
+  let systolic: number | null = null;
+  let diastolic: number | null = null;
+  let spo2Active: number | null = null;
+  let spo2History: number | null = null;
+  let battery: number | null = null;
+  let firmware: string | null = null;
+  let sleep: SnapshotSleep | null = null;
+  let deviceMacReported: string | null = null;
+
+  const sources: CycleSources = {
+    activePackets: false,
+    heartRateHistory: false,
+    hrvFatigueHistory: false,
+    temperatureHistory: false,
+  };
+
+  const crc: CycleCrcCounts = { valid: 0, invalid: 0, notApplicable: 0 };
+  const rawPackets: CycleRawPacket[] = [];
+
+  for (const packet of sorted) {
+    const applicable = crcApplies(packet.packetType);
+    if (!applicable) crc.notApplicable++;
+    else if (packet.crcValid) crc.valid++;
+    else crc.invalid++;
+
+    rawPackets.push({
+      id: packet.id,
+      packetType: packet.packetType,
+      rawHex: packet.rawHex,
+      crcValid: packet.crcValid,
+      crcApplicable: applicable,
+      decodeError: packet.decodeError,
+      decoded: packet.decoded,
+      receivedAt: packet.createdAt,
+    });
+
+    const decoded = freshDecoded(packet);
+    const type = packet.packetType.toLowerCase();
+
+    switch (type) {
+      case "0x28": // active measurement packet
+        if (decoded?.type === "0x28") {
+          sources.activePackets = true;
+          if (isValidHeartRate(decoded.heartRate)) hrActive.push(decoded.heartRate);
+          if (isValidTemperature(decoded.temperature)) tempActive = decoded.temperature;
+          if (isValidHrv(decoded.hrv)) hrvActive = decoded.hrv;
+          if (isValidFatigue(decoded.fatigue)) fatigueActive = decoded.fatigue;
+          if (
+            isValidSystolic(decoded.systolicPressure) &&
+            isValidDiastolic(decoded.diastolicPressure)
+          ) {
+            systolic = decoded.systolicPressure;
+            diastolic = decoded.diastolicPressure;
+          }
+          if (isValidSpo2(decoded.spo2)) spo2Active = decoded.spo2;
+        }
+        break;
+      case "0x54": // histórico de BPM (bulk)
+      case "0x55": // histórico de BPM (pontual)
+        sources.heartRateHistory = true;
+        if (decoded?.type === "0x28" && isValidHeartRate(decoded.heartRate)) {
+          hrHistory.push(decoded.heartRate);
+        }
+        break;
+      case "0x56": // histórico HRV/fadiga
+        sources.hrvFatigueHistory = true;
+        if (decoded?.type === "0x56") {
+          if (isValidHrv(decoded.hrv)) hrvHistory = decoded.hrv;
+          if (isValidFatigue(decoded.fatigue)) fatigueHistory = decoded.fatigue;
+        }
+        break;
+      case "0x62": // temperatura manual
+      case "0x65": // temperatura automática
+        sources.temperatureHistory = true;
+        if (decoded?.type === "0x28" && isValidTemperature(decoded.temperature)) {
+          tempHistory = decoded.temperature;
+        }
+        break;
+      case "0x60": // SpO2 manual
+      case "0x66": // SpO2 automático
+        if (decoded?.type === "0x28" && isValidSpo2(decoded.spo2)) {
+          spo2History = decoded.spo2;
+        }
+        break;
+      case "0x13":
+        if (decoded?.type === "0x13") battery = decoded.battery;
+        break;
+      case "0x27":
+        if (decoded?.type === "0x27") {
+          firmware = `V${decoded.major}.${decoded.minor}.${decoded.patch}`;
+        }
+        break;
+      case "0x53":
+        if (decoded?.type === "0x53") {
+          sleep = {
+            date: decoded.date,
+            time: decoded.time,
+            sleepMinutes: decoded.sleepMinutes,
+            recordId: decoded.recordId,
+          };
+        }
+        break;
+      case "0x22":
+        if (decoded?.type === "0x22") deviceMacReported = decoded.mac;
+        break;
+    }
+  }
+
+  rawPackets.sort((a, b) => b.id - a.id);
+
+  const hrSet = hrActive.length > 0 ? hrActive : hrHistory;
+  const heartRate = lastOf(hrSet);
+  const heartRateMin = hrSet.length > 0 ? Math.min(...hrSet) : null;
+  const heartRateMax = hrSet.length > 0 ? Math.max(...hrSet) : null;
+
+  const temperature = tempActive ?? tempHistory;
+  const hrv = hrvActive ?? hrvHistory;
+  const fatigue = fatigueActive ?? fatigueHistory;
+  const spo2 = spo2Active ?? spo2History;
+
+  const summary: CycleSummaryData = {
+    heartRate,
+    heartRateMin,
+    heartRateMax,
+    temperature,
+    hrv,
+    fatigue,
+    bloodPressure: { systolic, diastolic },
+    spo2,
+    battery,
+    sleepMinutes: sleep?.sleepMinutes ?? null,
+    firmware,
+  };
+
+  const missing = [
+    heartRate === null ? "heartRate" : null,
+    temperature === null ? "temperature" : null,
+    hrv === null ? "hrv" : null,
+  ].filter((field): field is string => field !== null);
+
+  const timestamps = sorted.map((packet) => new Date(packet.createdAt).getTime());
+
+  return {
+    cycleId: cycleIdForGroup(group),
+    deviceMac: sorted[0]!.deviceMac,
+    source: sorted[0]!.source,
+    startedAt: new Date(Math.min(...timestamps)).toISOString(),
+    endedAt: new Date(Math.max(...timestamps)).toISOString(),
+    summary,
+    sources,
+    sleep,
+    deviceMacReported,
+    packetTypes: [...new Set(group.map((packet) => packet.packetType))].sort(),
+    packetsCount: group.length,
+    crc,
+    complete: heartRate !== null && temperature !== null,
+    missing,
+    rawPackets,
+  };
+}
+
+/** Consolida pacotes crus em 1 registro lógico por ciclo de coleta. */
+export function buildCycleSummaries(
+  packets: SavedPacket[],
+  maxCycles?: number,
+): CycleSummary[] {
+  const summaries = groupPacketsByCycleKey(packets)
+    .map((group) => buildCycleSummary(group))
+    .filter((summary): summary is CycleSummary => summary !== null);
+
+  if (typeof maxCycles === "number" && maxCycles > 0) {
+    return summaries.slice(0, maxCycles);
+  }
+
+  return summaries;
+}
+
 export type BatchProcessInput = {
   ok: boolean;
   id: number;
@@ -233,6 +559,7 @@ export function buildSnapshotFromBatchResults(
     crcValid: result.ok,
     decoded: result.ok ? (result.decoded ?? null) : null,
     decodeError: result.ok ? null : (result.error ?? "decode error"),
+    ingestionBatchId: null,
     createdAt: result.savedAt,
   }));
 

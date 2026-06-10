@@ -202,6 +202,21 @@ function skipsCrcValidation(typeByte: number): boolean {
   }
 }
 
+/**
+ * Tipos cujo CRC é de fato verificado (resposta de 16 bytes ou histórico
+ * em blocos de 16). Demais tipos não têm CRC aplicável e não devem contar
+ * como "inválido" no consolidado.
+ */
+export function crcApplies(packetType: string): boolean {
+  let typeByte: number;
+  try {
+    typeByte = parsePacketType(packetType);
+  } catch {
+    return false;
+  }
+  return typeByte === 0x22 || typeByte === 0x28 || typeByte === 0x56;
+}
+
 function tryValidateCrc(bytes: number[]): boolean {
   try {
     validateCrc(bytes);
@@ -474,30 +489,68 @@ function decodeTemperatureHistory(bytes: number[], measurementType: number): Dec
   });
 }
 
+// ── Faixas fisiológicas válidas (rule 2 do protocolo da janela de 10 min) ────
+export function isValidHeartRate(value: number): boolean {
+  return value >= 30 && value <= 220;
+}
+export function isValidTemperature(celsius: number): boolean {
+  return celsius >= 30 && celsius <= 45;
+}
+export function isValidHrv(value: number): boolean {
+  return value > 0;
+}
+export function isValidFatigue(value: number): boolean {
+  return value > 0;
+}
+export function isValidSystolic(value: number): boolean {
+  return value >= 60 && value <= 220;
+}
+export function isValidDiastolic(value: number): boolean {
+  return value >= 30 && value <= 140;
+}
+export function isValidSpo2(value: number): boolean {
+  return value >= 70 && value <= 100;
+}
+
 /**
- * PDF §33 — resposta 0x28 (16 bytes):
- * [1]=tipo AA, [2]=BB HR, [3]=CC SpO2, [4]=DD HRV, [5]=EE fadiga,
- * [6]=FF sistólica, [7]=GG diastólica, [8..9]=HH II temperatura (/10).
+ * 0x28 — "active measurement packet" (16 bytes), layout de posição fixa:
+ *  data[0]=0x28, data[1]=modo, data[2]=heartRate, data[3]=SpO2 (opcional),
+ *  data[4]=HRV, data[5]=fadiga, data[6]=sistólica, data[7]=diastólica,
+ *  data[8..9]=temperatura little-endian (/10).
+ * Ex.: 28 02 4C 00 58 3F 7F 4D 64 01 … → HR 76, HRV 88, fadiga 63,
+ *      PA 127/77, temp 0x0164/10 = 35.6 °C.
+ *
+ * Campos fora da faixa fisiológica viram 0 (ausente); o pacote nunca é
+ * descartado por isso — o raw é sempre persistido (rule 1).
  */
 function decodeHealth(bytes: number[]): DecodedHealth {
   if (bytes.length < 10) {
     throw new PacketDecoderError("Health packet (0x28) requires at least 10 bytes");
   }
 
-  const measurementType = bytes[1];
-  const bp = decodeBloodPressure(bytes);
+  const measurementType = bytes[1] ?? 0;
+  const hr = bytes[2] ?? 0;
+  const spo2Raw = bytes[3] ?? 0;
+  const hrvRaw = bytes[4] ?? 0;
+  const fatigueRaw = bytes[5] ?? 0;
+  const sysRaw = bytes[6] ?? 0;
+  const diaRaw = bytes[7] ?? 0;
+  const tempC = decodeTemperatureTenths(bytes[8] ?? 0, bytes[9] ?? 0);
+
+  // Pressão: só aceita quando AMBOS os bytes estão em faixa válida.
+  const bpValid = isValidSystolic(sysRaw) && isValidDiastolic(diaRaw);
 
   return {
     type: "0x28",
     measurementType,
     measurementMode: healthMeasurementMode(measurementType),
-    heartRate: bytes[2] ?? 0,
-    spo2: bytes[3] ?? 0,
-    hrv: bytes[4] ?? 0,
-    fatigue: bytes[5] ?? 0,
-    systolicPressure: bp.systolicPressure,
-    diastolicPressure: bp.diastolicPressure,
-    temperature: decodeTemperatureTenths(bytes[8] ?? 0, bytes[9] ?? 0),
+    heartRate: isValidHeartRate(hr) ? hr : 0,
+    spo2: isValidSpo2(spo2Raw) ? spo2Raw : 0,
+    hrv: isValidHrv(hrvRaw) ? hrvRaw : 0,
+    fatigue: isValidFatigue(fatigueRaw) ? fatigueRaw : 0,
+    systolicPressure: bpValid ? sysRaw : 0,
+    diastolicPressure: bpValid ? diaRaw : 0,
+    temperature: isValidTemperature(tempC) ? tempC : 0,
   };
 }
 

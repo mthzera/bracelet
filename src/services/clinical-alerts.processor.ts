@@ -31,23 +31,15 @@ export function mergeVitalsFromHealthPackets(
   };
 }
 
-function parseBloodPressure(value: string): { systolic: number; diastolic: number } {
-  const match = value.match(/(\d+)\s*\/\s*(\d+)/);
-  if (!match) return { systolic: 0, diastolic: 0 };
-  return { systolic: Number(match[1]), diastolic: Number(match[2]) };
-}
-
 export function vitalsFromPacketMetrics(
   metrics: PacketMetrics,
 ): VitalsInput | null {
-  const bp = metrics.bloodPressure ? parseBloodPressure(metrics.bloodPressure) : { systolic: 0, diastolic: 0 };
-
   const vitals: VitalsInput = {
-    heartRate: metrics.heartRate ?? 0,
-    systolic: bp.systolic,
-    diastolic: bp.diastolic,
+    heartRate: metrics.bpm ?? 0,
+    systolic: metrics.bloodPressureSystolic ?? 0,
+    diastolic: metrics.bloodPressureDiastolic ?? 0,
     temperature: metrics.temperature ?? 0,
-    spo2: metrics.spO2 ?? 0,
+    spo2: metrics.spo2 ?? 0,
     hrv: metrics.hrv ?? 0,
     fatigue: metrics.fatigue ?? 0,
   };

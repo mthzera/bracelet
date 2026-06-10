@@ -57,11 +57,13 @@
 const unsigned long RX_028_MIN_GAP_MS = 3000;   // 1 pacote 0x28 a cada 3s por subtipo
 const unsigned long RX_OTHER_MIN_GAP_MS = 1500;
 
-// Medição: pulseira precisa de tempo com o comando ativo (PDF §33 — notify ~1/s)
-const unsigned long HEALTH_MEASURE_WINDOW_MS = 12000;
-const unsigned long HEALTH_HRV_WINDOW_MS = 18000;
-const unsigned long HEALTH_BP_WINDOW_MS = 20000;
-const unsigned long BLE_COLLECT_MAX_MS = 300UL * 1000UL;
+// Medição híbrida: tempo mínimo (como antes) + para cedo se valor chegar + avança se demorar demais
+const unsigned long HEALTH_VITAL_MIN_MS = 10000;       // 10s HR/SpO2/Temp
+const unsigned long HEALTH_HRV_MIN_MS = 15000;         // 15s HRV
+const unsigned long HEALTH_BP_MIN_MS = 20000;           // 20s pressão
+const unsigned long HEALTH_VITAL_MAX_WAIT_MS = 60000;  // 1 min max, depois avança (não trava)
+const unsigned long CYCLE_MIN_BEFORE_UPLOAD_MS = 5UL * 60UL * 1000UL;
+const unsigned long BLE_COLLECT_MAX_MS = 8UL * 60UL * 1000UL;
 const int HEALTH_MAX_RETRY_ROUNDS = 3;
 
 // Tempo final esperando resposta dos históricos antes de desligar BLE
@@ -117,6 +119,7 @@ static char batchPayload[BATCH_PAYLOAD_MAX_LEN];
    STATE_BLE_START,
    STATE_BLE_COLLECT,
    STATE_BLE_QUERY_HISTORY,
+   STATE_BLE_CYCLE_WAIT,
    STATE_BLE_SHUTDOWN,
    STATE_WIFI_START,
    STATE_RENDER_WAKE,
@@ -126,6 +129,7 @@ static char batchPayload[BATCH_PAYLOAD_MAX_LEN];
  
  MainState mainState = STATE_BLE_START;
  unsigned long stateStartedAt = 0;
+ unsigned long cycleStartedAt = 0;
  
  enum HealthCommandState {
    HEALTH_IDLE,
@@ -368,6 +372,10 @@ bool cycleReadyForUpload = false;
    mainState = next;
    stateStartedAt = millis();
 
+   if (next == STATE_BLE_COLLECT && cycleStartedAt == 0) {
+     cycleStartedAt = millis();
+   }
+
    if (next == STATE_RENDER_WAKE) {
      lastRenderPingAt = 0;
    }
@@ -381,6 +389,7 @@ bool cycleReadyForUpload = false;
     case STATE_BLE_START: logPrintf("[STATE] -> BLE_START\n"); break;
     case STATE_BLE_COLLECT: logPrintf("[STATE] -> BLE_COLLECT\n"); break;
     case STATE_BLE_QUERY_HISTORY: logPrintf("[STATE] -> BLE_QUERY_HISTORY\n"); break;
+    case STATE_BLE_CYCLE_WAIT: logPrintf("[STATE] -> BLE_CYCLE_WAIT\n"); break;
     case STATE_BLE_SHUTDOWN: logPrintf("[STATE] -> BLE_SHUTDOWN\n"); break;
     case STATE_WIFI_START: logPrintf("[STATE] -> WIFI_START\n"); break;
     case STATE_RENDER_WAKE: logPrintf("[STATE] -> RENDER_WAKE\n"); break;
@@ -453,10 +462,28 @@ bool isBleReady() {
    return bleClient && bleClient->isConnected() && txChar && rxChar && bleConnected;
  }
 
+bool isPlausibleHr(uint8_t value) {
+  return value > 0 && value < 220;
+}
+
+bool isPlausibleSpo2(uint8_t value) {
+  return value > 0 && value <= 100;
+}
+
+bool isPlausibleHrv(uint8_t value) {
+  return value > 0 && value < 250;
+}
+
 bool isPlausibleBp(uint8_t systolic, uint8_t diastolic) {
   if (systolic == 0x7b && diastolic == 0x49) return false;
   if (systolic == 0x75 && diastolic == 0x44) return false;
   return systolic > 0 && diastolic > 0 && systolic < 250 && diastolic < 200 && systolic > diastolic;
+}
+
+size_t historyLastRecordStart(size_t len, size_t recordLen) {
+  if (len < recordLen) return 0;
+  size_t count = len / recordLen;
+  return count > 0 ? (count - 1) * recordLen : 0;
 }
 
 bool hasMeaningfulTemp028(const uint8_t* data) {
@@ -470,39 +497,70 @@ void resetCycleVitals() {
   cycleReadyForUpload = false;
 }
 
+void recordCycleVitalFrom028(const uint8_t* data, size_t len) {
+  if (!data || len < 10 || data[0] != 0x28) return;
+
+  if (isPlausibleHr(data[2])) cycleVitals.hr = true;
+  if (isPlausibleSpo2(data[3])) cycleVitals.spo2 = true;
+  if (isPlausibleHrv(data[4])) cycleVitals.hrv = true;
+  if (hasMeaningfulTemp028(data)) cycleVitals.temp = true;
+  if (isPlausibleBp(data[6], data[7])) cycleVitals.bp = true;
+}
+
+void recordCycleVitalFromHistory(const uint8_t* data, size_t len) {
+  if (!data || len < 2) return;
+
+  switch (data[0]) {
+    case 0x54: {
+      if (len < 21) break;
+      size_t start = historyLastRecordStart(len, 21);
+      for (size_t i = start + 9; i <= start + 20 && i < len; i++) {
+        if (isPlausibleHr(data[i])) cycleVitals.hr = true;
+      }
+      break;
+    }
+    case 0x55: {
+      if (len < 10) break;
+      size_t start = historyLastRecordStart(len, 10);
+      if (isPlausibleHr(data[start + 9])) cycleVitals.hr = true;
+      break;
+    }
+    case 0x56: {
+      size_t recordLen = (len % 16 == 0) ? 16 : 15;
+      if (len < recordLen) break;
+      size_t start = historyLastRecordStart(len, recordLen);
+      if (isPlausibleHrv(data[start + 9])) cycleVitals.hrv = true;
+      break;
+    }
+    case 0x60:
+    case 0x66: {
+      if (len < 10) break;
+      size_t start = historyLastRecordStart(len, 10);
+      if (isPlausibleSpo2(data[start + 9])) cycleVitals.spo2 = true;
+      break;
+    }
+    case 0x62:
+    case 0x65: {
+      if (len < 11) break;
+      size_t start = historyLastRecordStart(len, 11);
+      uint8_t tempPacket[16] = {0x28, 0x04, 0, 0, 0, 0, 0, 0, data[start + 9], data[start + 10]};
+      if (hasMeaningfulTemp028(tempPacket)) cycleVitals.temp = true;
+      break;
+    }
+    default:
+      break;
+  }
+}
+
 void recordCycleVitalFromNotify(const uint8_t* data, size_t len) {
   if (!data || len < 2) return;
 
-  if (data[0] == 0x28 && len >= 10) {
-    switch (data[1]) {
-      case 0x02:
-        if (data[2] > 0) cycleVitals.hr = true;
-        break;
-      case 0x03:
-        if (data[3] > 0) cycleVitals.spo2 = true;
-        break;
-      case 0x04:
-        if (hasMeaningfulTemp028(data)) cycleVitals.temp = true;
-        break;
-      case 0x01:
-        if (data[4] > 0) cycleVitals.hrv = true;
-        break;
-      case 0x05:
-        if (isPlausibleBp(data[6], data[7])) cycleVitals.bp = true;
-        break;
-      default:
-        break;
-    }
-    if (hasMeaningfulTemp028(data)) cycleVitals.temp = true;
-    if (isPlausibleBp(data[6], data[7])) cycleVitals.bp = true;
+  if (data[0] == 0x28) {
+    recordCycleVitalFrom028(data, len);
     return;
   }
 
-  if (data[0] == 0x56 && len >= 13) {
-    size_t recordLen = (len % 16 == 0) ? 16 : 15;
-    size_t start = len >= recordLen ? len - recordLen : 0;
-    if (data[start + 9] > 0) cycleVitals.hrv = true;
-  }
+  recordCycleVitalFromHistory(data, len);
 }
 
 bool cycleVitalsComplete() {
@@ -523,6 +581,24 @@ void logCycleVitalsStatus(const char* prefix) {
   );
 }
 
+unsigned long healthMinWindowForState(HealthCommandState state) {
+  switch (state) {
+    case HEALTH_STOP_HRV:
+      return HEALTH_HRV_MIN_MS;
+    case HEALTH_STOP_BP:
+      return HEALTH_BP_MIN_MS;
+    default:
+      return HEALTH_VITAL_MIN_MS;
+  }
+}
+
+bool shouldAdvanceVitalStep(HealthCommandState waitState, unsigned long startedAt, bool vitalOk) {
+  unsigned long elapsed = millis() - startedAt;
+  if (vitalOk && elapsed >= healthMinWindowForState(waitState)) return true;
+  if (elapsed >= HEALTH_VITAL_MAX_WAIT_MS) return true;
+  return false;
+}
+
 HealthCommandState firstMissingHealthState() {
   if (!cycleVitals.hr) return HEALTH_START_HR;
   if (!cycleVitals.spo2) return HEALTH_START_SPO2;
@@ -532,36 +608,15 @@ HealthCommandState firstMissingHealthState() {
   return HEALTH_DONE;
 }
 
-unsigned long healthWindowForState(HealthCommandState state) {
-  switch (state) {
-    case HEALTH_STOP_HRV:
-      return HEALTH_HRV_WINDOW_MS;
-    case HEALTH_STOP_BP:
-      return HEALTH_BP_WINDOW_MS;
-    default:
-      return HEALTH_MEASURE_WINDOW_MS;
-  }
-}
-
 bool hasMeaningful028Data(const uint8_t* data, size_t len) {
   if (!data || len < 10 || data[0] != 0x28) return false;
 
-  // PDF §33: [2]=HR, [3]=SpO2, [4]=HRV, [5]=fadiga, [8..9]=temp (/10)
-  switch (data[1]) {
-    case 0x01:
-      return data[4] > 0 || data[5] > 0;
-    case 0x02:
-      return data[2] > 0;
-    case 0x03:
-      return data[3] > 0;
-    case 0x04:
-      return hasMeaningfulTemp028(data);
-    case 0x05:
-      return isPlausibleBp(data[6], data[7]);
-    default:
-      return data[2] > 0 || data[3] > 0 || data[4] > 0 || data[5] > 0
-          || hasMeaningfulTemp028(data) || isPlausibleBp(data[6], data[7]);
-  }
+  return isPlausibleHr(data[2])
+      || isPlausibleSpo2(data[3])
+      || isPlausibleHrv(data[4])
+      || data[5] > 0
+      || hasMeaningfulTemp028(data)
+      || isPlausibleBp(data[6], data[7]);
 }
  
  // ===================== FILA =====================
@@ -904,9 +959,7 @@ void notifyCallback(
     updateClockFromBraceletPacket(data, len);
   }
 
-  if (type == 0x28 || type == 0x56) {
-    recordCycleVitalFromNotify(data, len);
-  }
+  recordCycleVitalFromNotify(data, len);
 
   if (!isWantedPacketType(type)) {
 #if LOG_BLE_RX
@@ -941,8 +994,10 @@ void notifyCallback(
 
   if (type == 0x28 && !hasMeaningful028Data(data, len)) {
 #if LOG_BLE_RX
-    logPrintf("[BLE RX] 0x28 ignorado AA=%02X BB=%02X CC=%02X [8..9]=%02X%02X\n",
-              data[1], len > 2 ? data[2] : 0, len > 3 ? data[3] : 0,
+    logPrintf("[BLE RX] 0x28 ignorado AA=%02X [2..7]=%02X %02X %02X %02X %02X %02X [8..9]=%02X%02X\n",
+              data[1],
+              len > 2 ? data[2] : 0, len > 3 ? data[3] : 0, len > 4 ? data[4] : 0,
+              len > 5 ? data[5] : 0, len > 6 ? data[6] : 0, len > 7 ? data[7] : 0,
               len > 8 ? data[8] : 0, len > 9 ? data[9] : 0);
 #endif
     return;
@@ -1264,6 +1319,30 @@ bool connectBracelet() {
  
  // ===================== HEALTH SCHEDULER =====================
  
+void finishHealthRound() {
+  logCycleVitalsStatus("[APP] Fim da rodada:");
+
+  if (cycleVitalsComplete()) {
+    logPrintln("[APP] Ciclo de saúde completo.");
+    healthState = HEALTH_DONE;
+    return;
+  }
+
+  if (cycleVitals.retryRound < HEALTH_MAX_RETRY_ROUNDS) {
+    cycleVitals.retryRound++;
+    logPrintf("[APP] Vitais incompletos — retentativa %u/%d\n",
+              cycleVitals.retryRound, HEALTH_MAX_RETRY_ROUNDS);
+    stopAllHealth();
+    delay(300);
+    healthState = firstMissingHealthState();
+    healthStateStartedAt = millis();
+    return;
+  }
+
+  logPrintln("[APP] Vitais incompletos — seguindo para histórico (API mescla).");
+  healthState = HEALTH_DONE;
+}
+
  void processHealthScheduler() {
    if (!isBleReady()) return;
  
@@ -1276,15 +1355,16 @@ bool connectBracelet() {
        break;
  
      case HEALTH_START_HR:
-       logPrintln("[APP] Start HR");
+       logPrintln("[APP] Start HR — aguardando valor...");
        startHealth(0x02);
        healthState = HEALTH_STOP_HR;
        healthStateStartedAt = now;
        break;
  
      case HEALTH_STOP_HR:
-       if (now - healthStateStartedAt >= healthWindowForState(HEALTH_STOP_HR)) {
-         logPrintln("[APP] Stop HR");
+       if (shouldAdvanceVitalStep(HEALTH_STOP_HR, healthStateStartedAt, cycleVitals.hr)) {
+         if (cycleVitals.hr) logPrintln("[APP] HR OK — parando");
+         else logPrintln("[APP] HR sem valor — avançando");
          stopHealth(0x02);
          healthState = HEALTH_START_SPO2;
          healthStateStartedAt = now;
@@ -1292,15 +1372,16 @@ bool connectBracelet() {
        break;
  
      case HEALTH_START_SPO2:
-       logPrintln("[APP] Start SpO2");
+       logPrintln("[APP] Start SpO2 — aguardando valor...");
        startHealth(0x03);
        healthState = HEALTH_STOP_SPO2;
        healthStateStartedAt = now;
        break;
  
      case HEALTH_STOP_SPO2:
-       if (now - healthStateStartedAt >= healthWindowForState(HEALTH_STOP_SPO2)) {
-         logPrintln("[APP] Stop SpO2");
+       if (shouldAdvanceVitalStep(HEALTH_STOP_SPO2, healthStateStartedAt, cycleVitals.spo2)) {
+         if (cycleVitals.spo2) logPrintln("[APP] SpO2 OK — parando");
+         else logPrintln("[APP] SpO2 sem valor — avançando");
          stopHealth(0x03);
          healthState = HEALTH_START_TEMP;
          healthStateStartedAt = now;
@@ -1308,15 +1389,16 @@ bool connectBracelet() {
        break;
  
      case HEALTH_START_TEMP:
-       logPrintln("[APP] Start Temp");
+       logPrintln("[APP] Start Temp — aguardando valor...");
        startHealth(0x04);
        healthState = HEALTH_STOP_TEMP;
        healthStateStartedAt = now;
        break;
  
      case HEALTH_STOP_TEMP:
-       if (now - healthStateStartedAt >= healthWindowForState(HEALTH_STOP_TEMP)) {
-         logPrintln("[APP] Stop Temp");
+       if (shouldAdvanceVitalStep(HEALTH_STOP_TEMP, healthStateStartedAt, cycleVitals.temp)) {
+         if (cycleVitals.temp) logPrintln("[APP] Temp OK — parando");
+         else logPrintln("[APP] Temp sem valor — avançando");
          stopHealth(0x04);
          healthState = HEALTH_START_HRV;
          healthStateStartedAt = now;
@@ -1324,15 +1406,16 @@ bool connectBracelet() {
        break;
  
      case HEALTH_START_HRV:
-       logPrintln("[APP] Start HRV");
+       logPrintln("[APP] Start HRV — aguardando valor...");
        startHealth(0x01);
        healthState = HEALTH_STOP_HRV;
        healthStateStartedAt = now;
        break;
  
     case HEALTH_STOP_HRV:
-      if (now - healthStateStartedAt >= healthWindowForState(HEALTH_STOP_HRV)) {
-        logPrintln("[APP] Stop HRV");
+      if (shouldAdvanceVitalStep(HEALTH_STOP_HRV, healthStateStartedAt, cycleVitals.hrv)) {
+        if (cycleVitals.hrv) logPrintln("[APP] HRV OK — parando");
+        else logPrintln("[APP] HRV sem valor — avançando");
         stopHealth(0x01);
         healthState = HEALTH_START_BP;
         healthStateStartedAt = now;
@@ -1340,30 +1423,18 @@ bool connectBracelet() {
       break;
 
     case HEALTH_START_BP:
-      logPrintln("[APP] Start BP");
+      logPrintln("[APP] Start BP — aguardando valor...");
       startHealth(0x05);
       healthState = HEALTH_STOP_BP;
       healthStateStartedAt = now;
       break;
 
     case HEALTH_STOP_BP:
-      if (now - healthStateStartedAt >= healthWindowForState(HEALTH_STOP_BP)) {
-        logPrintln("[APP] Stop BP");
+      if (shouldAdvanceVitalStep(HEALTH_STOP_BP, healthStateStartedAt, cycleVitals.bp)) {
+        if (cycleVitals.bp) logPrintln("[APP] BP OK — parando");
+        else logPrintln("[APP] BP sem valor — avançando");
         stopHealth(0x05);
-        logCycleVitalsStatus("[APP] Fim da rodada:");
-
-        if (cycleVitalsComplete()) {
-          logPrintln("[APP] Ciclo de saúde completo.");
-          healthState = HEALTH_DONE;
-        } else if (cycleVitals.retryRound < HEALTH_MAX_RETRY_ROUNDS) {
-          cycleVitals.retryRound++;
-          logPrintf("[APP] Vitais incompletos — retentativa %u/%d\n",
-                    cycleVitals.retryRound, HEALTH_MAX_RETRY_ROUNDS);
-          healthState = firstMissingHealthState();
-        } else {
-          logPrintln("[APP] Vitais incompletos após retentativas.");
-          healthState = HEALTH_DONE;
-        }
+        finishHealthRound();
         healthStateStartedAt = now;
       }
       break;
@@ -1512,22 +1583,17 @@ bool connectBracelet() {
          processHealthScheduler();
        }
 
-       if (healthState == HEALTH_DONE && cycleVitalsComplete()) {
-         logPrintf("[APP] Vitais completos. Fila=%d — coletando histórico\n", queueCount);
+       if (healthState == HEALTH_DONE) {
+         logPrintf("[APP] Rodada de medição feita. Fila=%d — coletando histórico\n", queueCount);
+         logCycleVitalsStatus("[APP]");
          resetHistoryQuery();
          changeState(STATE_BLE_QUERY_HISTORY);
-       } else if (now - stateStartedAt >= BLE_COLLECT_MAX_MS) {
-         logPrintln("[APP] Timeout absoluto de coleta BLE.");
+       } else if (now - cycleStartedAt >= BLE_COLLECT_MAX_MS) {
+         logPrintln("[APP] Timeout absoluto de coleta BLE (8 min) — coletando histórico.");
          logCycleVitalsStatus("[APP]");
-         if (cycleVitalsComplete()) {
-           resetHistoryQuery();
-           changeState(STATE_BLE_QUERY_HISTORY);
-         } else {
-           logPrintln("[APP] Sem vitais completos — reiniciando ciclo BLE (sem WiFi).");
-           resetCycleVitals();
-           healthState = HEALTH_IDLE;
-           stateStartedAt = now;
-         }
+         healthState = HEALTH_DONE;
+         resetHistoryQuery();
+         changeState(STATE_BLE_QUERY_HISTORY);
        }
  
        break;
@@ -1542,16 +1608,32 @@ bool connectBracelet() {
  
        if (historyCommandsFinished && now - lastHistoryCommandAt >= HISTORY_RESPONSE_WAIT_MS) {
          logPrintf("[APP] Histórico coletado. Fila=%d\n", queueCount);
-         cycleReadyForUpload = cycleVitalsComplete();
-         if (!cycleReadyForUpload) {
-           logCycleVitalsStatus("[APP] Bloqueando WiFi — faltam:");
+         logCycleVitalsStatus("[APP] Pós-histórico:");
+
+         unsigned long elapsed = now - cycleStartedAt;
+         if (elapsed < CYCLE_MIN_BEFORE_UPLOAD_MS) {
+           unsigned long remainSec = (CYCLE_MIN_BEFORE_UPLOAD_MS - elapsed) / 1000UL;
+           logPrintf("[APP] Aguardando 5 min (%lus restantes)...\n", remainSec);
+           changeState(STATE_BLE_CYCLE_WAIT);
+         } else {
+           changeState(STATE_BLE_SHUTDOWN);
          }
-         changeState(STATE_BLE_SHUTDOWN);
        }
  
        break;
      }
  
+     case STATE_BLE_CYCLE_WAIT: {
+       ensureBraceletConnected();
+
+       if (now - cycleStartedAt >= CYCLE_MIN_BEFORE_UPLOAD_MS) {
+         logCycleVitalsStatus("[APP] 5 min —");
+         logPrintln("[APP] Enviando para API.");
+         changeState(STATE_BLE_SHUTDOWN);
+       }
+       break;
+     }
+
      case STATE_BLE_SHUTDOWN: {
        if (isBleReady()) {
          stopRealtime();
@@ -1560,15 +1642,8 @@ bool connectBracelet() {
          delay(300);
        }
 
-      cycleReadyForUpload = cycleVitalsComplete();
-      if (!cycleReadyForUpload) {
-        logCycleVitalsStatus("[APP] Upload cancelado — faltam:");
-        logPrintln("[APP] Nova coleta BLE (sem WiFi).");
-        delay(1000);
-        resetCycleVitals();
-        healthState = HEALTH_IDLE;
-        changeState(STATE_BLE_START);
-        break;
+      if (!cycleVitalsComplete()) {
+        logCycleVitalsStatus("[APP] Aviso — snapshot pode ficar incompleto:");
       }
 
       blePauseForWifi();
@@ -1691,6 +1766,7 @@ bool connectBracelet() {
       delay(1500);
 
       resetCycleVitals();
+      cycleStartedAt = 0;
       healthState = HEALTH_IDLE;
       lastBleReconnectAttempt = 0;
       lastRenderPingAt = 0;

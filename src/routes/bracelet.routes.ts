@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyBaseLogger } from "fastify";
+import { randomUUID } from "node:crypto";
 import { ZodError } from "zod";
 import {
   getMergedHealthForDevice,
@@ -17,6 +18,7 @@ import {
 } from "../schemas/report.swagger.js";
 import {
   getPacketRouteSchema,
+  getPacketSummaryRouteSchema,
   postPacketRouteSchema,
 } from "../schemas/packet.swagger.js";
 import {
@@ -38,7 +40,6 @@ import {
 } from "../services/packet-decoder.service.js";
 import {
   enrichDecodedHealthFromMetrics,
-  EMPTY_HEALTH_READING_ERROR,
   hasAnyHealthReading,
 } from "../services/vitals-validation.service.js";
 import { DEFAULT_VITALS_REPORT_WINDOW_MINUTES } from "../config/teams-report.config.js";
@@ -48,6 +49,7 @@ import {
   buildVitalsReportByPatientName,
 } from "../services/teams-report.service.js";
 import {
+  buildCycleSummaries,
   buildSnapshotFromBatchResults,
   buildSnapshotsFromPackets,
 } from "../services/measurement-snapshot.service.js";
@@ -83,6 +85,7 @@ async function processInboundPacket(
   payload: PacketPayload,
   item: PacketItem,
   log: FastifyBaseLogger,
+  ingestionBatchId: string,
 ): Promise<PacketProcessResult> {
   const base = {
     packetType: item.packetType,
@@ -92,14 +95,16 @@ async function processInboundPacket(
   try {
     let { bytes, decoded, crcValid } = decodePacket(item.packetType, item.rawHex);
 
+    // 0x28 é o "active measurement packet": nunca descartamos por vir com campos
+    // zerados — o raw é sempre persistido (rule 1). Só registramos se há alguma
+    // leitura útil para decidir se vale acionar a avaliação clínica.
+    let healthHasReading = false;
     if (decoded.type === "0x28") {
       let healthDecoded = decoded;
       if (item.metrics) {
         healthDecoded = enrichDecodedHealthFromMetrics(healthDecoded, item.metrics);
       }
-      if (!hasAnyHealthReading(healthDecoded)) {
-        throw new PacketDecoderError(EMPTY_HEALTH_READING_ERROR);
-      }
+      healthHasReading = hasAnyHealthReading(healthDecoded);
       decoded = healthDecoded;
     }
 
@@ -109,6 +114,7 @@ async function processInboundPacket(
       crcValid,
       decoded,
       receivedAtMs: item.receivedAtMs,
+      ingestionBatchId,
     });
 
     const isHealthPacket = decoded.type === "0x28" || decoded.type === "0x56";
@@ -152,7 +158,7 @@ async function processInboundPacket(
     }
 
     try {
-      if (decoded.type === "0x28") {
+      if (decoded.type === "0x28" && healthHasReading) {
         await processClinicalAlertsFromRecentPackets(
           payload.deviceMac,
           payload.source,
@@ -208,6 +214,7 @@ async function processInboundPacket(
         crcValid: false,
         decodeError: err.message,
         receivedAtMs: item.receivedAtMs,
+        ingestionBatchId,
       });
 
       return {
@@ -295,9 +302,25 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
+  async function buildConsolidatedCycles(limit: number, deviceMac?: string) {
+    // Cada ciclo agrega muitos pacotes crus; busca um múltiplo do limite pedido.
+    const rawLimit = Math.min(Math.max(limit * 20, limit), 200);
+    const packets = await listPackets(rawLimit, deviceMac);
+    return buildCycleSummaries(packets, limit).map((cycle) => ({
+      ...cycle,
+      patient: resolvePatientForMac(cycle.deviceMac),
+    }));
+  }
+
   app.get("/bracelets/packets", { schema: getPacketRouteSchema }, async (request, reply) => {
-    const query = request.query as { limit?: number; deviceMac?: string; view?: string };
+    const query = request.query as {
+      limit?: number;
+      deviceMac?: string;
+      view?: string;
+      group?: string | boolean;
+    };
     const view = query.view === "raw" ? "raw" : "snapshots";
+    const grouped = query.group === true || query.group === "true";
     const limit =
       typeof query.limit === "number" && Number.isFinite(query.limit)
         ? query.limit
@@ -311,6 +334,12 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(200).send({ view: "raw", packets });
     }
 
+    // group=true devolve o formato consolidado (items) no mesmo endpoint.
+    if (grouped) {
+      const items = await buildConsolidatedCycles(limit, deviceMac);
+      return reply.status(200).send({ view: "consolidated", items });
+    }
+
     const rawLimit = Math.min(Math.max(limit * 20, limit), 200);
     const packets = await listPackets(rawLimit, deviceMac);
     const snapshots = buildSnapshotsFromPackets(packets, limit).map((snapshot) => ({
@@ -320,6 +349,20 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
 
     return reply.status(200).send({ view: "snapshots", snapshots });
   });
+
+  app.get(
+    "/bracelets/packets/summary",
+    { schema: getPacketSummaryRouteSchema },
+    async (request, reply) => {
+      const query = request.query as { limit?: number; deviceMac?: string };
+      const limit =
+        typeof query.limit === "number" && Number.isFinite(query.limit) ? query.limit : 30;
+      const deviceMac = typeof query.deviceMac === "string" ? query.deviceMac : undefined;
+
+      const items = await buildConsolidatedCycles(limit, deviceMac);
+      return reply.status(200).send({ items });
+    },
+  );
 
   app.post("/bracelets/packets", { schema: postPacketRouteSchema }, async (request, reply) => {
     let batch;
@@ -337,6 +380,11 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       throw err;
     }
 
+    // Identificador de ciclo: usa o do body se enviado, senão gera um por request.
+    // Todos os pacotes deste batch compartilham o mesmo ingestionBatchId.
+    const ingestionBatchId =
+      batch.ingestionBatchId?.trim() || batch.cycleId?.trim() || randomUUID();
+
     const results: PacketProcessResult[] = [];
 
     for (const item of batch.packets) {
@@ -348,7 +396,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
         metrics: item.metrics,
       };
 
-      results.push(await processInboundPacket(payload, item, request.log));
+      results.push(await processInboundPacket(payload, item, request.log, ingestionBatchId));
     }
 
     const okCount = results.filter((result) => result.ok).length;
@@ -384,6 +432,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     return reply.status(200).send({
       deviceMac: batch.deviceMac,
       source: batch.source,
+      ingestionBatchId,
       patient: resolvePatientForMac(batch.deviceMac),
       snapshot: enrichedSnapshot,
       stats: {

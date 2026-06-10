@@ -99,6 +99,7 @@ export const packetBatchSuccessResponseSchema = {
   properties: {
     deviceMac: { type: "string", example: "E6:64:0D:30:D3:F9" },
     source: { type: "string", example: "ESP32" },
+    ingestionBatchId: { type: "string", description: "Cycle id applied to every packet in this batch" },
     patient: patientFieldSchema,
     snapshot: { ...measurementSnapshotSchema, nullable: true },
     stats: {
@@ -134,14 +135,139 @@ const savedPacketSchema = {
   },
 };
 
-export const listPacketsResponseSchema = {
+const cycleSummaryItemSchema = {
+  type: "object",
+  required: ["cycleId", "deviceMac", "source", "startedAt", "endedAt", "summary", "packetTypes", "packetsCount", "crc"],
+  properties: {
+    cycleId: { type: "string", description: "ingestionBatchId, ou win-<minId>-<maxId> p/ registros antigos" },
+    deviceMac: { type: "string", example: "ef:7a:0d:30:b3:fa" },
+    patient: patientFieldSchema,
+    source: { type: "string", example: "ESP32" },
+    startedAt: { type: "string", format: "date-time" },
+    endedAt: { type: "string", format: "date-time" },
+    summary: {
+      type: "object",
+      description: "Resumo clínico do ciclo. Campos null = ausente (o front mostra \"--\", nunca 0).",
+      properties: {
+        heartRate: { type: "number", nullable: true, example: 76, description: "Último BPM válido da janela" },
+        heartRateMin: { type: "number", nullable: true, example: 63 },
+        heartRateMax: { type: "number", nullable: true, example: 91 },
+        temperature: { type: "number", nullable: true, example: 35.6 },
+        hrv: { type: "number", nullable: true, example: 88 },
+        fatigue: { type: "number", nullable: true, example: 63 },
+        bloodPressure: {
+          type: "object",
+          properties: {
+            systolic: { type: "number", nullable: true, example: 127 },
+            diastolic: { type: "number", nullable: true, example: 77 },
+          },
+        },
+        spo2: { type: "number", nullable: true, example: null, description: "Opcional; null quando ausente" },
+        battery: { type: "number", nullable: true, example: 83 },
+        sleepMinutes: { type: "number", nullable: true, example: 140 },
+        firmware: { type: "string", nullable: true, example: "V0.0.3" },
+      },
+    },
+    sources: {
+      type: "object",
+      description: "Quais famílias de pacote alimentaram o ciclo",
+      properties: {
+        activePackets: { type: "boolean" },
+        heartRateHistory: { type: "boolean" },
+        hrvFatigueHistory: { type: "boolean" },
+        temperatureHistory: { type: "boolean" },
+      },
+    },
+    sleep: {
+      type: "object",
+      nullable: true,
+      properties: {
+        date: { type: "string" },
+        time: { type: "string" },
+        sleepMinutes: { type: "number" },
+        recordId: { type: "number" },
+      },
+    },
+    deviceMacReported: { type: "string", nullable: true },
+    packetTypes: {
+      type: "array",
+      items: { type: "string" },
+      example: ["0x28", "0x53", "0x54", "0x55", "0x56", "0x60", "0x62", "0x65", "0x66"],
+    },
+    packetsCount: { type: "integer", example: 20 },
+    crc: {
+      type: "object",
+      properties: {
+        valid: { type: "integer", example: 10 },
+        invalid: { type: "integer", example: 2 },
+        notApplicable: { type: "integer", example: 8 },
+      },
+    },
+    complete: { type: "boolean" },
+    missing: { type: "array", items: { type: "string" } },
+    rawPackets: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "integer" },
+          packetType: { type: "string" },
+          rawHex: { type: "string" },
+          crcValid: { type: "boolean" },
+          crcApplicable: { type: "boolean" },
+          decodeError: { type: "string", nullable: true },
+          decoded: { ...decodedSchema, nullable: true },
+          receivedAt: { type: "string", format: "date-time" },
+        },
+      },
+    },
+  },
+} as const;
+
+export const consolidatedCyclesResponseSchema = {
+  type: "object",
+  required: ["items"],
+  properties: {
+    items: { type: "array", items: cycleSummaryItemSchema },
+  },
+};
+
+export const getPacketSummaryRouteSchema = {
+  tags: ["bracelets"],
+  summary: "List consolidated measurement cycles",
+  description:
+    "Retorna 1 registro lógico por ciclo de coleta, agregando todos os pacotes crus relacionados (vitais, sono, bateria, firmware). Agrupa por ingestionBatchId quando presente; registros antigos sem batch id são agrupados por janela de tempo (~3 min). Inclui rawPackets para depuração.",
+  querystring: {
+    type: "object",
+    properties: {
+      limit: { type: "integer", minimum: 1, maximum: 200, default: 30 },
+      deviceMac: {
+        type: "string",
+        description: "Filter by bracelet MAC (case-insensitive)",
+        example: "ef:7a:0d:30:b3:fa",
+      },
+    },
+  },
+  response: {
+    200: {
+      description: "Consolidated cycles",
+      ...consolidatedCyclesResponseSchema,
+    },
+  },
+};
+
+const listPacketsResponseSchema = {
   type: "object",
   required: ["view"],
   properties: {
-    view: { type: "string", enum: ["snapshots", "raw"] },
+    view: { type: "string", enum: ["snapshots", "raw", "consolidated"] },
     snapshots: {
       type: "array",
       items: measurementSnapshotSchema,
+    },
+    items: {
+      type: "array",
+      items: cycleSummaryItemSchema,
     },
     packets: {
       type: "array",
@@ -171,12 +297,17 @@ export const getPacketRouteSchema = {
         enum: ["snapshots", "raw"],
         default: "snapshots",
       },
+      group: {
+        type: "boolean",
+        default: false,
+        description: "Quando true, devolve ciclos consolidados ({ items }) — igual a /bracelets/packets/summary",
+      },
       limit: {
         type: "integer",
         minimum: 1,
         maximum: 200,
         default: 30,
-        description: "Max snapshots (default) or raw packets when view=raw",
+        description: "Max snapshots/cycles (default) or raw packets when view=raw",
       },
       deviceMac: {
         type: "string",
