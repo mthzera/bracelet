@@ -27,7 +27,7 @@ import {
 } from "../services/device-registry.service.js";
 import {
   processClinicalAlertsFromDecoded,
-  processClinicalAlertsAfterHealthPacket,
+  processClinicalAlertsFromRecentPackets,
 } from "../services/clinical-alerts.processor.js";
 import {
   decodePacket,
@@ -36,12 +36,10 @@ import {
   type DecodedHealth,
   type DecodedPacket,
 } from "../services/packet-decoder.service.js";
-import { vitalsFromDecodedHealth } from "../services/clinical-alerts.service.js";
 import {
   enrichDecodedHealthFromMetrics,
-  hasMandatoryVitals,
-  mandatoryVitalsFromDecoded,
-  MANDATORY_VITALS_ERROR,
+  EMPTY_HEALTH_READING_ERROR,
+  hasAnyHealthReading,
 } from "../services/vitals-validation.service.js";
 import { DEFAULT_VITALS_REPORT_WINDOW_MINUTES } from "../config/teams-report.config.js";
 import {
@@ -95,8 +93,8 @@ async function processInboundPacket(
       if (item.metrics) {
         healthDecoded = enrichDecodedHealthFromMetrics(healthDecoded, item.metrics);
       }
-      if (!hasMandatoryVitals(mandatoryVitalsFromDecoded(healthDecoded))) {
-        throw new PacketDecoderError(MANDATORY_VITALS_ERROR);
+      if (!hasAnyHealthReading(healthDecoded)) {
+        throw new PacketDecoderError(EMPTY_HEALTH_READING_ERROR);
       }
       decoded = healthDecoded;
     }
@@ -127,13 +125,12 @@ async function processInboundPacket(
 
     try {
       if (decoded.type === "0x28") {
-        await processClinicalAlertsAfterHealthPacket({
-          deviceMac: payload.deviceMac,
-          source: payload.source,
-          packetId: saved.id,
-          measuredAt: saved.createdAt,
-          vitals: vitalsFromDecodedHealth(decoded),
-        });
+        await processClinicalAlertsFromRecentPackets(
+          payload.deviceMac,
+          payload.source,
+          saved.id,
+          saved.createdAt,
+        );
       } else if (decoded.type === "0x56") {
         await processClinicalAlertsFromDecoded(
           payload.deviceMac,

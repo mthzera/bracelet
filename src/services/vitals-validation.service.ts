@@ -10,8 +10,30 @@ export type MandatoryVitals = {
 export const MANDATORY_VITALS_ERROR =
   "Health packet requires heartRate (bpm), spO2 (%), and temperature (°C) — all must be > 0";
 
+export const EMPTY_HEALTH_READING_ERROR =
+  "Health packet has no measurable vital values (all zero)";
+
 export function hasMandatoryVitals(vitals: MandatoryVitals): boolean {
   return vitals.heartRate > 0 && vitals.spo2 > 0 && vitals.temperature > 0;
+}
+
+/** Aceita leituras parciais do ESP32 (HR, SpO2 ou temp em pacotes separados). */
+export function hasAnyHealthReading(decoded: {
+  heartRate?: number;
+  spo2?: number;
+  temperature?: number;
+  hrv?: number;
+  systolicPressure?: number;
+  diastolicPressure?: number;
+}): boolean {
+  return (
+    (decoded.heartRate ?? 0) > 0 ||
+    (decoded.spo2 ?? 0) > 0 ||
+    (decoded.temperature ?? 0) > 0 ||
+    (decoded.hrv ?? 0) > 0 ||
+    (decoded.systolicPressure ?? 0) > 0 ||
+    (decoded.diastolicPressure ?? 0) > 0
+  );
 }
 
 export function mandatoryVitalsFromDecoded(decoded: {

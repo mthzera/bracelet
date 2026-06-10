@@ -10,14 +10,20 @@
  
  #include "soc/soc.h"
  #include "soc/rtc_cntl_reg.h"
+
+ #include <time.h>
+ #include <stdarg.h>
+ #include <sys/time.h>
+ #include "esp_bt.h"
+ #include "esp_sntp.h"
  
  // ===================== CONFIGURAÇÕES =====================
  
  const char* WIFI_SSID = "IoTs";
  const char* WIFI_PASS = "AneryIot158";
  
- const char* API_BASE = "https://bracelet-pn7r.onrender.com";
- const char* API_BATCH_URL = "https://bracelet-pn7r.onrender.com/bracelets/packets";
+ const char* API_HOST = "bracelet-pn7r.onrender.com";
+ const char* API_BATCH_PATH = "/bracelets/packets";
  
  // MAC atual da pulseira que você está usando
  const char* DEVICE_MAC = "ef:7a:0d:30:b3:fa";
@@ -34,12 +40,21 @@
  #define LOG_HTTP 1
  #define LOG_QUEUE 1
  #define LOG_STATE 1
- 
+
+ // Fuso horário: UTC-3 (Brasil)
+ const long TIMEZONE_OFFSET_SEC = -3 * 3600;
+ const int TIMEZONE_DST_SEC = 0;
+
+ bool clockSynced = false;
+
+ // Epoch mínimo plausível: 2024-01-01
+ const time_t MIN_VALID_EPOCH_SEC = 1704067200;
+ const uint64_t MIN_VALID_EPOCH_MS = 1704067200000ULL;
+
 // ===================== INTERVALOS =====================
 
-// Controle para não encher fila com 0x28/0x09 a cada segundo
+// Controle para não encher fila com pacotes repetidos
 const unsigned long RX_028_MIN_GAP_MS = 3000;   // 1 pacote 0x28 a cada 3s por subtipo
-const unsigned long RX_009_MIN_GAP_MS = 15000;  // 1 pacote 0x09 a cada 15s
 const unsigned long RX_OTHER_MIN_GAP_MS = 1500;
 
 // Janelas menores de medição
@@ -54,22 +69,25 @@ const unsigned long HISTORY_COMMAND_GAP_MS = 700;
  
  // Wi-Fi / Render
  const unsigned long WIFI_RETRY_INTERVAL_MS = 5000;
+ const unsigned long WIFI_HTTPS_WARMUP_MS = 4000;
  const unsigned long RENDER_PING_INTERVAL_MS = 8000;
  const unsigned long HTTP_RETRY_INTERVAL_MS = 10000;
+ const int RENDER_HEALTH_MAX_FAILS = 3;
  
  // ===================== FILA =====================
  
-#define RAW_HEX_MAX_LEN 360
+#define RAW_HEX_MAX_LEN 800
 #define PACKET_TYPE_LEN 8
 #define HTTP_QUEUE_SIZE 50
-#define BATCH_MAX_PACKETS 50
-#define BATCH_PAYLOAD_MAX_LEN 9000
+#define BATCH_MAX_PACKETS 20
+#define BATCH_PAYLOAD_MAX_LEN 16000
  
  struct RawPacketItem {
    bool used;
    char packetType[PACKET_TYPE_LEN];
    char rawHex[RAW_HEX_MAX_LEN];
    unsigned long receivedAtMs;
+   unsigned long receivedAtUptimeMs;
  };
  
 RawPacketItem httpQueue[HTTP_QUEUE_SIZE];
@@ -127,26 +145,241 @@ static char batchPayload[BATCH_PAYLOAD_MAX_LEN];
  unsigned long lastWifiTryAt = 0;
  unsigned long lastRenderPingAt = 0;
  unsigned long lastHttpTryAt = 0;
+ int renderHealthFailCount = 0;
+ int httpBatchFailCount = 0;
+ const int HTTP_BATCH_MAX_FAILS = 2;
  
  // ===================== UTILS =====================
- 
+
+ void initClockTimezone() {
+   configTime(TIMEZONE_OFFSET_SEC, TIMEZONE_DST_SEC, nullptr, nullptr);
+ }
+
+ uint8_t byteToDec(uint8_t value, bool bcd) {
+   if (!bcd) return value;
+   return ((value >> 4) & 0x0F) * 10 + (value & 0x0F);
+ }
+
+ bool isValidEpoch(time_t epoch) {
+   return epoch >= MIN_VALID_EPOCH_SEC && epoch < 2000000000;
+ }
+
+ bool isValidDateTime(const struct tm& t) {
+   int year = t.tm_year + 1900;
+   if (year < 2024 || year > 2027) return false;
+   if (t.tm_mon < 0 || t.tm_mon > 11) return false;
+   if (t.tm_mday < 1 || t.tm_mday > 31) return false;
+   if (t.tm_hour < 0 || t.tm_hour > 23) return false;
+   if (t.tm_min < 0 || t.tm_min > 59) return false;
+   if (t.tm_sec < 0 || t.tm_sec > 59) return false;
+   return true;
+ }
+
+ bool applySystemTime(struct tm& t, const char* source) {
+   if (!isValidDateTime(t)) return false;
+
+   time_t epoch = mktime(&t);
+   if (epoch <= 0 || !isValidEpoch(epoch)) return false;
+
+   struct timeval tv = { epoch, 0 };
+   settimeofday(&tv, nullptr);
+   clockSynced = true;
+
+   char timeBuf[32];
+   strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", &t);
+   logPrintf("Relógio ajustado via %s: %s\n", source, timeBuf);
+   return true;
+ }
+
+ uint64_t nowEpochMs() {
+   struct timeval tv;
+   if (gettimeofday(&tv, nullptr) != 0) return 0;
+   if (!isValidEpoch(tv.tv_sec)) return 0;
+   return ((uint64_t)tv.tv_sec * 1000ULL) + (uint64_t)(tv.tv_usec / 1000);
+ }
+
+ uint64_t resolvePacketEpochMs(unsigned long storedEpochMs, unsigned long receivedAtUptimeMs) {
+   if (storedEpochMs >= MIN_VALID_EPOCH_MS) {
+     return storedEpochMs;
+   }
+
+   uint64_t epochNow = nowEpochMs();
+   if (epochNow == 0) return 0;
+
+   unsigned long batchUptime = millis();
+   if (batchUptime >= receivedAtUptimeMs) {
+     unsigned long ageMs = batchUptime - receivedAtUptimeMs;
+     if (epochNow > ageMs) {
+       return epochNow - ageMs;
+     }
+   }
+
+   return epochNow;
+ }
+
+ void formatLogTime(char* out, size_t outSize) {
+   if (!out || outSize == 0) return;
+
+   struct timeval tv;
+   if (gettimeofday(&tv, nullptr) == 0 && isValidEpoch(tv.tv_sec)) {
+     struct tm timeinfo;
+     localtime_r(&tv.tv_sec, &timeinfo);
+     strftime(out, outSize, "%Y-%m-%d %H:%M:%S", &timeinfo);
+     return;
+   }
+
+   strncpy(out, "----/--/-- --:--:--", outSize);
+   out[outSize - 1] = '\0';
+ }
+
+ void logPrefix() {
+   char timeBuf[32];
+   formatLogTime(timeBuf, sizeof(timeBuf));
+   Serial.printf("[%s] ", timeBuf);
+ }
+
+ void logPrint(const char* msg) {
+   logPrefix();
+   Serial.print(msg);
+ }
+
+ void logPrintln() {
+   logPrefix();
+   Serial.println();
+ }
+
+ void logPrintln(const char* msg) {
+   logPrefix();
+   Serial.println(msg);
+ }
+
+ void logPrintln(unsigned long value) {
+   logPrefix();
+   Serial.println(value);
+ }
+
+ void logPrintf(const char* fmt, ...) {
+   logPrefix();
+
+   char buffer[320];
+   va_list args;
+   va_start(args, fmt);
+   vsnprintf(buffer, sizeof(buffer), fmt, args);
+   va_end(args);
+
+   Serial.print(buffer);
+ }
+
+ bool syncTimeFromNtp() {
+   if (WiFi.status() != WL_CONNECTED) return false;
+
+   time_t before = time(nullptr);
+   configTime(TIMEZONE_OFFSET_SEC, TIMEZONE_DST_SEC, "pool.ntp.org", "time.nist.gov");
+
+   for (int i = 0; i < 40; i++) {
+     delay(250);
+
+     time_t now = time(nullptr);
+     if (!isValidEpoch(now)) continue;
+
+     if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+       clockSynced = true;
+       struct tm timeinfo;
+       localtime_r(&now, &timeinfo);
+       char timeBuf[32];
+       strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+       logPrintf("Relógio sincronizado via NTP: %s\n", timeBuf);
+       return true;
+     }
+
+     if (before < MIN_VALID_EPOCH_SEC && now >= MIN_VALID_EPOCH_SEC) {
+       clockSynced = true;
+       struct tm timeinfo;
+       localtime_r(&now, &timeinfo);
+       char timeBuf[32];
+       strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+       logPrintf("Relógio sincronizado via NTP: %s\n", timeBuf);
+       return true;
+     }
+   }
+
+   logPrintln("[APP] NTP não confirmou sincronização.");
+   return false;
+ }
+
+ bool tryParseBraceletTime(const uint8_t* data, size_t len, int offset, bool bcd, struct tm& out) {
+   if (!data || len < (size_t)(offset + 6)) return false;
+
+   memset(&out, 0, sizeof(out));
+
+   int year = byteToDec(data[offset], bcd);
+   if (year < 100) {
+     year += 2000;
+   }
+
+   out.tm_year = year - 1900;
+   out.tm_mon = byteToDec(data[offset + 1], bcd) - 1;
+   out.tm_mday = byteToDec(data[offset + 2], bcd);
+   out.tm_hour = byteToDec(data[offset + 3], bcd);
+   out.tm_min = byteToDec(data[offset + 4], bcd);
+   out.tm_sec = byteToDec(data[offset + 5], bcd);
+
+   return isValidDateTime(out);
+ }
+
+ void updateClockFromBraceletPacket(const uint8_t* data, size_t len) {
+   if (!data || len < 7 || data[0] != 0x41) return;
+   if (clockSynced) return;
+
+   char rawHex[80];
+   rawToHex(data, len < 16 ? len : 16, rawHex, sizeof(rawHex));
+
+   struct tm parsed = {};
+   const struct {
+     int offset;
+     bool bcd;
+   } formats[] = {
+     { 1, false },
+     { 1, true },
+     { 3, false },
+     { 3, true },
+   };
+
+   for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+     if (tryParseBraceletTime(data, len, formats[i].offset, formats[i].bcd, parsed)) {
+       if (applySystemTime(parsed, "pulseira 0x41")) {
+         return;
+       }
+     }
+   }
+
+   logPrintf("[APP] 0x41 ignorado (relógio da pulseira inválido): %s\n", rawHex);
+ }
+
  void changeState(MainState next) {
    mainState = next;
    stateStartedAt = millis();
- 
- #if LOG_STATE
-   Serial.print("[STATE] -> ");
-   switch (next) {
-     case STATE_BLE_START: Serial.println("BLE_START"); break;
-     case STATE_BLE_COLLECT: Serial.println("BLE_COLLECT"); break;
-     case STATE_BLE_QUERY_HISTORY: Serial.println("BLE_QUERY_HISTORY"); break;
-     case STATE_BLE_SHUTDOWN: Serial.println("BLE_SHUTDOWN"); break;
-     case STATE_WIFI_START: Serial.println("WIFI_START"); break;
-     case STATE_RENDER_WAKE: Serial.println("RENDER_WAKE"); break;
-     case STATE_HTTP_SEND_BATCH: Serial.println("HTTP_SEND_BATCH"); break;
-     case STATE_WIFI_SHUTDOWN: Serial.println("WIFI_SHUTDOWN"); break;
+
+   if (next == STATE_RENDER_WAKE) {
+     lastRenderPingAt = 0;
    }
- #endif
+
+   if (next == STATE_HTTP_SEND_BATCH) {
+     lastHttpTryAt = 0;
+   }
+
+#if LOG_STATE
+  switch (next) {
+    case STATE_BLE_START: logPrintf("[STATE] -> BLE_START\n"); break;
+    case STATE_BLE_COLLECT: logPrintf("[STATE] -> BLE_COLLECT\n"); break;
+    case STATE_BLE_QUERY_HISTORY: logPrintf("[STATE] -> BLE_QUERY_HISTORY\n"); break;
+    case STATE_BLE_SHUTDOWN: logPrintf("[STATE] -> BLE_SHUTDOWN\n"); break;
+    case STATE_WIFI_START: logPrintf("[STATE] -> WIFI_START\n"); break;
+    case STATE_RENDER_WAKE: logPrintf("[STATE] -> RENDER_WAKE\n"); break;
+    case STATE_HTTP_SEND_BATCH: logPrintf("[STATE] -> HTTP_SEND_BATCH\n"); break;
+    case STATE_WIFI_SHUTDOWN: logPrintf("[STATE] -> WIFI_SHUTDOWN\n"); break;
+  }
+#endif
  }
  
  uint8_t calcCrc(uint8_t* p, uint8_t len = 16) {
@@ -181,13 +414,57 @@ static char batchPayload[BATCH_PAYLOAD_MAX_LEN];
    }
  }
  
- void packetTypeToString(uint8_t packetType, char* out, size_t outSize) {
-   snprintf(out, outSize, "0x%02X", packetType);
- }
- 
- bool isBleReady() {
+void packetTypeToString(uint8_t packetType, char* out, size_t outSize) {
+  snprintf(out, outSize, "0x%02X", packetType);
+}
+
+// Aceita só sinais vitais, sono e metadados do dispositivo.
+// Ignora atividade: 0x09, 0x18, 0x51, 0x52, 0x5C (passos, calorias, exercícios).
+bool isWantedPacketType(uint8_t type) {
+  switch (type) {
+    case 0x28:  // medição ativa (HR, SpO2, temp, HRV)
+    case 0x53:  // sono
+    case 0x54:  // histórico HR
+    case 0x55:  // histórico HR pontual
+    case 0x56:  // histórico HRV
+    case 0x60:  // histórico SpO2 manual
+    case 0x62:  // histórico temperatura manual
+    case 0x65:  // histórico temperatura auto
+    case 0x66:  // histórico SpO2 auto
+    case 0x13:  // bateria
+    case 0x22:  // MAC
+    case 0x27:  // firmware
+    case 0x41:  // relógio
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isBleReady() {
    return bleClient && bleClient->isConnected() && txChar && rxChar && bleConnected;
  }
+
+bool hasMeaningful028Data(const uint8_t* data, size_t len) {
+  if (!data || len < 10 || data[0] != 0x28) return false;
+
+  int offset = (data[2] == 0x00 || data[2] == 0x01) ? 1 : 0;
+
+  switch (data[1]) {
+    case 0x02:
+      return data[2 + offset] > 1 || data[3 + offset] > 1;
+    case 0x03:
+      return data[3 + offset] > 1 || data[2 + offset] > 1;
+    case 0x04: {
+      uint16_t tempRaw = data[8] | (data[9] << 8);
+      return tempRaw > 0;
+    }
+    case 0x01:
+      return data[4 + offset] > 1 || data[5 + offset] > 1;
+    default:
+      return true;
+  }
+}
  
  // ===================== FILA =====================
  
@@ -196,7 +473,7 @@ void enqueueRawPacket(const char* packetType, const char* rawHex) {
 
   if (queueCount >= HTTP_QUEUE_SIZE) {
 #if LOG_QUEUE
-    Serial.println("[QUEUE] Limite 50 atingido. Ignorando novo pacote até enviar batch.");
+    logPrintln("[QUEUE] Limite 50 atingido. Ignorando novo pacote até enviar batch.");
 #endif
     return;
   }
@@ -210,12 +487,15 @@ void enqueueRawPacket(const char* packetType, const char* rawHex) {
   strncpy(item.rawHex, rawHex, RAW_HEX_MAX_LEN - 1);
   item.rawHex[RAW_HEX_MAX_LEN - 1] = '\0';
 
-  item.receivedAtMs = millis();
+  item.receivedAtUptimeMs = millis();
+
+  uint64_t epochMs = nowEpochMs();
+  item.receivedAtMs = epochMs > 0 ? (unsigned long)epochMs : 0;
 
   queueCount++;
 
 #if LOG_QUEUE
-  Serial.printf("[QUEUE] + %s | fila=%d/%d\n", packetType, queueCount, HTTP_QUEUE_SIZE);
+  logPrintf("[QUEUE] + %s | fila=%d/%d\n", packetType, queueCount, HTTP_QUEUE_SIZE);
 #endif
 }
  
@@ -241,7 +521,7 @@ void wifiOff() {
     return;
   }
 
-  Serial.println("[WIFI] Desligando Wi-Fi...");
+  logPrintln("[WIFI] Desligando Wi-Fi...");
 
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
@@ -262,65 +542,99 @@ void wifiOff() {
    lastWifiTryAt = now;
  
  #if LOG_STATE
-   Serial.println("[WIFI] Ligando/conectando...");
+   logPrintln("[WIFI] Ligando/conectando...");
  #endif
  
    WiFi.mode(WIFI_STA);
    WiFi.setSleep(false);
+   WiFi.setAutoReconnect(true);
+   WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE,
+               IPAddress(8, 8, 8, 8), IPAddress(1, 1, 1, 1));
    WiFi.begin(WIFI_SSID, WIFI_PASS);
  
    unsigned long start = millis();
  
    while (millis() - start < 12000) {
      if (WiFi.status() == WL_CONNECTED) {
-       Serial.printf("[WIFI] Conectado. IP=%s RSSI=%d\n",
-                     WiFi.localIP().toString().c_str(),
-                     WiFi.RSSI());
+       logPrintf("[WIFI] Conectado. IP=%s RSSI=%d heap=%u\n",
+                 WiFi.localIP().toString().c_str(),
+                 WiFi.RSSI(),
+                 ESP.getFreeHeap());
+       syncTimeFromNtp();
        return true;
      }
  
      delay(250);
    }
  
-   Serial.printf("[WIFI] Ainda não conectou. Status=%d\n", WiFi.status());
+   logPrintf("[WIFI] Ainda não conectou. Status=%d\n", WiFi.status());
    return false;
  }
  
  // ===================== HTTP =====================
- 
+
+ void configureSecureClient(WiFiClientSecure& client) {
+   client.setInsecure();
+   client.setHandshakeTimeout(45);
+   client.setTimeout(45000);
+ }
+
+ bool resolveApiHost(IPAddress& outIp) {
+   if (WiFi.hostByName(API_HOST, outIp)) {
+     logPrintf("[HTTP] DNS OK -> %s\n", outIp.toString().c_str());
+     return true;
+   }
+
+   logPrintln("[HTTP] DNS falhou para host da API.");
+   return false;
+ }
+
+ void logHttpResult(const char* label, int code, HTTPClient& http) {
+   if (code < 0) {
+     logPrintf("[HTTP] %s -> %d (%s) heap=%u\n",
+               label,
+               code,
+               http.errorToString(code).c_str(),
+               ESP.getFreeHeap());
+   } else {
+     logPrintf("[HTTP] %s -> %d heap=%u\n", label, code, ESP.getFreeHeap());
+   }
+ }
+
  bool pingRenderHealth() {
    if (WiFi.status() != WL_CONNECTED) return false;
- 
+
+   IPAddress apiIp;
+   if (!resolveApiHost(apiIp)) {
+     return false;
+   }
+
    WiFiClientSecure client;
-   client.setInsecure();
-   client.setHandshakeTimeout(30);
- 
+   configureSecureClient(client);
+
    HTTPClient http;
    http.setReuse(false);
-   http.setTimeout(25000);
- 
-   String url = String(API_BASE) + "/health";
- 
+   http.setTimeout(45000);
+   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+
  #if LOG_HTTP
-   Serial.println("[HTTP] GET /health...");
+   logPrintf("[HTTP] GET /health... heap=%u\n", ESP.getFreeHeap());
  #endif
- 
-   if (!http.begin(client, url)) {
+
+   if (!http.begin(client, API_HOST, 443, "/health", true)) {
  #if LOG_HTTP
-     Serial.println("[HTTP] begin /health falhou.");
+     logPrintln("[HTTP] begin /health falhou.");
  #endif
      return false;
    }
- 
+
    http.addHeader("Connection", "close");
- 
+   http.addHeader("User-Agent", "ESP32-2208A-Gateway");
+
    int code = http.GET();
+   logHttpResult("/health", code, http);
    http.end();
- 
- #if LOG_HTTP
-   Serial.printf("[HTTP] /health -> %d\n", code);
- #endif
- 
+
    return code >= 200 && code < 500;
  }
  
@@ -347,16 +661,25 @@ bool buildBatchPayload(int& itemsInBatch) {
   }
 
   for (int i = 0; i < limit; i++) {
-    char itemJson[520];
+    char itemJson[2800];
+    uint64_t packetEpochMs = resolvePacketEpochMs(
+      httpQueue[i].receivedAtMs,
+      httpQueue[i].receivedAtUptimeMs
+    );
+
+    if (packetEpochMs == 0) {
+      logPrintf("[HTTP] Sem epoch válido para %s. Abortando batch.\n", httpQueue[i].packetType);
+      return false;
+    }
 
     snprintf(
       itemJson,
       sizeof(itemJson),
-      "%s{\"packetType\":\"%s\",\"rawHex\":\"%s\",\"receivedAtMs\":%lu}",
+      "%s{\"packetType\":\"%s\",\"rawHex\":\"%s\",\"receivedAtMs\":%llu}",
       itemsInBatch > 0 ? "," : "",
       httpQueue[i].packetType,
       httpQueue[i].rawHex,
-      httpQueue[i].receivedAtMs
+      (unsigned long long)packetEpochMs
     );
 
     if (strlen(batchPayload) + strlen(itemJson) + 4 >= BATCH_PAYLOAD_MAX_LEN) {
@@ -371,6 +694,11 @@ bool buildBatchPayload(int& itemsInBatch) {
 
   strcat(batchPayload, "]}");
 
+#if LOG_HTTP
+  logPrintf("[HTTP] Batch timestamps OK | epoch agora=%llu\n",
+            (unsigned long long)nowEpochMs());
+#endif
+
   return true;
 }
  
@@ -378,46 +706,59 @@ bool postBatchToApi() {
   if (WiFi.status() != WL_CONNECTED) return false;
   if (queueCount <= 0) return true;
 
+  if (!clockSynced) {
+    syncTimeFromNtp();
+  }
+
+  if (!clockSynced || nowEpochMs() == 0) {
+    logPrintln("[HTTP] Sem relógio válido para timestamps do batch.");
+    return false;
+  }
+
   int itemsInBatch = 0;
 
   if (!buildBatchPayload(itemsInBatch)) {
-    Serial.println("[HTTP] Falha ao montar batch payload.");
+    logPrintln("[HTTP] Falha ao montar batch payload.");
+    return false;
+  }
+
+  IPAddress apiIp;
+  if (!resolveApiHost(apiIp)) {
     return false;
   }
 
   WiFiClientSecure client;
-  client.setInsecure();
-  client.setHandshakeTimeout(30);
+  configureSecureClient(client);
 
   HTTPClient http;
   http.setReuse(false);
-  http.setTimeout(30000);
+  http.setTimeout(45000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
 
 #if LOG_HTTP
-  Serial.printf("[HTTP] POST batch | itens=%d | fila=%d\n", itemsInBatch, queueCount);
+  logPrintf("[HTTP] POST batch | itens=%d | fila=%d heap=%u\n",
+            itemsInBatch, queueCount, ESP.getFreeHeap());
 #endif
 
-  if (!http.begin(client, API_BATCH_URL)) {
+  if (!http.begin(client, API_HOST, 443, API_BATCH_PATH, true)) {
 #if LOG_HTTP
-    Serial.println("[HTTP] begin batch falhou.");
+    logPrintln("[HTTP] begin batch falhou.");
 #endif
     return false;
   }
 
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Connection", "close");
+  http.addHeader("User-Agent", "ESP32-2208A-Gateway");
 
   int code = http.POST((uint8_t*)batchPayload, strlen(batchPayload));
 
-#if LOG_HTTP
-  Serial.printf("[HTTP] batch status=%d\n", code);
-#endif
+  logHttpResult("batch", code, http);
 
   if (code > 0) {
     String res = http.getString();
 #if LOG_HTTP
-    Serial.print("[HTTP] response size=");
-    Serial.println(res.length());
+    logPrintf("[HTTP] response size=%u\n", res.length());
 #endif
   }
 
@@ -425,11 +766,11 @@ bool postBatchToApi() {
 
   if (code == 200 || code == 201 || code == 202) {
     removeQueueItems(itemsInBatch);
-    Serial.printf("[HTTP] Batch OK. Removidos=%d | fila=%d\n", itemsInBatch, queueCount);
+    logPrintf("[HTTP] Batch OK. Removidos=%d | fila=%d\n", itemsInBatch, queueCount);
     return true;
   }
 
-  Serial.println("[HTTP] Batch falhou. Mantendo fila.");
+  logPrintln("[HTTP] Batch falhou. Mantendo fila.");
   return false;
 }
  
@@ -438,14 +779,14 @@ bool postBatchToApi() {
  class BraceletCallbacks : public BLEClientCallbacks {
    void onConnect(BLEClient*) override {
      bleConnected = true;
-     Serial.println("[BLE] Callback conectado.");
+     logPrintln("[BLE] Callback conectado.");
    }
  
    void onDisconnect(BLEClient*) override {
      bleConnected = false;
      txChar = nullptr;
      rxChar = nullptr;
-     Serial.println("[BLE] Callback desconectado.");
+     logPrintln("[BLE] Callback desconectado.");
    }
  };
  
@@ -459,13 +800,23 @@ void notifyCallback(
 ) {
   if (!data || len == 0) return;
 
+  uint8_t type = data[0];
+
+  if (type == 0x41) {
+    updateClockFromBraceletPacket(data, len);
+  }
+
+  if (!isWantedPacketType(type)) {
+#if LOG_BLE_RX
+    logPrintf("[BLE RX] 0x%02X ignorado (atividade/outro)\n", type);
+#endif
+    return;
+  }
+
   unsigned long now = millis();
 
   static unsigned long last028BySubtype[8] = {0};
-  static unsigned long last009At = 0;
   static unsigned long lastOtherByType[256] = {0};
-
-  uint8_t type = data[0];
 
   // Limita volume do 0x28 por subtipo: HR, SpO2, Temp, HRV
   if (type == 0x28 && len > 1) {
@@ -478,14 +829,6 @@ void notifyCallback(
     }
   }
 
-  // Limita 0x09, porque tempo real gera pacote demais
-  else if (type == 0x09) {
-    if (now - last009At < RX_009_MIN_GAP_MS) {
-      return;
-    }
-    last009At = now;
-  }
-
   // Limita duplicidade de outros pacotes, tipo 0x13, 0x22, 0x27, 0x41
   else {
     if (now - lastOtherByType[type] < RX_OTHER_MIN_GAP_MS) {
@@ -494,9 +837,16 @@ void notifyCallback(
     lastOtherByType[type] = now;
   }
 
+  if (type == 0x28 && !hasMeaningful028Data(data, len)) {
+#if LOG_BLE_RX
+    logPrintf("[BLE RX] 0x28 ignorado (sem valor de medição)\n");
+#endif
+    return;
+  }
+
   if (queueCount >= HTTP_QUEUE_SIZE) {
 #if LOG_QUEUE
-    Serial.println("[QUEUE] Cheia. RX ignorado.");
+    logPrintln("[QUEUE] Cheia. RX ignorado.");
 #endif
     return;
   }
@@ -508,7 +858,7 @@ void notifyCallback(
   packetTypeToString(type, packetType, sizeof(packetType));
 
 #if LOG_BLE_RX
-  Serial.printf("[BLE RX] %s len=%u | fila=%d/%d\n", packetType, len, queueCount, HTTP_QUEUE_SIZE);
+  logPrintf("[BLE RX] %s len=%u | fila=%d/%d\n", packetType, len, queueCount, HTTP_QUEUE_SIZE);
 #endif
 
   enqueueRawPacket(packetType, rawHex);
@@ -521,7 +871,7 @@ bool startBle() {
     return true;
   }
 
-  Serial.println("[BLE] Inicializando BLE...");
+  logPrintln("[BLE] Inicializando BLE...");
   BLEDevice::init("ESP32_2208A_GATEWAY");
   bleInitialized = true;
   delay(500);
@@ -530,7 +880,7 @@ bool startBle() {
 }
 
 void blePauseForWifi() {
-  Serial.println("[BLE] Pausando BLE para usar Wi-Fi...");
+  logPrintln("[BLE] Pausando BLE para usar Wi-Fi...");
 
   if (bleClient && bleClient->isConnected()) {
     bleClient->disconnect();
@@ -540,9 +890,14 @@ void blePauseForWifi() {
   bleConnected = false;
   txChar = nullptr;
   rxChar = nullptr;
+  bleClient = nullptr;
 
-  // NÃO chamar BLEDevice::deinit(true) aqui.
-  // Manter a stack BLE inicializada evita falha ao criar client no próximo ciclo.
+  if (bleInitialized) {
+    BLEDevice::deinit(false);
+    bleInitialized = false;
+    delay(1200);
+    logPrintf("[BLE] Stack BLE pausada. heap=%u\n", ESP.getFreeHeap());
+  }
 }
 
 bool connectBracelet() {
@@ -558,11 +913,11 @@ bool connectBracelet() {
   }
 
   if (!bleClient) {
-    Serial.println("[BLE] Criando BLE client...");
+    logPrintln("[BLE] Criando BLE client...");
     bleClient = BLEDevice::createClient();
 
     if (!bleClient) {
-      Serial.println("[BLE] Falha ao criar BLE client. Tentando resetar stack BLE uma vez...");
+      logPrintln("[BLE] Falha ao criar BLE client. Tentando resetar stack BLE uma vez...");
 
       BLEDevice::deinit(true);
       bleInitialized = false;
@@ -575,7 +930,7 @@ bool connectBracelet() {
       bleClient = BLEDevice::createClient();
 
       if (!bleClient) {
-        Serial.println("[BLE] Falha definitiva ao criar BLE client.");
+        logPrintln("[BLE] Falha definitiva ao criar BLE client.");
         return false;
       }
     }
@@ -583,31 +938,31 @@ bool connectBracelet() {
     bleClient->setClientCallbacks(&braceletCallbacks);
   }
 
-  Serial.printf("[BLE] Conectando na pulseira %s...\n", DEVICE_MAC);
+  logPrintf("[BLE] Conectando na pulseira %s...\n", DEVICE_MAC);
 
   BLEAddress address(DEVICE_MAC);
 
   bool connected = bleClient->connect(address, BLE_ADDR_TYPE_RANDOM);
 
   if (!connected) {
-    Serial.println("[BLE] Falhou RANDOM. Tentando PUBLIC...");
+    logPrintln("[BLE] Falhou RANDOM. Tentando PUBLIC...");
     delay(500);
     connected = bleClient->connect(address, BLE_ADDR_TYPE_PUBLIC);
   }
 
   if (!connected) {
-    Serial.println("[BLE] Falha ao conectar na pulseira.");
+    logPrintln("[BLE] Falha ao conectar na pulseira.");
     bleConnected = false;
     txChar = nullptr;
     rxChar = nullptr;
     return false;
   }
 
-  Serial.println("[BLE] Conectado. Procurando serviço FFF0...");
+  logPrintln("[BLE] Conectado. Procurando serviço FFF0...");
 
   BLERemoteService* service = bleClient->getService(SERVICE_UUID);
   if (!service) {
-    Serial.println("[BLE] Serviço FFF0 não encontrado.");
+    logPrintln("[BLE] Serviço FFF0 não encontrado.");
     bleClient->disconnect();
     delay(500);
     bleConnected = false;
@@ -620,7 +975,7 @@ bool connectBracelet() {
   rxChar = service->getCharacteristic(RX_UUID);
 
   if (!txChar || !rxChar) {
-    Serial.println("[BLE] Características FFF6/FFF7 não encontradas.");
+    logPrintln("[BLE] Características FFF6/FFF7 não encontradas.");
     bleClient->disconnect();
     delay(500);
     bleConnected = false;
@@ -631,14 +986,20 @@ bool connectBracelet() {
 
   if (rxChar->canNotify()) {
     rxChar->registerForNotify(notifyCallback);
-    Serial.println("[BLE] Notify registrado em RX FFF7.");
+    logPrintln("[BLE] Notify registrado em RX FFF7.");
   } else {
-    Serial.println("[BLE] RX FFF7 não suporta notify.");
+    logPrintln("[BLE] RX FFF7 não suporta notify.");
   }
 
   bleConnected = true;
 
-  Serial.println("[BLE] Pulseira pronta.");
+  readDeviceTime();
+  unsigned long waitClock = millis();
+  while (!clockSynced && millis() - waitClock < 3000) {
+    delay(50);
+  }
+
+  logPrintln("[BLE] Pulseira pronta.");
 
   return true;
 }
@@ -654,7 +1015,7 @@ bool connectBracelet() {
  
    lastBleReconnectAttempt = now;
  
-   Serial.println("[BLE] Não conectado. Tentando reconectar...");
+   logPrintln("[BLE] Não conectado. Tentando reconectar...");
    return connectBracelet();
  }
  
@@ -662,7 +1023,7 @@ bool connectBracelet() {
  
  void sendPacket16(uint8_t* pkt) {
    if (!isBleReady()) {
-     Serial.println("[BLE TX] Não enviado: BLE não pronto.");
+     logPrintln("[BLE TX] Não enviado: BLE não pronto.");
      return;
    }
  
@@ -671,7 +1032,7 @@ bool connectBracelet() {
  #if LOG_BLE_TX
    char txHex[80];
    rawToHex(pkt, 16, txHex, sizeof(txHex));
-   Serial.printf("[BLE TX] %s\n", txHex);
+   logPrintf("[BLE TX] %s\n", txHex);
  #endif
  
    txChar->writeValue(pkt, 16, true);
@@ -710,11 +1071,7 @@ bool connectBracelet() {
    delay(50);
  }
  
- // Tempo real 0x09
- void startRealtime() {
-   sendCommand(0x09, 0x01, 0x00);
- }
- 
+ // Tempo real 0x09 — desabilitado (passos, calorias, distância)
  void stopRealtime() {
    sendCommand(0x09, 0x00, 0x00);
  }
@@ -773,25 +1130,28 @@ bool connectBracelet() {
  
  void sendInitialBleCommands() {
    if (!isBleReady()) return;
- 
-   Serial.println("[APP] Comandos iniciais BLE...");
- 
+
+   if (!clockSynced) {
+     readDeviceTime();
+
+     unsigned long waitClock = millis();
+     while (!clockSynced && millis() - waitClock < 3000) {
+       delay(50);
+     }
+   }
+
+   logPrintln("[APP] Comandos iniciais BLE...");
+
    readBattery();
    delay(300);
- 
+
    readMacAddress();
    delay(300);
- 
+
    readFirmware();
    delay(300);
- 
-   readDeviceTime();
-   delay(300);
- 
-  // startRealtime();
-  // delay(300);
- 
-   healthState = HEALTH_START_HR;
+
+  healthState = HEALTH_START_HR;
    healthStateStartedAt = millis();
  }
  
@@ -809,7 +1169,7 @@ bool connectBracelet() {
        break;
  
      case HEALTH_START_HR:
-       Serial.println("[APP] Start HR");
+       logPrintln("[APP] Start HR");
        startHealth(0x02);
        healthState = HEALTH_STOP_HR;
        healthStateStartedAt = now;
@@ -817,7 +1177,7 @@ bool connectBracelet() {
  
      case HEALTH_STOP_HR:
        if (now - healthStateStartedAt >= HEALTH_MEASURE_WINDOW_MS) {
-         Serial.println("[APP] Stop HR");
+         logPrintln("[APP] Stop HR");
          stopHealth(0x02);
          healthState = HEALTH_START_SPO2;
          healthStateStartedAt = now;
@@ -825,7 +1185,7 @@ bool connectBracelet() {
        break;
  
      case HEALTH_START_SPO2:
-       Serial.println("[APP] Start SpO2");
+       logPrintln("[APP] Start SpO2");
        startHealth(0x03);
        healthState = HEALTH_STOP_SPO2;
        healthStateStartedAt = now;
@@ -833,7 +1193,7 @@ bool connectBracelet() {
  
      case HEALTH_STOP_SPO2:
        if (now - healthStateStartedAt >= HEALTH_MEASURE_WINDOW_MS) {
-         Serial.println("[APP] Stop SpO2");
+         logPrintln("[APP] Stop SpO2");
          stopHealth(0x03);
          healthState = HEALTH_START_TEMP;
          healthStateStartedAt = now;
@@ -841,7 +1201,7 @@ bool connectBracelet() {
        break;
  
      case HEALTH_START_TEMP:
-       Serial.println("[APP] Start Temp");
+       logPrintln("[APP] Start Temp");
        startHealth(0x04);
        healthState = HEALTH_STOP_TEMP;
        healthStateStartedAt = now;
@@ -849,7 +1209,7 @@ bool connectBracelet() {
  
      case HEALTH_STOP_TEMP:
        if (now - healthStateStartedAt >= HEALTH_MEASURE_WINDOW_MS) {
-         Serial.println("[APP] Stop Temp");
+         logPrintln("[APP] Stop Temp");
          stopHealth(0x04);
          healthState = HEALTH_START_HRV;
          healthStateStartedAt = now;
@@ -857,7 +1217,7 @@ bool connectBracelet() {
        break;
  
      case HEALTH_START_HRV:
-       Serial.println("[APP] Start HRV");
+       logPrintln("[APP] Start HRV");
        startHealth(0x01);
        healthState = HEALTH_STOP_HRV;
        healthStateStartedAt = now;
@@ -865,10 +1225,10 @@ bool connectBracelet() {
  
     case HEALTH_STOP_HRV:
       if (now - healthStateStartedAt >= HEALTH_MEASURE_WINDOW_MS) {
-        Serial.println("[APP] Stop HRV");
+        logPrintln("[APP] Stop HRV");
         stopHealth(0x01);
 
-        Serial.println("[APP] Ciclo de saúde finalizado.");
+        logPrintln("[APP] Ciclo de saúde finalizado.");
         healthState = HEALTH_DONE;
         healthStateStartedAt = now;
       }
@@ -902,7 +1262,7 @@ bool connectBracelet() {
  
    lastHistoryCommandAt = now;
  
-   Serial.printf("[APP] Consultando histórico index=%d\n", historyIndex);
+   logPrintf("[APP] Consultando histórico index=%d\n", historyIndex);
  
    switch (historyIndex) {
      case 0:
@@ -939,7 +1299,7 @@ bool connectBracelet() {
  
      default:
        historyCommandsFinished = true;
-       Serial.println("[APP] Comandos de histórico finalizados. Aguardando respostas...");
+       logPrintln("[APP] Comandos de histórico finalizados. Aguardando respostas...");
        break;
    }
  
@@ -953,14 +1313,19 @@ bool connectBracelet() {
  
    Serial.begin(115200);
    delay(1000);
- 
-   Serial.println();
-   Serial.println("==========================================");
-   Serial.println("ESP32 2208A BLE COLLECT -> WIFI BATCH API");
-   Serial.println("==========================================");
- 
+
+   initClockTimezone();
+
+   logPrintln();
+   logPrintln("==========================================");
+   logPrintln("ESP32 2208A BLE COLLECT -> WIFI BATCH API");
+   logPrintln("==========================================");
+
+   esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+   logPrintf("[APP] Heap livre no boot=%u\n", ESP.getFreeHeap());
+
    wifiOff();
- 
+
    changeState(STATE_BLE_START);
  }
  
@@ -985,7 +1350,7 @@ bool connectBracelet() {
         sendInitialBleCommands();
         changeState(STATE_BLE_COLLECT);
       } else {
-        Serial.println("[BLE] Falha no start. Tentando novamente em 10s...");
+        logPrintln("[BLE] Falha no start. Tentando novamente em 10s...");
         delay(10000);
       }
 
@@ -1000,7 +1365,7 @@ bool connectBracelet() {
        }
  
        if (now - stateStartedAt >= BLE_COLLECT_WINDOW_MS) {
-         Serial.printf("[APP] Janela BLE finalizada. Fila=%d\n", queueCount);
+         logPrintf("[APP] Janela BLE finalizada. Fila=%d\n", queueCount);
          resetHistoryQuery();
          changeState(STATE_BLE_QUERY_HISTORY);
        }
@@ -1016,7 +1381,7 @@ bool connectBracelet() {
        }
  
        if (historyCommandsFinished && now - lastHistoryCommandAt >= HISTORY_RESPONSE_WAIT_MS) {
-         Serial.printf("[APP] Histórico coletado. Fila=%d\n", queueCount);
+         logPrintf("[APP] Histórico coletado. Fila=%d\n", queueCount);
          changeState(STATE_BLE_SHUTDOWN);
        }
  
@@ -1032,7 +1397,7 @@ bool connectBracelet() {
        }
  
       blePauseForWifi();
-      delay(800);
+      delay(1500);
       changeState(STATE_WIFI_START);
       break;
     }
@@ -1050,20 +1415,35 @@ bool connectBracelet() {
          changeState(STATE_WIFI_START);
          break;
        }
- 
+
+       if (now - stateStartedAt < WIFI_HTTPS_WARMUP_MS) {
+         break;
+       }
+
        if (now - lastRenderPingAt >= RENDER_PING_INTERVAL_MS) {
          lastRenderPingAt = now;
- 
+
          bool ok = pingRenderHealth();
- 
+
          if (ok) {
-           Serial.println("[HTTP] Render acordado.");
+           renderHealthFailCount = 0;
+           httpBatchFailCount = 0;
+           logPrintln("[HTTP] Render acordado.");
            changeState(STATE_HTTP_SEND_BATCH);
          } else {
-           Serial.println("[HTTP] Render ainda não respondeu. Tentando de novo...");
+           renderHealthFailCount++;
+
+           logPrintf("[HTTP] Render ainda não respondeu. Tentativas=%d/%d\n",
+                     renderHealthFailCount,
+                     RENDER_HEALTH_MAX_FAILS);
+
+           if (renderHealthFailCount >= RENDER_HEALTH_MAX_FAILS) {
+             logPrintln("[HTTP] /health falhou demais. Tentando batch direto uma vez.");
+             changeState(STATE_HTTP_SEND_BATCH);
+           }
          }
        }
- 
+
        break;
      }
  
@@ -1072,37 +1452,58 @@ bool connectBracelet() {
          changeState(STATE_WIFI_START);
          break;
        }
- 
+
        if (queueCount <= 0) {
-         Serial.println("[HTTP] Fila vazia. Finalizando envio.");
+         logPrintln("[HTTP] Fila vazia. Finalizando envio.");
          changeState(STATE_WIFI_SHUTDOWN);
          break;
        }
- 
+
        if (now - lastHttpTryAt >= HTTP_RETRY_INTERVAL_MS) {
          lastHttpTryAt = now;
- 
+
          bool ok = postBatchToApi();
- 
-         if (!ok) {
-           Serial.println("[HTTP] Batch falhou. Voltando para wake Render.");
+
+         if (ok) {
+           httpBatchFailCount = 0;
+
+           if (queueCount <= 0) {
+             logPrintln("[HTTP] Todos os batches enviados.");
+             changeState(STATE_WIFI_SHUTDOWN);
+           }
+
+           break;
+         }
+
+         httpBatchFailCount++;
+
+         logPrintf("[HTTP] Batch falhou. Tentativas=%d/%d\n",
+                   httpBatchFailCount,
+                   HTTP_BATCH_MAX_FAILS);
+
+         if (httpBatchFailCount >= HTTP_BATCH_MAX_FAILS) {
+           logPrintln("[HTTP] Falhou demais. Mantendo fila e voltando para BLE.");
+           changeState(STATE_WIFI_SHUTDOWN);
+         } else {
            changeState(STATE_RENDER_WAKE);
          }
        }
- 
+
        break;
      }
  
     case STATE_WIFI_SHUTDOWN: {
       wifiOff();
 
-      Serial.println("[APP] Ciclo completo. Voltando para BLE.");
+      logPrintln("[APP] Ciclo completo. Voltando para BLE.");
       delay(1500);
 
       healthState = HEALTH_IDLE;
       lastBleReconnectAttempt = 0;
       lastRenderPingAt = 0;
       lastHttpTryAt = 0;
+      renderHealthFailCount = 0;
+      httpBatchFailCount = 0;
 
       changeState(STATE_BLE_START);
       break;

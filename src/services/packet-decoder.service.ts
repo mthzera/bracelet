@@ -37,11 +37,13 @@ export type DecodedHealth = {
   temperature: number;
 };
 
-/** Histórico HRV — comando 0x56 (D1=HRV, D4=fadiga). */
+/** Histórico HRV — comando 0x56 (registros de 16 bytes concatenados). */
 export type DecodedHrvHistory = {
   type: "0x56";
   hrv: number;
   fatigue: number;
+  /** Presente quando o pacote traz múltiplos registros de histórico. */
+  recordCount?: number;
 };
 
 /** Pacote 0x09 — tempo real (passos, calorias, distância, HR, SpO2, temperatura). */
@@ -187,20 +189,44 @@ export function validateCrc(bytes: number[]): void {
 }
 
 /**
- * Pacotes que não têm CRC no último byte — ou porque são curtos por design (0x13),
- * ou porque o ESP32 trunca em 16 bytes e o CRC real está além da janela capturada.
- * Apenas 0x22 e 0x28 são sempre 16 bytes com CRC correto na posição 15.
- * 0x56 tem decoder existente e resposta 16 bytes — mantém validação.
+ * Pacotes com CRC no último byte do buffer inteiro.
+ * Históricos bulk (0x56, 0x54, …) são múltiplos blocos de 16 bytes — CRC é por bloco.
  */
 function skipsCrcValidation(typeByte: number): boolean {
   switch (typeByte) {
     case 0x22: // MAC — resposta 16 bytes do dispositivo
-    case 0x28: // Health — ESP32 monta com CRC explícito
-    case 0x56: // HRV History — resposta 16 bytes com CRC
+    case 0x28: // Health — notify ativo 16 bytes com CRC
       return false;
     default:
       return true;
   }
+}
+
+function tryValidateCrc(bytes: number[]): boolean {
+  try {
+    validateCrc(bytes);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Valida CRC de cada registro de 16 bytes no histórico HRV bulk. */
+function crcValidForHrvHistory(bytes: number[]): boolean {
+  if (bytes.length < 16) return false;
+  if (bytes.length === 16) return tryValidateCrc(bytes);
+
+  let validRecords = 0;
+  let totalRecords = 0;
+
+  for (let offset = 0; offset + 16 <= bytes.length; offset += 16) {
+    totalRecords++;
+    if (tryValidateCrc(bytes.slice(offset, offset + 16))) {
+      validRecords++;
+    }
+  }
+
+  return totalRecords > 0 && validRecords === totalRecords;
 }
 
 function formatMacFromBytes(bytes: number[]): string {
@@ -336,11 +362,32 @@ function decodeHrvHistory(bytes: number[]): DecodedHrvHistory {
   if (bytes.length < 13) {
     throw new PacketDecoderError("HRV history packet (0x56) requires at least 13 bytes");
   }
+
+  const recordLen = 16;
+  const recordCount =
+    bytes.length >= recordLen ? Math.floor(bytes.length / recordLen) : 1;
+  const recordStart =
+    bytes.length >= recordLen ? (recordCount - 1) * recordLen : 0;
+
   return {
     type: "0x56",
-    hrv: bytes[9] ?? 0,
-    fatigue: bytes[12] ?? 0,
+    hrv: bytes[recordStart + 9] ?? 0,
+    fatigue: bytes[recordStart + 12] ?? 0,
+    recordCount: recordCount > 1 ? recordCount : undefined,
   };
+}
+
+/** 2208A às vezes usa byte[2] como status (0x00/0x01) antes do valor real. */
+function healthPayloadOffset(bytes: number[]): number {
+  if (bytes.length > 3 && (bytes[2] === 0x00 || bytes[2] === 0x01) && (bytes[3] ?? 0) > 1) {
+    return 1;
+  }
+  return 0;
+}
+
+function vitalByte(bytes: number[], index: number): number {
+  const value = bytes[index] ?? 0;
+  return value > 1 ? value : 0;
 }
 
 function decodeHealth(bytes: number[]): DecodedHealth {
@@ -350,6 +397,7 @@ function decodeHealth(bytes: number[]): DecodedHealth {
 
   const measurementType = bytes[1];
   const measurementMode = healthMeasurementMode(measurementType);
+  const offset = healthPayloadOffset(bytes);
   const temperatureRaw = bytes[8] | (bytes[9] << 8);
   const temperature = temperatureRaw > 0 ? temperatureRaw / 10 : 0;
 
@@ -362,23 +410,23 @@ function decodeHealth(bytes: number[]): DecodedHealth {
 
   switch (measurementType) {
     case 0x01: {
-      if (bytes[4] > 0) hrv = bytes[4];
-      if (bytes[5] > 0) fatigue = bytes[5];
+      hrv = vitalByte(bytes, 4 + offset);
+      fatigue = vitalByte(bytes, 5 + offset);
       break;
     }
     case 0x02: {
-      if (bytes[2] > 0) heartRate = bytes[2];
-      if (bytes[3] > 0) spo2 = bytes[3];
-      if (bytes[4] > 0) hrv = bytes[4];
-      if (bytes[5] > 0) fatigue = bytes[5];
+      heartRate = vitalByte(bytes, 2 + offset);
+      spo2 = vitalByte(bytes, 3 + offset);
+      hrv = vitalByte(bytes, 4 + offset);
+      fatigue = vitalByte(bytes, 5 + offset);
       const bp = decodeBloodPressure(bytes);
       systolicPressure = bp.systolicPressure;
       diastolicPressure = bp.diastolicPressure;
       break;
     }
     case 0x03: {
-      if (bytes[3] > 0) spo2 = bytes[3];
-      if (bytes[2] > 0) heartRate = bytes[2];
+      spo2 = vitalByte(bytes, 3 + offset);
+      heartRate = vitalByte(bytes, 2 + offset);
       break;
     }
     case 0x04: {
@@ -391,10 +439,10 @@ function decodeHealth(bytes: number[]): DecodedHealth {
       break;
     }
     default: {
-      if (bytes[2] > 0) heartRate = bytes[2];
-      if (bytes[3] > 0) spo2 = bytes[3];
-      if (bytes[4] > 0) hrv = bytes[4];
-      if (bytes[5] > 0) fatigue = bytes[5];
+      heartRate = vitalByte(bytes, 2 + offset);
+      spo2 = vitalByte(bytes, 3 + offset);
+      hrv = vitalByte(bytes, 4 + offset);
+      fatigue = vitalByte(bytes, 5 + offset);
       const bp = decodeBloodPressure(bytes);
       systolicPressure = bp.systolicPressure;
       diastolicPressure = bp.diastolicPressure;
@@ -491,9 +539,14 @@ export function decodePacket(packetType: string, rawHex: string): {
   const typeByte = parsePacketType(packetType);
   const bytes = rawHexToBytes(rawHex);
 
-  const crcValid = !skipsCrcValidation(typeByte);
-  if (crcValid) {
+  const skipPacketCrc = skipsCrcValidation(typeByte);
+  let crcValid = false;
+
+  if (!skipPacketCrc) {
     validateCrc(bytes);
+    crcValid = true;
+  } else if (typeByte === 0x56) {
+    crcValid = crcValidForHrvHistory(bytes);
   }
 
   if (bytes[0] !== typeByte) {
