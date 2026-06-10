@@ -262,14 +262,18 @@ function decodeFirmware(bytes: number[]): DecodedFirmware {
   };
 }
 
+function bcdByte(value: number): number {
+  return ((value >> 4) & 0x0f) * 10 + (value & 0x0f);
+}
+
 function decodeSleep(bytes: number[]): DecodedSleep {
   const recordId = (bytes[1] ?? 0) | ((bytes[2] ?? 0) << 8);
-  const yy = bytes[3] ?? 0;
-  const mo = bytes[4] ?? 0;
-  const dd = bytes[5] ?? 0;
-  const hh = bytes[6] ?? 0;
-  const mm = bytes[7] ?? 0;
-  const ss = bytes[8] ?? 0;
+  const yy = bcdByte(bytes[3] ?? 0);
+  const mo = bcdByte(bytes[4] ?? 0);
+  const dd = bcdByte(bytes[5] ?? 0);
+  const hh = bcdByte(bytes[6] ?? 0);
+  const mm = bcdByte(bytes[7] ?? 0);
+  const ss = bcdByte(bytes[8] ?? 0);
   const segLen = bytes[9] ?? 0;
   return {
     type: "0x53",
@@ -363,11 +367,10 @@ function decodeHrvHistory(bytes: number[]): DecodedHrvHistory {
     throw new PacketDecoderError("HRV history packet (0x56) requires at least 13 bytes");
   }
 
-  const recordLen = 16;
-  const recordCount =
-    bytes.length >= recordLen ? Math.floor(bytes.length / recordLen) : 1;
-  const recordStart =
-    bytes.length >= recordLen ? (recordCount - 1) * recordLen : 0;
+  // PDF §27: registro mínimo 15 bytes; notify BLE costuma vir em blocos de 16 com CRC.
+  const recordLen = bytes.length % 16 === 0 ? 16 : 15;
+  const recordCount = Math.max(1, Math.floor(bytes.length / recordLen));
+  const recordStart = (recordCount - 1) * recordLen;
 
   return {
     type: "0x56",
@@ -377,89 +380,31 @@ function decodeHrvHistory(bytes: number[]): DecodedHrvHistory {
   };
 }
 
-/** 2208A às vezes usa byte[2] como status (0x00/0x01) antes do valor real. */
-function healthPayloadOffset(bytes: number[]): number {
-  if (bytes.length > 3 && (bytes[2] === 0x00 || bytes[2] === 0x01) && (bytes[3] ?? 0) > 1) {
-    return 1;
-  }
-  return 0;
-}
-
-function vitalByte(bytes: number[], index: number): number {
-  const value = bytes[index] ?? 0;
-  return value > 1 ? value : 0;
-}
-
+/**
+ * PDF §33 — resposta 0x28 (16 bytes):
+ * [1]=tipo AA, [2]=BB HR, [3]=CC SpO2, [4]=DD HRV, [5]=EE fadiga,
+ * [6]=FF sistólica, [7]=GG diastólica, [8..9]=HH II temperatura (/10).
+ */
 function decodeHealth(bytes: number[]): DecodedHealth {
   if (bytes.length < 10) {
     throw new PacketDecoderError("Health packet (0x28) requires at least 10 bytes");
   }
 
   const measurementType = bytes[1];
-  const measurementMode = healthMeasurementMode(measurementType);
-  const offset = healthPayloadOffset(bytes);
-  const temperatureRaw = bytes[8] | (bytes[9] << 8);
-  const temperature = temperatureRaw > 0 ? temperatureRaw / 10 : 0;
-
-  let heartRate = 0;
-  let spo2 = 0;
-  let hrv = 0;
-  let fatigue = 0;
-  let systolicPressure = 0;
-  let diastolicPressure = 0;
-
-  switch (measurementType) {
-    case 0x01: {
-      hrv = vitalByte(bytes, 4 + offset);
-      fatigue = vitalByte(bytes, 5 + offset);
-      break;
-    }
-    case 0x02: {
-      heartRate = vitalByte(bytes, 2 + offset);
-      spo2 = vitalByte(bytes, 3 + offset);
-      hrv = vitalByte(bytes, 4 + offset);
-      fatigue = vitalByte(bytes, 5 + offset);
-      const bp = decodeBloodPressure(bytes);
-      systolicPressure = bp.systolicPressure;
-      diastolicPressure = bp.diastolicPressure;
-      break;
-    }
-    case 0x03: {
-      spo2 = vitalByte(bytes, 3 + offset);
-      heartRate = vitalByte(bytes, 2 + offset);
-      break;
-    }
-    case 0x04: {
-      break;
-    }
-    case 0x05: {
-      const bp = decodeBloodPressure(bytes);
-      systolicPressure = bp.systolicPressure;
-      diastolicPressure = bp.diastolicPressure;
-      break;
-    }
-    default: {
-      heartRate = vitalByte(bytes, 2 + offset);
-      spo2 = vitalByte(bytes, 3 + offset);
-      hrv = vitalByte(bytes, 4 + offset);
-      fatigue = vitalByte(bytes, 5 + offset);
-      const bp = decodeBloodPressure(bytes);
-      systolicPressure = bp.systolicPressure;
-      diastolicPressure = bp.diastolicPressure;
-    }
-  }
+  const bp = decodeBloodPressure(bytes);
+  const temperatureRaw = ((bytes[8] ?? 0) << 8) | (bytes[9] ?? 0);
 
   return {
     type: "0x28",
     measurementType,
-    measurementMode,
-    heartRate,
-    spo2,
-    hrv,
-    fatigue,
-    systolicPressure,
-    diastolicPressure,
-    temperature,
+    measurementMode: healthMeasurementMode(measurementType),
+    heartRate: bytes[2] ?? 0,
+    spo2: bytes[3] ?? 0,
+    hrv: bytes[4] ?? 0,
+    fatigue: bytes[5] ?? 0,
+    systolicPressure: bp.systolicPressure,
+    diastolicPressure: bp.diastolicPressure,
+    temperature: temperatureRaw > 0 ? temperatureRaw / 10 : 0,
   };
 }
 

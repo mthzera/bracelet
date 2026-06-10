@@ -334,26 +334,14 @@ static char batchPayload[BATCH_PAYLOAD_MAX_LEN];
    char rawHex[80];
    rawToHex(data, len < 16 ? len : 16, rawHex, sizeof(rawHex));
 
+   // PDF §2: 0x41 AA BB CC DD EE FF ... com data/hora em BCD.
    struct tm parsed = {};
-   const struct {
-     int offset;
-     bool bcd;
-   } formats[] = {
-     { 1, false },
-     { 1, true },
-     { 3, false },
-     { 3, true },
-   };
-
-   for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
-     if (tryParseBraceletTime(data, len, formats[i].offset, formats[i].bcd, parsed)) {
-       if (applySystemTime(parsed, "pulseira 0x41")) {
-         return;
-       }
-     }
+   if (!tryParseBraceletTime(data, len, 1, true, parsed)) {
+     logPrintf("[APP] 0x41 ignorado (relógio da pulseira inválido): %s\n", rawHex);
+     return;
    }
 
-   logPrintf("[APP] 0x41 ignorado (relógio da pulseira inválido): %s\n", rawHex);
+   applySystemTime(parsed, "pulseira 0x41");
  }
 
  void changeState(MainState next) {
@@ -448,21 +436,20 @@ bool isBleReady() {
 bool hasMeaningful028Data(const uint8_t* data, size_t len) {
   if (!data || len < 10 || data[0] != 0x28) return false;
 
-  int offset = (data[2] == 0x00 || data[2] == 0x01) ? 1 : 0;
-
+  // PDF §33: [2]=HR, [3]=SpO2, [4]=HRV, [5]=fadiga, [8..9]=temp (/10)
   switch (data[1]) {
+    case 0x01:
+      return data[4] > 0 || data[5] > 0;
     case 0x02:
-      return data[2 + offset] > 1 || data[3 + offset] > 1;
+      return data[2] > 0;
     case 0x03:
-      return data[3 + offset] > 1 || data[2 + offset] > 1;
+      return data[3] > 0;
     case 0x04: {
-      uint16_t tempRaw = data[8] | (data[9] << 8);
+      uint16_t tempRaw = ((uint16_t)data[8] << 8) | data[9];
       return tempRaw > 0;
     }
-    case 0x01:
-      return data[4 + offset] > 1 || data[5 + offset] > 1;
     default:
-      return true;
+      return data[2] > 0 || data[3] > 0 || data[4] > 0 || data[5] > 0;
   }
 }
  
