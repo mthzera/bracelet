@@ -180,7 +180,7 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
 
 export async function listPackets(limit = 50, deviceMac?: string): Promise<SavedPacket[]> {
   const pool = getPool();
-  const safeLimit = Math.min(Math.max(limit, 1), 200);
+  const safeLimit = Math.min(Math.max(limit, 1), 2000);
 
   const params: Array<string | number> = [safeLimit];
   let deviceFilter = "";

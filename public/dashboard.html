@@ -883,7 +883,7 @@
     const head = document.getElementById('tableHead');
     head.innerHTML = viewMode === 'raw'
       ? `<tr><th>Hora</th><th>Tipo</th><th>CRC</th><th>Resumo</th><th>Raw Hex</th></tr>`
-      : `<tr><th>Data/hora</th><th>Paciente / Disp.</th><th>BPM (atual/min/máx)</th><th>Temp</th><th>HRV</th><th>Fadiga</th><th>Pressão</th><th>Tipos</th><th>Qtd</th></tr>`;
+      : `<tr><th>Data/hora</th><th>Paciente / Disp.</th><th>BPM (méd/min/máx)</th><th>Temp (méd)</th><th>HRV (méd)</th><th>Fadiga (méd)</th><th>Pressão (méd)</th><th>Tipos</th><th>Qtd</th></tr>`;
   }
 
   function renderTable() {
@@ -958,7 +958,7 @@
     const dash = '<span style="color:var(--muted)">--</span>';
     const v = (x, u) => (x === null || x === undefined) ? dash : `${x}${u || ''}`;
     const hr = sum.heartRate == null ? dash
-      : `${sum.heartRate} bpm${(sum.heartRateMin != null && sum.heartRateMax != null) ? ` (min ${sum.heartRateMin} / máx ${sum.heartRateMax})` : ''}`;
+      : `${sum.heartRate} bpm (média)${(sum.heartRateMin != null && sum.heartRateMax != null) ? ` · min ${sum.heartRateMin} / máx ${sum.heartRateMax}` : ''}`;
     const src = s.sources || {};
     const rows = [
       ['Janela', `${formatTime(s.startedAt)} → ${formatTime(s.endedAt)}`],

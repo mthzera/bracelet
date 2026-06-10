@@ -147,9 +147,9 @@ const cycleSummaryItemSchema = {
     endedAt: { type: "string", format: "date-time" },
     summary: {
       type: "object",
-      description: "Resumo clínico do ciclo. Campos null = ausente (o front mostra \"--\", nunca 0).",
+      description: "Resumo clínico do ciclo = média dos valores válidos da janela. Campos null = ausente (o front mostra \"--\", nunca 0).",
       properties: {
-        heartRate: { type: "number", nullable: true, example: 76, description: "Último BPM válido da janela" },
+        heartRate: { type: "number", nullable: true, example: 76, description: "Média dos BPM válidos da janela" },
         heartRateMin: { type: "number", nullable: true, example: 63 },
         heartRateMax: { type: "number", nullable: true, example: 91 },
         temperature: { type: "number", nullable: true, example: 35.6 },

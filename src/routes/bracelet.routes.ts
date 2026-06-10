@@ -304,7 +304,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
 
   async function buildConsolidatedCycles(limit: number, deviceMac?: string) {
     // Cada ciclo agrega muitos pacotes crus; busca um múltiplo do limite pedido.
-    const rawLimit = Math.min(Math.max(limit * 20, limit), 200);
+    const rawLimit = Math.min(Math.max(limit * 80, 400), 2000);
     const packets = await listPackets(rawLimit, deviceMac);
     return buildCycleSummaries(packets, limit).map((cycle) => ({
       ...cycle,
@@ -340,7 +340,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(200).send({ view: "consolidated", items });
     }
 
-    const rawLimit = Math.min(Math.max(limit * 20, limit), 200);
+    const rawLimit = Math.min(Math.max(limit * 80, 400), 2000);
     const packets = await listPackets(rawLimit, deviceMac);
     const snapshots = buildSnapshotsFromPackets(packets, limit).map((snapshot) => ({
       ...snapshot,

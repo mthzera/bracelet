@@ -321,19 +321,31 @@ function cycleIdForGroup(group: SavedPacket[]): string {
   return `win-${Math.min(...ids)}-${Math.max(...ids)}`;
 }
 
-function lastOf(values: number[]): number | null {
-  return values.length > 0 ? (values[values.length - 1] ?? null) : null;
+function average(values: number[]): number | null {
+  if (values.length === 0) return null;
+  return values.reduce((sum, v) => sum + v, 0) / values.length;
+}
+
+function avgRound(values: number[]): number | null {
+  const a = average(values);
+  return a === null ? null : Math.round(a);
+}
+
+function avgRound1(values: number[]): number | null {
+  const a = average(values);
+  return a === null ? null : Math.round(a * 10) / 10;
 }
 
 /**
- * Consolida a janela de coleta em um único resumo clínico.
- * - heartRate: valores válidos do 0x28 (preferência) com último/min/máx; se não
- *   houver ativos, usa o histórico 0x54/0x55.
- * - temperature: último válido do 0x28; senão 0x62/0x65.
- * - hrv/fatigue: do 0x28 quando válidos; senão histórico 0x56.
- * - bloodPressure: data[6]/data[7] do 0x28 quando ambos válidos.
- * - spo2: data[3] do 0x28 (opcional); senão 0x60/0x66.
- * Campos sem valor válido ficam null.
+ * Consolida a janela de coleta em um único resumo clínico, usando a MÉDIA dos
+ * valores válidos de cada parâmetro na janela:
+ * - heartRate: média (+ min/máx) dos BPM válidos do 0x28 e do histórico 0x54/0x55.
+ * - temperature: média das temperaturas válidas do 0x28 e de 0x62/0x65.
+ * - hrv/fatigue: média do histórico 0x56 (fonte real); só cai no 0x28 se não houver
+ *   0x56 — o 0x28 costuma repetir um baseline fixo nesses bytes.
+ * - spo2: média do 0x28 (modo oxigênio) e de 0x60/0x66.
+ * - bloodPressure: média dos pares válidos do 0x28.
+ * Faixas fisiológicas filtram leituras inválidas; campos sem valor ficam null.
  */
 function buildCycleSummary(group: SavedPacket[]): CycleSummary | null {
   if (group.length === 0) return null;
@@ -342,18 +354,16 @@ function buildCycleSummary(group: SavedPacket[]): CycleSummary | null {
     (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
   );
 
-  const hrActive: number[] = [];
-  const hrHistory: number[] = [];
-  let tempActive: number | null = null;
-  let tempHistory: number | null = null;
-  let hrvActive: number | null = null;
-  let hrvHistory: number | null = null;
-  let fatigueActive: number | null = null;
-  let fatigueHistory: number | null = null;
-  let systolic: number | null = null;
-  let diastolic: number | null = null;
-  let spo2Active: number | null = null;
-  let spo2History: number | null = null;
+  // Acumula todos os valores válidos da janela para tirar média.
+  const hrValues: number[] = [];
+  const tempValues: number[] = [];
+  const hrv28: number[] = [];
+  const hrv56: number[] = [];
+  const fatigue28: number[] = [];
+  const fatigue56: number[] = [];
+  const systolicValues: number[] = [];
+  const diastolicValues: number[] = [];
+  const spo2Values: number[] = [];
   let battery: number | null = null;
   let firmware: string | null = null;
   let sleep: SnapshotSleep | null = null;
@@ -393,45 +403,45 @@ function buildCycleSummary(group: SavedPacket[]): CycleSummary | null {
       case "0x28": // active measurement packet
         if (decoded?.type === "0x28") {
           sources.activePackets = true;
-          if (isValidHeartRate(decoded.heartRate)) hrActive.push(decoded.heartRate);
-          if (isValidTemperature(decoded.temperature)) tempActive = decoded.temperature;
-          if (isValidHrv(decoded.hrv)) hrvActive = decoded.hrv;
-          if (isValidFatigue(decoded.fatigue)) fatigueActive = decoded.fatigue;
+          if (isValidHeartRate(decoded.heartRate)) hrValues.push(decoded.heartRate);
+          if (isValidTemperature(decoded.temperature)) tempValues.push(decoded.temperature);
+          if (isValidHrv(decoded.hrv)) hrv28.push(decoded.hrv);
+          if (isValidFatigue(decoded.fatigue)) fatigue28.push(decoded.fatigue);
           if (
             isValidSystolic(decoded.systolicPressure) &&
             isValidDiastolic(decoded.diastolicPressure)
           ) {
-            systolic = decoded.systolicPressure;
-            diastolic = decoded.diastolicPressure;
+            systolicValues.push(decoded.systolicPressure);
+            diastolicValues.push(decoded.diastolicPressure);
           }
-          if (isValidSpo2(decoded.spo2)) spo2Active = decoded.spo2;
+          if (isValidSpo2(decoded.spo2)) spo2Values.push(decoded.spo2);
         }
         break;
       case "0x54": // histórico de BPM (bulk)
       case "0x55": // histórico de BPM (pontual)
         sources.heartRateHistory = true;
         if (decoded?.type === "0x28" && isValidHeartRate(decoded.heartRate)) {
-          hrHistory.push(decoded.heartRate);
+          hrValues.push(decoded.heartRate);
         }
         break;
-      case "0x56": // histórico HRV/fadiga
+      case "0x56": // histórico HRV/fadiga (fonte real)
         sources.hrvFatigueHistory = true;
         if (decoded?.type === "0x56") {
-          if (isValidHrv(decoded.hrv)) hrvHistory = decoded.hrv;
-          if (isValidFatigue(decoded.fatigue)) fatigueHistory = decoded.fatigue;
+          if (isValidHrv(decoded.hrv)) hrv56.push(decoded.hrv);
+          if (isValidFatigue(decoded.fatigue)) fatigue56.push(decoded.fatigue);
         }
         break;
       case "0x62": // temperatura manual
       case "0x65": // temperatura automática
         sources.temperatureHistory = true;
         if (decoded?.type === "0x28" && isValidTemperature(decoded.temperature)) {
-          tempHistory = decoded.temperature;
+          tempValues.push(decoded.temperature);
         }
         break;
       case "0x60": // SpO2 manual
       case "0x66": // SpO2 automático
         if (decoded?.type === "0x28" && isValidSpo2(decoded.spo2)) {
-          spo2History = decoded.spo2;
+          spo2Values.push(decoded.spo2);
         }
         break;
       case "0x13":
@@ -460,15 +470,18 @@ function buildCycleSummary(group: SavedPacket[]): CycleSummary | null {
 
   rawPackets.sort((a, b) => b.id - a.id);
 
-  const hrSet = hrActive.length > 0 ? hrActive : hrHistory;
-  const heartRate = lastOf(hrSet);
-  const heartRateMin = hrSet.length > 0 ? Math.min(...hrSet) : null;
-  const heartRateMax = hrSet.length > 0 ? Math.max(...hrSet) : null;
+  // Média dos BPM válidos da janela (+ extremos).
+  const heartRate = avgRound(hrValues);
+  const heartRateMin = hrValues.length > 0 ? Math.min(...hrValues) : null;
+  const heartRateMax = hrValues.length > 0 ? Math.max(...hrValues) : null;
 
-  const temperature = tempActive ?? tempHistory;
-  const hrv = hrvActive ?? hrvHistory;
-  const fatigue = fatigueActive ?? fatigueHistory;
-  const spo2 = spo2Active ?? spo2History;
+  const temperature = avgRound1(tempValues);
+  // HRV/fadiga: prioriza o histórico 0x56 (valor real); 0x28 é baseline fixo.
+  const hrv = avgRound(hrv56.length > 0 ? hrv56 : hrv28);
+  const fatigue = avgRound(fatigue56.length > 0 ? fatigue56 : fatigue28);
+  const spo2 = avgRound(spo2Values);
+  const systolic = avgRound(systolicValues);
+  const diastolic = avgRound(diastolicValues);
 
   const summary: CycleSummaryData = {
     heartRate,
