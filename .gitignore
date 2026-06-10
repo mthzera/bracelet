@@ -6,4 +6,6 @@ dist/
 .env.local
 sketch_may25a.ino
 *.log
+logs.md
+*.pdf
 data/

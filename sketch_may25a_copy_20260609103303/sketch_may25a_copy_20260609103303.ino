@@ -72,6 +72,8 @@ const unsigned long HISTORY_COMMAND_GAP_MS = 700;
  const unsigned long WIFI_HTTPS_WARMUP_MS = 4000;
  const unsigned long RENDER_PING_INTERVAL_MS = 8000;
  const unsigned long HTTP_RETRY_INTERVAL_MS = 10000;
+ const unsigned long HTTP_FAIL_RETRY_MS = 30000;
+ const unsigned long HTTP_STUCK_RESTART_MS = 3UL * 60UL * 1000UL;
  const int RENDER_HEALTH_MAX_FAILS = 3;
  
  // ===================== FILA =====================
@@ -147,6 +149,7 @@ static char batchPayload[BATCH_PAYLOAD_MAX_LEN];
  unsigned long lastHttpTryAt = 0;
  int renderHealthFailCount = 0;
  int httpBatchFailCount = 0;
+ unsigned long httpStuckSince = 0;
  const int HTTP_BATCH_MAX_FAILS = 2;
  
  // ===================== UTILS =====================
@@ -445,8 +448,9 @@ bool hasMeaningful028Data(const uint8_t* data, size_t len) {
     case 0x03:
       return data[3] > 0;
     case 0x04: {
-      uint16_t tempRaw = ((uint16_t)data[8] << 8) | data[9];
-      return tempRaw > 0;
+      uint16_t tempBe = ((uint16_t)data[8] << 8) | data[9];
+      uint16_t tempLe = ((uint16_t)data[9] << 8) | data[8];
+      return tempBe > 0 || tempLe > 0;
     }
     default:
       return data[2] > 0 || data[3] > 0 || data[4] > 0 || data[5] > 0;
@@ -826,7 +830,9 @@ void notifyCallback(
 
   if (type == 0x28 && !hasMeaningful028Data(data, len)) {
 #if LOG_BLE_RX
-    logPrintf("[BLE RX] 0x28 ignorado (sem valor de medição)\n");
+    logPrintf("[BLE RX] 0x28 ignorado AA=%02X BB=%02X CC=%02X [8..9]=%02X%02X\n",
+              data[1], len > 2 ? data[2] : 0, len > 3 ? data[3] : 0,
+              len > 8 ? data[8] : 0, len > 9 ? data[9] : 0);
 #endif
     return;
   }
@@ -1325,6 +1331,20 @@ bool connectBracelet() {
     case STATE_BLE_START: {
       static bool wifiAlreadyOffForBle = false;
 
+      if (queueCount > 0) {
+        logPrintf("[APP] Fila pendente=%d. Priorizando envio HTTP.\n", queueCount);
+        if (bleInitialized) {
+          blePauseForWifi();
+          delay(1500);
+        } else {
+          wifiOff();
+          delay(800);
+        }
+        wifiAlreadyOffForBle = false;
+        changeState(STATE_WIFI_START);
+        break;
+      }
+
       if (!wifiAlreadyOffForBle) {
         wifiOff();
         wifiAlreadyOffForBle = true;
@@ -1453,6 +1473,7 @@ bool connectBracelet() {
 
          if (ok) {
            httpBatchFailCount = 0;
+           httpStuckSince = 0;
 
            if (queueCount <= 0) {
              logPrintln("[HTTP] Todos os batches enviados.");
@@ -1469,8 +1490,24 @@ bool connectBracelet() {
                    HTTP_BATCH_MAX_FAILS);
 
          if (httpBatchFailCount >= HTTP_BATCH_MAX_FAILS) {
-           logPrintln("[HTTP] Falhou demais. Mantendo fila e voltando para BLE.");
-           changeState(STATE_WIFI_SHUTDOWN);
+           if (httpStuckSince == 0) {
+             httpStuckSince = now;
+           }
+
+           if (now - httpStuckSince >= HTTP_STUCK_RESTART_MS) {
+             logPrintf("[HTTP] Sem API há %lus. Reiniciando ESP32 (fila=%d será perdida).\n",
+                       (now - httpStuckSince) / 1000UL,
+                       queueCount);
+             delay(1000);
+             ESP.restart();
+           }
+
+           logPrintf("[HTTP] Falhou demais. Fila=%d — retry HTTP em %lus (sem nova coleta BLE).\n",
+                     queueCount,
+                     HTTP_FAIL_RETRY_MS / 1000UL);
+           httpBatchFailCount = 0;
+           lastHttpTryAt = now - HTTP_RETRY_INTERVAL_MS + HTTP_FAIL_RETRY_MS;
+           changeState(STATE_RENDER_WAKE);
          } else {
            changeState(STATE_RENDER_WAKE);
          }
@@ -1491,6 +1528,7 @@ bool connectBracelet() {
       lastHttpTryAt = 0;
       renderHealthFailCount = 0;
       httpBatchFailCount = 0;
+      httpStuckSince = 0;
 
       changeState(STATE_BLE_START);
       break;

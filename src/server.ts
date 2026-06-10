@@ -24,7 +24,10 @@ async function main(): Promise<void> {
   await initDatabase();
 
   const app = Fastify({
-    logger: true,
+    logger: {
+      level: process.env.LOG_LEVEL ?? "info",
+    },
+    disableRequestLogging: true,
     ajv: {
       customOptions: {
         // OpenAPI usa `example`; AJV strict não reconhece essa keyword.

@@ -380,6 +380,100 @@ function decodeHrvHistory(bytes: number[]): DecodedHrvHistory {
   };
 }
 
+function isPlausibleBodyTemperature(celsius: number): boolean {
+  return celsius >= 30 && celsius <= 45;
+}
+
+/** PDF §33/§39: T1 T2 ou HH II — high byte first; 2208A costuma enviar LE em [8..9]. */
+function decodeTemperatureTenths(high: number, low: number): number {
+  const be = ((high << 8) | low) / 10;
+  const le = (high | (low << 8)) / 10;
+  if (isPlausibleBodyTemperature(be)) return be;
+  if (isPlausibleBodyTemperature(le)) return le;
+  if (be > 0 && be < 100) return be;
+  if (le > 0 && le < 100) return le;
+  return 0;
+}
+
+function lastRecordStart(bytes: number[], recordLen: number): number {
+  if (bytes.length < recordLen) return 0;
+  const recordCount = Math.floor(bytes.length / recordLen);
+  return (Math.max(1, recordCount) - 1) * recordLen;
+}
+
+function pickLastPositive(bytes: number[], start: number, end: number): number {
+  let value = 0;
+  for (let i = start; i <= end && i < bytes.length; i++) {
+    const next = bytes[i] ?? 0;
+    if (next > 0) value = next;
+  }
+  return value;
+}
+
+function decodeHealthPartial(
+  measurementType: number,
+  fields: Partial<
+    Pick<DecodedHealth, "heartRate" | "spo2" | "hrv" | "fatigue" | "temperature">
+  >,
+): DecodedHealth {
+  return {
+    type: "0x28",
+    measurementType,
+    measurementMode: healthMeasurementMode(measurementType),
+    heartRate: fields.heartRate ?? 0,
+    spo2: fields.spo2 ?? 0,
+    hrv: fields.hrv ?? 0,
+    fatigue: fields.fatigue ?? 0,
+    systolicPressure: 0,
+    diastolicPressure: 0,
+    temperature: fields.temperature ?? 0,
+  };
+}
+
+/** PDF §25 — 0x54: registros de 21 bytes, SD1..SD12 em [9..20]. */
+function decodeHeartRateBulkHistory(bytes: number[]): DecodedHealth {
+  if (bytes.length < 21) {
+    throw new PacketDecoderError("Heart rate history (0x54) requires at least 21 bytes");
+  }
+  const start = lastRecordStart(bytes, 21);
+  return decodeHealthPartial(0x02, {
+    heartRate: pickLastPositive(bytes, start + 9, start + 20),
+  });
+}
+
+/** PDF §26 — 0x55: registros de 10 bytes, HR em [9]. */
+function decodeHeartRateSingleHistory(bytes: number[]): DecodedHealth {
+  if (bytes.length < 10) {
+    throw new PacketDecoderError("Single heart rate history (0x55) requires at least 10 bytes");
+  }
+  const start = lastRecordStart(bytes, 10);
+  return decodeHealthPartial(0x02, {
+    heartRate: bytes[start + 9] ?? 0,
+  });
+}
+
+/** PDF §37/§38 — 0x60/0x66: registros de 10 bytes, SpO2 em [9]. */
+function decodeSpo2History(bytes: number[], measurementType: number): DecodedHealth {
+  if (bytes.length < 10) {
+    throw new PacketDecoderError(`SpO2 history (0x${measurementType.toString(16)}) requires at least 10 bytes`);
+  }
+  const start = lastRecordStart(bytes, 10);
+  return decodeHealthPartial(0x03, {
+    spo2: bytes[start + 9] ?? 0,
+  });
+}
+
+/** PDF §39/§40 — 0x62/0x65: registros de 11 bytes, T1 T2 em [9..10]. */
+function decodeTemperatureHistory(bytes: number[], measurementType: number): DecodedHealth {
+  if (bytes.length < 11) {
+    throw new PacketDecoderError(`Temperature history (0x${measurementType.toString(16)}) requires at least 11 bytes`);
+  }
+  const start = lastRecordStart(bytes, 11);
+  return decodeHealthPartial(0x04, {
+    temperature: decodeTemperatureTenths(bytes[start + 9] ?? 0, bytes[start + 10] ?? 0),
+  });
+}
+
 /**
  * PDF §33 — resposta 0x28 (16 bytes):
  * [1]=tipo AA, [2]=BB HR, [3]=CC SpO2, [4]=DD HRV, [5]=EE fadiga,
@@ -392,7 +486,6 @@ function decodeHealth(bytes: number[]): DecodedHealth {
 
   const measurementType = bytes[1];
   const bp = decodeBloodPressure(bytes);
-  const temperatureRaw = ((bytes[8] ?? 0) << 8) | (bytes[9] ?? 0);
 
   return {
     type: "0x28",
@@ -404,7 +497,7 @@ function decodeHealth(bytes: number[]): DecodedHealth {
     fatigue: bytes[5] ?? 0,
     systolicPressure: bp.systolicPressure,
     diastolicPressure: bp.diastolicPressure,
-    temperature: temperatureRaw > 0 ? temperatureRaw / 10 : 0,
+    temperature: decodeTemperatureTenths(bytes[8] ?? 0, bytes[9] ?? 0),
   };
 }
 
@@ -524,12 +617,24 @@ export function decodePacket(packetType: string, rawHex: string): {
     case 0x56:
       decoded = decodeHrvHistory(bytes);
       break;
+    case 0x54:
+      decoded = decodeHeartRateBulkHistory(bytes);
+      break;
+    case 0x55:
+      decoded = decodeHeartRateSingleHistory(bytes);
+      break;
+    case 0x60:
+    case 0x66:
+      decoded = decodeSpo2History(bytes, typeByte);
+      break;
+    case 0x62:
+    case 0x65:
+      decoded = decodeTemperatureHistory(bytes, typeByte);
+      break;
     case 0x09:
       decoded = decodeRealtime(bytes);
       break;
     default:
-      // Tipos de histórico (0x51, 0x52, 0x54, 0x55, 0x5C, 0x60, 0x62, 0x65, 0x66)
-      // e quaisquer outros tipos futuros — salva como raw para inspeção.
       decoded = {
         type: "raw",
         originalType: `0x${typeByte.toString(16).padStart(2, "0")}`,

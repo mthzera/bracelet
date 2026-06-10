@@ -112,16 +112,40 @@ async function processInboundPacket(
       ? await getMergedHealthForDevice(payload.deviceMac)
       : null;
 
-    log.info(
-      {
-        id: saved.id,
-        deviceMac: payload.deviceMac,
-        packetType: item.packetType,
-        crcValid,
-        decoded,
-      },
-      "Bracelet packet decoded and saved",
-    );
+    if (decoded.type === "0x28") {
+      log.info(
+        {
+          id: saved.id,
+          deviceMac: payload.deviceMac,
+          mode: decoded.measurementMode,
+          heartRate: decoded.heartRate,
+          spo2: decoded.spo2,
+          hrv: decoded.hrv,
+          temperature: decoded.temperature,
+        },
+        "0x28 vital saved",
+      );
+    } else if (decoded.type === "0x56") {
+      log.info(
+        {
+          id: saved.id,
+          deviceMac: payload.deviceMac,
+          hrv: decoded.hrv,
+          fatigue: decoded.fatigue,
+        },
+        "0x56 HRV saved",
+      );
+    } else if (decoded.type === "0x53") {
+      log.info(
+        {
+          id: saved.id,
+          deviceMac: payload.deviceMac,
+          date: decoded.date,
+          sleepMinutes: decoded.sleepMinutes,
+        },
+        "0x53 sleep saved",
+      );
+    }
 
     try {
       if (decoded.type === "0x28") {
@@ -181,16 +205,6 @@ async function processInboundPacket(
         decodeError: err.message,
         receivedAtMs: item.receivedAtMs,
       });
-
-      log.info(
-        {
-          id: saved.id,
-          deviceMac: payload.deviceMac,
-          packetType: item.packetType,
-          error: err.message,
-        },
-        "Bracelet packet saved with decode error",
-      );
 
       return {
         ok: false,
@@ -282,11 +296,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     const limit = typeof query.limit === "number" && Number.isFinite(query.limit) ? query.limit : 50;
     const deviceMac = typeof query.deviceMac === "string" ? query.deviceMac : undefined;
 
-    request.log.info({ limit, deviceMac }, "Listing bracelet packets");
-
     const packets = (await listPackets(limit, deviceMac)).map(enrichWithPatient);
-
-    request.log.info({ limit, deviceMac, count: packets.length }, "Listed bracelet packets");
 
     return reply.status(200).send({ packets });
   });
@@ -307,15 +317,6 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       throw err;
     }
 
-    request.log.info(
-      {
-        deviceMac: batch.deviceMac,
-        source: batch.source,
-        count: batch.packets.length,
-      },
-      "Received bracelet packet batch",
-    );
-
     const results: PacketProcessResult[] = [];
 
     for (const item of batch.packets) {
@@ -331,15 +332,18 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const okCount = results.filter((result) => result.ok).length;
-    request.log.info(
-      {
-        deviceMac: batch.deviceMac,
-        total: results.length,
-        ok: okCount,
-        failed: results.length - okCount,
-      },
-      "Bracelet packet batch processed",
-    );
+    const failedCount = results.length - okCount;
+    if (failedCount > 0 || okCount > 0) {
+      request.log.info(
+        {
+          deviceMac: batch.deviceMac,
+          total: results.length,
+          ok: okCount,
+          failed: failedCount,
+        },
+        failedCount > 0 ? "Batch from ESP32 (with errors)" : "Batch from ESP32",
+      );
+    }
 
     return reply.status(200).send({
       deviceMac: batch.deviceMac,

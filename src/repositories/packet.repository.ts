@@ -47,6 +47,17 @@ type PacketRow = {
   created_at: Date;
 };
 
+const HEALTH_MERGE_PACKET_TYPES = new Set([
+  "0x28",
+  "0x56",
+  "0x54",
+  "0x55",
+  "0x60",
+  "0x66",
+  "0x62",
+  "0x65",
+]);
+
 function isHealthDecoded(
   decoded: DecodedPacket | null,
 ): decoded is DecodedHealth | DecodedHrvHistory {
@@ -67,7 +78,7 @@ function attachMergedHealth(packets: SavedPacket[]): SavedPacket[] {
   const byDevice = new Map<string, SavedPacket[]>();
 
   for (const packet of packets) {
-    if (packet.packetType !== "0x28" && packet.packetType !== "0x56") continue;
+    if (!HEALTH_MERGE_PACKET_TYPES.has(packet.packetType)) continue;
     const list = byDevice.get(packet.deviceMac) ?? [];
     list.push(packet);
     byDevice.set(packet.deviceMac, list);
