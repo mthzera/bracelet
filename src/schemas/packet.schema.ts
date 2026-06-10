@@ -1,8 +1,10 @@
 import { z } from "zod";
+import { normalizePacketType } from "../services/packet-decoder.service.js";
 
 const macAddressRegex = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
 
-const packetTypeRegex = /^0x[0-9A-Fa-f]{1,2}$/i;
+// Aceita prefixo "0x" ou "0X" (normalizado depois via transform).
+const packetTypeRegex = /^0[xX][0-9A-Fa-f]{1,2}$/;
 
 const rawHexRegex = /^([0-9A-Fa-f]{2}\s*)+$/;
 
@@ -32,7 +34,8 @@ const packetItemSchema = z
   .object({
     packetType: z
       .string()
-      .regex(packetTypeRegex, 'packetType must be a hex literal (e.g. "0x28")'),
+      .regex(packetTypeRegex, 'packetType must be a hex literal (e.g. "0x28")')
+      .transform(normalizePacketType),
     rawHex: z
       .string()
       .min(1)

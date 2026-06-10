@@ -140,6 +140,15 @@ export class PacketDecoderError extends Error {
   }
 }
 
+/**
+ * Normaliza o prefixo do tipo: aceita "0X54" e devolve "0x54".
+ * Preserva o case dos dígitos hex (ex.: "0x5C" continua "0x5C") para casar com
+ * comparações exatas no repositório/front. O decode em si já é case-insensitive.
+ */
+export function normalizePacketType(packetType: string): string {
+  return packetType.trim().replace(/^0X/, "0x");
+}
+
 export function parsePacketType(packetType: string): number {
   const normalized = packetType.trim().toLowerCase();
   if (!normalized.startsWith("0x")) {
