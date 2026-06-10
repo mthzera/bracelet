@@ -135,8 +135,12 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
   const bytesJson = input.bytes ? JSON.stringify(input.bytes) : null;
   const decodedJson = input.decoded ? JSON.stringify(input.decoded) : null;
 
+  // O ESP32 às vezes manda receivedAtMs como millis desde o boot (ex.: 123456),
+  // não epoch real — isso jogaria created_at para 1970. Só confiamos no valor
+  // se for um epoch plausível (>= 2020-01-01); senão usamos now() via COALESCE.
+  const MIN_PLAUSIBLE_EPOCH_MS = 1_577_836_800_000; // 2020-01-01T00:00:00Z
   const createdAt =
-    input.receivedAtMs !== undefined
+    input.receivedAtMs !== undefined && input.receivedAtMs >= MIN_PLAUSIBLE_EPOCH_MS
       ? new Date(input.receivedAtMs).toISOString()
       : null;
 

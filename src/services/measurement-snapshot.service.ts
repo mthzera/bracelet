@@ -286,33 +286,23 @@ function newestMs(packets: SavedPacket[]): number {
 }
 
 /**
- * Agrupa pacotes por ciclo: prioriza ingestionBatchId quando presente;
- * registros antigos (sem batch id) caem no agrupamento por janela de tempo.
+ * Agrupa pacotes por ciclo de coleta = deviceMac + janela de ~10 min.
+ *
+ * O ESP32 transmite a janela em vários POSTs pequenos (cada um com seu próprio
+ * ingestionBatchId), então agrupar por batchId fragmentaria a janela em dezenas
+ * de "ciclos" de 2-3 pacotes. Por isso agrupamos por tempo+dispositivo; o
+ * ingestionBatchId continua salvo só para auditoria.
  */
 function groupPacketsByCycleKey(packets: SavedPacket[]): SavedPacket[][] {
-  const byBatchId = new Map<string, SavedPacket[]>();
-  const legacy: SavedPacket[] = [];
-
+  const byDevice = new Map<string, SavedPacket[]>();
   for (const packet of packets) {
-    if (packet.ingestionBatchId) {
-      const list = byBatchId.get(packet.ingestionBatchId) ?? [];
-      list.push(packet);
-      byBatchId.set(packet.ingestionBatchId, list);
-    } else {
-      legacy.push(packet);
-    }
-  }
-
-  const groups: SavedPacket[][] = [...byBatchId.values()];
-
-  // Registros antigos (sem batch id): agrupa por deviceMac + janela de tempo curta.
-  const legacyByDevice = new Map<string, SavedPacket[]>();
-  for (const packet of legacy) {
-    const list = legacyByDevice.get(packet.deviceMac) ?? [];
+    const list = byDevice.get(packet.deviceMac) ?? [];
     list.push(packet);
-    legacyByDevice.set(packet.deviceMac, list);
+    byDevice.set(packet.deviceMac, list);
   }
-  for (const devicePackets of legacyByDevice.values()) {
+
+  const groups: SavedPacket[][] = [];
+  for (const devicePackets of byDevice.values()) {
     groups.push(...groupPacketsByCycle(devicePackets));
   }
 
@@ -321,8 +311,12 @@ function groupPacketsByCycleKey(packets: SavedPacket[]): SavedPacket[][] {
 }
 
 function cycleIdForGroup(group: SavedPacket[]): string {
-  const batchId = group.find((packet) => packet.ingestionBatchId)?.ingestionBatchId;
-  if (batchId) return batchId;
+  // Só usa o batchId como id do ciclo se TODOS os pacotes compartilham o mesmo
+  // (ex.: janela enviada em um único POST). Caso contrário, id por janela.
+  const batchIds = new Set(group.map((packet) => packet.ingestionBatchId).filter(Boolean));
+  if (batchIds.size === 1) {
+    return [...batchIds][0] as string;
+  }
   const ids = group.map((packet) => packet.id);
   return `win-${Math.min(...ids)}-${Math.max(...ids)}`;
 }
