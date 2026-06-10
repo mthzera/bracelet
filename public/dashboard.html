@@ -409,46 +409,16 @@
     </div>
   </div>
 
-  <!-- Packets table -->
+  <!-- Measurement history -->
   <div class="table-wrap">
     <div class="table-header">
-      <h2>Packet Log</h2>
+      <h2>Histórico de medições</h2>
       <div class="filter-row">
-        <label style="font-size:13px;color:var(--muted)">Tipo:</label>
-        <select id="filterType" onchange="renderTable()">
-          <option value="">Todos</option>
-          <optgroup label="Saúde">
-            <option value="0x28">0x28 Health</option>
-            <option value="0x56">0x56 HRV History</option>
-          </optgroup>
-          <optgroup label="Atividade">
-            <option value="0x09">0x09 Realtime</option>
-            <option value="0x18">0x18 Sport</option>
-          </optgroup>
-          <optgroup label="Históricos">
-            <option value="0x51">0x51 Steps Total</option>
-            <option value="0x52">0x52 Steps Detail</option>
-            <option value="0x53">0x53 Sleep</option>
-            <option value="0x54">0x54 HR History</option>
-            <option value="0x55">0x55 HR Single</option>
-            <option value="0x5C">0x5C Exercise Hist.</option>
-            <option value="0x60">0x60 SpO2 Manual</option>
-            <option value="0x62">0x62 Temp Manual</option>
-            <option value="0x65">0x65 Temp Auto</option>
-            <option value="0x66">0x66 SpO2 Auto</option>
-          </optgroup>
-          <optgroup label="Dispositivo">
-            <option value="0x13">0x13 Battery</option>
-            <option value="0x22">0x22 MAC</option>
-            <option value="0x27">0x27 Firmware</option>
-          </optgroup>
-          <option value="raw">raw (desconhecido)</option>
-        </select>
-        <label style="font-size:13px;color:var(--muted)">Limite:</label>
+        <label style="font-size:13px;color:var(--muted)">Ciclos:</label>
         <select id="limitSelect" onchange="fetchPackets()">
+          <option value="20">20</option>
+          <option value="30" selected>30</option>
           <option value="50">50</option>
-          <option value="100">100</option>
-          <option value="200">200</option>
         </select>
       </div>
     </div>
@@ -457,11 +427,11 @@
         <tr>
           <th>#</th>
           <th>Hora</th>
-          <th>Device MAC</th>
-          <th>Tipo</th>
-          <th>Source</th>
-          <th>CRC</th>
-          <th>Resumo</th>
+          <th>Paciente</th>
+          <th>Vitais</th>
+          <th>Sono</th>
+          <th>Bateria</th>
+          <th>Pacotes</th>
         </tr>
       </thead>
       <tbody id="tableBody">
@@ -474,7 +444,7 @@
 <div id="toast"></div>
 
 <script>
-  let packets = [];
+  let snapshots = [];
   let devices = [];
   let autoRefresh = true;
   let refreshTimer = null;
@@ -525,14 +495,8 @@
 
   function selectedDeviceMac() { return document.getElementById('deviceSelect').value; }
 
-  function healthView(p) {
-    if (!p) return null;
-    return p.mergedHealth || p.decoded;
-  }
-
-  function isHealthPacket(p) {
-    const t = field(p, 'packetType', 'packet_type');
-    return t === '0x28' || t === '0x56' || !!p.mergedHealth;
+  function latestSnapshot() {
+    return snapshots[0] || null;
   }
 
   function latestVital(getValue) {
@@ -542,12 +506,10 @@
       const v = getValue(device.mergedHealth);
       if (v > 0) return { value: v, time: device.lastSeenAt };
     }
-    for (const p of packets) {
-      if (!isHealthPacket(p)) continue;
-      const view = healthView(p);
-      if (!view) continue;
-      const v = getValue(view);
-      if (v > 0) return { value: v, time: field(p, 'createdAt', 'created_at') };
+    for (const s of snapshots) {
+      if (!s?.vitals) continue;
+      const v = getValue(s.vitals);
+      if (v > 0) return { value: v, time: s.measuredAt };
     }
     return null;
   }
@@ -621,11 +583,12 @@
     try {
       const qs = new URLSearchParams({ limit });
       if (deviceMac) qs.set('deviceMac', deviceMac);
+      qs.set('view', 'snapshots');
       const res = await fetch(`${apiBase()}/bracelets/packets?${qs}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      packets = Array.isArray(data) ? data : (data.packets || data.data || []);
-      setStatus('live', `${packets.length} pacotes`);
+      snapshots = data.snapshots || [];
+      setStatus('live', `${snapshots.length} medições`);
       updateSummary();
       renderPanels();
       renderTable();
@@ -644,21 +607,21 @@
 
   // ── Summary ──────────────────────────────────────────────────────────────────
   function updateSummary() {
-    document.getElementById('sumTotal').textContent = packets.length;
+    document.getElementById('sumTotal').textContent = snapshots.length;
 
     const deviceMac = selectedDeviceMac();
     const device = devices.find(d => normalizeMac(d.deviceMac) === normalizeMac(deviceMac));
-    const patientFromPacket = packets.find(p => p.patient)?.patient;
-    const patient = device?.patient || patientFromPacket;
+    const latest = latestSnapshot();
+    const patient = device?.patient || latest?.patient;
 
     if (patient) {
       document.getElementById('sumPatient').textContent = patient.patientName;
       document.getElementById('sumMac').textContent =
-        (device?.deviceMac || field(packets[0], 'deviceMac', 'device_mac') || '—') +
+        (device?.deviceMac || latest?.deviceMac || '—') +
         (patient.email ? ` · ${patient.email}` : '');
-    } else if (packets.length > 0) {
+    } else if (snapshots.length > 0) {
       document.getElementById('sumPatient').textContent = 'MAC não cadastrado';
-      document.getElementById('sumMac').textContent = field(packets[0], 'deviceMac', 'device_mac') || '—';
+      document.getElementById('sumMac').textContent = latest?.deviceMac || '—';
     } else {
       document.getElementById('sumPatient').textContent = '—';
       document.getElementById('sumMac').textContent = '—';
@@ -682,35 +645,17 @@
       : '—<span class="unit">°C</span>';
 
     // Blood Pressure
-    const bpVital = latestVital(v => v.systolicPressure || v.diastolicPressure);
-    if (bpVital) {
-      const view = (() => {
-        for (const p of packets) {
-          if (!isHealthPacket(p)) continue;
-          const v = healthView(p);
-          if (v && (v.systolicPressure > 0 || v.diastolicPressure > 0)) return v;
-        }
-        return null;
-      })();
-      if (view && view.systolicPressure > 0) {
-        document.getElementById('sumBP').innerHTML =
-          `${view.systolicPressure}/<span style="font-size:18px">${view.diastolicPressure}</span>`;
-      } else {
-        document.getElementById('sumBP').textContent = '—';
-      }
+    const bpSnap = snapshots.find(s => s.vitals?.systolicPressure > 0);
+    if (bpSnap?.vitals?.systolicPressure > 0) {
+      document.getElementById('sumBP').innerHTML =
+        `${bpSnap.vitals.systolicPressure}/<span style="font-size:18px">${bpSnap.vitals.diastolicPressure}</span>`;
     } else {
       document.getElementById('sumBP').textContent = '—';
     }
 
-    // Steps (realtime 0x09)
-    const withSteps = packets.find(p => p.decoded?.steps != null);
-    document.getElementById('sumSteps').textContent = withSteps
-      ? (withSteps.decoded.steps || 0).toLocaleString('pt-BR')
-      : '—';
+    document.getElementById('sumSteps').textContent = '—';
 
-    // Battery
-    const batPacket = packets.find(p => p.decoded?.type === '0x13');
-    const batPct = device?.battery ?? batPacket?.decoded?.battery ?? null;
+    const batPct = device?.battery ?? latest?.battery ?? null;
     if (batPct != null) {
       const color = batPct > 50 ? 'var(--accent2)' : batPct > 20 ? 'var(--warn)' : 'var(--danger)';
       document.getElementById('sumBatVal').innerHTML = batPct + '<span class="unit">%</span>';
@@ -722,15 +667,9 @@
     }
 
     // Firmware
-    const fwPacket = packets.find(p => p.decoded?.type === '0x27');
-    const fw = fwPacket?.decoded;
-    document.getElementById('sumFirmware').textContent = fw
-      ? `V${fw.major}.${fw.minor}.${fw.patch}`
-      : '—';
+    document.getElementById('sumFirmware').textContent = latest?.firmware || '—';
 
-    // Sleep
-    const sleepPacket = packets.find(p => p.decoded?.type === '0x53');
-    const sl = sleepPacket?.decoded;
+    const sl = latest?.sleep;
     if (sl) {
       document.getElementById('sumSleep').textContent = sl.sleepMinutes + ' min';
       document.getElementById('sumSleepDate').textContent = sl.date || '';
@@ -740,7 +679,7 @@
     }
 
     // Last update
-    const lastAt = device?.lastSeenAt || (packets.length > 0 ? field(packets[0], 'createdAt', 'created_at') : null);
+    const lastAt = device?.lastSeenAt || latest?.measuredAt || null;
     document.getElementById('sumLastUpdate').textContent = lastAt ? relTime(lastAt) : '—';
   }
 
@@ -753,14 +692,10 @@
   }
 
   function renderHealthPanel() {
-    const h = packets.find(p => {
-      if (!isHealthPacket(p)) return false;
-      const v = healthView(p);
-      return v && (v.heartRate > 0 || v.spo2 > 0 || v.temperature > 0);
-    });
+    const h = latestSnapshot();
     const el = document.getElementById('healthPanel');
-    if (!h) { el.innerHTML = '<div class="no-data">Sem dados de saúde</div>'; return; }
-    const d = h.mergedHealth || h.decoded;
+    if (!h?.vitals) { el.innerHTML = '<div class="no-data">Sem dados de saúde</div>'; return; }
+    const d = h.vitals;
     const bpStr = (d.systolicPressure > 0)
       ? `${d.systolicPressure}/${d.diastolicPressure}`
       : '—';
@@ -789,83 +724,25 @@
         <span class="metric-name">&#x26A1; Fadiga</span>
         <span><span class="metric-val">${d.fatigue || '—'}</span></span>
       </div>
-      <div class="metric-row">
-        <span class="metric-name">Modo</span>
-        <span class="badge badge-health">${d.measurementMode || '—'}</span>
-      </div>
-      <div class="panel-ts">${relTime(field(h, 'createdAt', 'created_at'))}</div>
+      <div class="panel-ts">${relTime(h.measuredAt)}</div>
     `;
   }
 
   function renderRealtimePanel() {
-    const r = packets.find(p => p.decoded?.type === '0x09');
-    const el = document.getElementById('realtimePanel');
-    if (!r) { el.innerHTML = '<div class="no-data">Sem dados de atividade</div>'; return; }
-    const d = r.decoded;
-    el.innerHTML = `
-      <div class="metric-row">
-        <span class="metric-name">&#x1F463; Passos</span>
-        <span><span class="metric-val" style="color:var(--accent)">${(d.steps || 0).toLocaleString('pt-BR')}</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x1F525; Calorias</span>
-        <span><span class="metric-val" style="color:var(--warn)">${d.caloriesKcal ?? '—'}</span><span class="metric-unit">kcal</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x1F4CD; Distância</span>
-        <span><span class="metric-val">${d.distanceKm ?? '—'}</span><span class="metric-unit">km</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x2764;&#xFE0F; Heart Rate</span>
-        <span><span class="metric-val" style="color:#ff6b8a">${d.heartRate || '—'}</span><span class="metric-unit">bpm</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x1F321;&#xFE0F; Temperature</span>
-        <span><span class="metric-val" style="color:var(--warn)">${d.temperature || '—'}</span><span class="metric-unit">°C</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x1F4A8; SpO2</span>
-        <span><span class="metric-val" style="color:var(--accent2)">${d.spo2 || '—'}</span><span class="metric-unit">%</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x23F1;&#xFE0F; Tempo ativo</span>
-        <span><span class="metric-val">${d.movementTimeRaw ?? '—'}</span><span class="metric-unit">raw</span></span>
-      </div>
-      <div class="panel-ts">${relTime(field(r, 'createdAt', 'created_at'))}</div>
-    `;
+    document.getElementById('realtimePanel').innerHTML =
+      '<div class="no-data">Sem dados de atividade</div>';
   }
 
   function renderSportPanel() {
-    const s = packets.find(p => p.decoded?.type === '0x18');
-    const el = document.getElementById('sportPanel');
-    if (!s) { el.innerHTML = '<div class="no-data">Sem dados de exercício</div>'; return; }
-    const d = s.decoded;
-    el.innerHTML = `
-      <div class="metric-row">
-        <span class="metric-name">&#x2764;&#xFE0F; Heart Rate</span>
-        <span><span class="metric-val" style="color:#ff6b8a">${d.heartRate || '—'}</span><span class="metric-unit">bpm</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x1F463; Passos</span>
-        <span><span class="metric-val" style="color:var(--sport)">${(d.steps || 0).toLocaleString('pt-BR')}</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x1F525; Calorias</span>
-        <span><span class="metric-val" style="color:var(--warn)">${d.caloriesRaw ?? '—'}</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x23F1;&#xFE0F; Tempo exercício</span>
-        <span><span class="metric-val">${d.exerciseTime ?? '—'}</span><span class="metric-unit">s</span></span>
-      </div>
-      <div class="panel-ts">${relTime(field(s, 'createdAt', 'created_at'))}</div>
-    `;
+    document.getElementById('sportPanel').innerHTML =
+      '<div class="no-data">Sem dados de exercício</div>';
   }
 
   function renderSleepPanel() {
-    const s = packets.find(p => p.decoded?.type === '0x53');
+    const snap = snapshots.find(s => s.sleep);
     const el = document.getElementById('sleepPanel');
-    if (!s) { el.innerHTML = '<div class="no-data">Sem dados de sono</div>'; return; }
-    const d = s.decoded;
+    if (!snap?.sleep) { el.innerHTML = '<div class="no-data">Sem dados de sono</div>'; return; }
+    const d = snap.sleep;
     const hh = Math.floor((d.sleepMinutes || 0) / 60);
     const mm = (d.sleepMinutes || 0) % 60;
     el.innerHTML = `
@@ -889,50 +766,81 @@
         <span class="metric-name">&#x1F4CB; Record ID</span>
         <span class="metric-val" style="font-size:15px">${d.recordId ?? '—'}</span>
       </div>
-      <div class="panel-ts">${relTime(field(s, 'createdAt', 'created_at'))}</div>
+      <div class="panel-ts">${relTime(snap.measuredAt)}</div>
     `;
   }
 
   // ── Table ────────────────────────────────────────────────────────────────────
-  function renderTable() {
-    const filter = document.getElementById('filterType').value;
-    const rows = filter
-      ? packets.filter(p => {
-          const pt = field(p, 'packetType', 'packet_type');
-          if (filter === 'raw') return pt === 'raw' || (p.decoded?.type === 'raw');
-          return pt === filter;
-        })
-      : packets;
+  function formatVital(value, unit) {
+    return value > 0 ? `<b>${value}</b>${unit}` : '—';
+  }
 
+  function summarizeSnapshot(s) {
+    const v = s.vitals || {};
+    const hr = formatVital(v.heartRate, ' bpm');
+    const spo2 = formatVital(v.spo2, '%');
+    const temp = formatVital(v.temperature, '°C');
+    const bp = v.systolicPressure > 0
+      ? ` &nbsp; PA: <b>${v.systolicPressure}/${v.diastolicPressure}</b>`
+      : '';
+    const hrv = v.hrv > 0 ? ` &nbsp; HRV: <b>${v.hrv}</b> ms` : '';
+    const fatigue = v.fatigue > 0 ? ` &nbsp; Fadiga: <b>${v.fatigue}</b>` : '';
+    return `HR: ${hr} &nbsp; SpO2: ${spo2} &nbsp; Temp: ${temp}${bp}${hrv}${fatigue}`;
+  }
+
+  function renderTable() {
     const tbody = document.getElementById('tableBody');
-    if (rows.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="7" class="no-data">Nenhum pacote encontrado</td></tr>';
+    if (snapshots.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="no-data">Nenhuma medição encontrada</td></tr>';
       return;
     }
 
-    tbody.innerHTML = rows.map(p => {
-      const id = `row-${p.id}`;
-      const packetType = field(p, 'packetType', 'packet_type') || 'raw';
-      const badge = badgeCls(packetType);
-      const crcValid = field(p, 'crcValid', 'crc_valid');
-      const crc = crcIcon(packetType, crcValid);
-      const summary = summarize(p);
-      const patientName = p.patient?.patientName;
+    tbody.innerHTML = snapshots.map(s => {
+      const id = `row-${s.id}`;
+      const patientName = s.patient?.patientName || '—';
+      const sleep = s.sleep
+        ? `<b>${s.sleep.sleepMinutes} min</b> (${s.sleep.date || '—'})`
+        : '—';
+      const battery = s.battery != null ? `<b>${s.battery}%</b>` : '—';
+      const packetsInfo = s.failedCount > 0
+        ? `${s.packetCount} <span class="error-msg">(${s.failedCount} erro)</span>`
+        : `${s.packetCount}`;
       return `
         <tr onclick="toggleDetail('${id}')">
-          <td>${p.id}</td>
-          <td class="timestamp">${formatTime(field(p, 'createdAt', 'created_at'))}</td>
-          <td class="mono" style="font-size:12px">${patientName ? '<span style="color:var(--text)">' + patientName + '</span><br>' : ''}${field(p, 'deviceMac', 'device_mac') || '—'}</td>
-          <td><span class="badge ${badge}">${packetType}</span></td>
-          <td>${p.source || '—'}</td>
-          <td>${crc}</td>
-          <td>${summary}</td>
+          <td>${s.id}</td>
+          <td class="timestamp">${formatTime(s.measuredAt)}</td>
+          <td style="font-size:12px">${patientName}<br><span class="mono">${s.deviceMac || '—'}</span></td>
+          <td>${summarizeSnapshot(s)}</td>
+          <td>${sleep}</td>
+          <td>${battery}</td>
+          <td>${packetsInfo}</td>
         </tr>
         <tr class="detail-row" id="${id}">
-          <td colspan="7" class="detail-cell">${renderDetail(p)}</td>
+          <td colspan="7" class="detail-cell">${renderSnapshotDetail(s)}</td>
         </tr>
       `;
     }).join('');
+  }
+
+  function renderSnapshotDetail(s) {
+    const rows = [
+      ['Medido em', formatTime(s.measuredAt)],
+      ['Heart Rate', s.vitals?.heartRate > 0 ? s.vitals.heartRate + ' bpm' : '—'],
+      ['SpO2', s.vitals?.spo2 > 0 ? s.vitals.spo2 + '%' : '—'],
+      ['Temperatura', s.vitals?.temperature > 0 ? s.vitals.temperature + '°C' : '—'],
+      ['Pressão arterial', s.vitals?.systolicPressure > 0 ? `${s.vitals.systolicPressure}/${s.vitals.diastolicPressure} mmHg` : '—'],
+      ['HRV', s.vitals?.hrv > 0 ? s.vitals.hrv + ' ms' : '—'],
+      ['Fadiga', s.vitals?.fatigue > 0 ? s.vitals.fatigue : '—'],
+      ['Sono', s.sleep ? `${s.sleep.sleepMinutes} min · ${s.sleep.date} ${s.sleep.time}` : '—'],
+      ['Bateria', s.battery != null ? s.battery + '%' : '—'],
+      ['Firmware', s.firmware || '—'],
+      ['Pacotes no ciclo', String(s.packetCount)],
+    ];
+    return `
+      <table class="detail-table">
+        ${rows.map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join('')}
+      </table>
+    `;
   }
 
   function toggleDetail(id) {

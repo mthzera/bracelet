@@ -52,16 +52,62 @@ const packetResultSchema = {
   },
 };
 
+const snapshotVitalsSchema = {
+  type: "object",
+  properties: {
+    heartRate: { type: "number", example: 86 },
+    spo2: { type: "number", example: 95 },
+    temperature: { type: "number", example: 36.5 },
+    hrv: { type: "number", example: 48 },
+    fatigue: { type: "number", example: 109 },
+    systolicPressure: { type: "number", example: 114 },
+    diastolicPressure: { type: "number", example: 64 },
+  },
+} as const;
+
+const measurementSnapshotSchema = {
+  type: "object",
+  required: ["id", "deviceMac", "source", "measuredAt", "vitals", "packetCount", "failedCount"],
+  properties: {
+    id: { type: "integer", description: "ID do último pacote do ciclo" },
+    deviceMac: { type: "string" },
+    source: { type: "string", example: "ESP32" },
+    measuredAt: { type: "string", format: "date-time" },
+    vitals: snapshotVitalsSchema,
+    sleep: {
+      type: "object",
+      nullable: true,
+      properties: {
+        date: { type: "string" },
+        time: { type: "string" },
+        sleepMinutes: { type: "number" },
+        recordId: { type: "number" },
+      },
+    },
+    battery: { type: "number", nullable: true, example: 83 },
+    firmware: { type: "string", nullable: true, example: "V0.0.3" },
+    deviceMacReported: { type: "string", nullable: true },
+    packetCount: { type: "integer", example: 15 },
+    failedCount: { type: "integer", example: 0 },
+    patient: patientFieldSchema,
+  },
+} as const;
+
 export const packetBatchSuccessResponseSchema = {
   type: "object",
-  required: ["deviceMac", "source", "results"],
+  required: ["deviceMac", "source", "snapshot", "stats"],
   properties: {
     deviceMac: { type: "string", example: "E6:64:0D:30:D3:F9" },
     source: { type: "string", example: "ESP32" },
     patient: patientFieldSchema,
-    results: {
-      type: "array",
-      items: packetResultSchema,
+    snapshot: { ...measurementSnapshotSchema, nullable: true },
+    stats: {
+      type: "object",
+      properties: {
+        total: { type: "integer" },
+        ok: { type: "integer" },
+        failed: { type: "integer" },
+      },
     },
   },
 };
@@ -90,8 +136,13 @@ const savedPacketSchema = {
 
 export const listPacketsResponseSchema = {
   type: "object",
-  required: ["packets"],
+  required: ["view"],
   properties: {
+    view: { type: "string", enum: ["snapshots", "raw"] },
+    snapshots: {
+      type: "array",
+      items: measurementSnapshotSchema,
+    },
     packets: {
       type: "array",
       items: savedPacketSchema,
@@ -109,17 +160,23 @@ export const validationErrorResponseSchema = {
 
 export const getPacketRouteSchema = {
   tags: ["bracelets"],
-  summary: "List saved BLE packets",
-  description: "Returns the most recent packets stored in the database.",
+  summary: "List measurement cycles",
+  description:
+    "Default view=snapshots returns one consolidated row per ESP32 cycle (vitals + sleep + battery). Use view=raw for individual BLE packets.",
   querystring: {
     type: "object",
     properties: {
+      view: {
+        type: "string",
+        enum: ["snapshots", "raw"],
+        default: "snapshots",
+      },
       limit: {
         type: "integer",
         minimum: 1,
         maximum: 200,
-        default: 50,
-        description: "Max number of records to return",
+        default: 30,
+        description: "Max snapshots (default) or raw packets when view=raw",
       },
       deviceMac: {
         type: "string",
@@ -130,7 +187,7 @@ export const getPacketRouteSchema = {
   },
   response: {
     200: {
-      description: "List of saved packets",
+      description: "Measurement snapshots or raw packets",
       ...listPacketsResponseSchema,
     },
   },

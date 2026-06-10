@@ -47,6 +47,10 @@ import {
   buildVitalsReportPngByPatientName,
   buildVitalsReportByPatientName,
 } from "../services/teams-report.service.js";
+import {
+  buildSnapshotFromBatchResults,
+  buildSnapshotsFromPackets,
+} from "../services/measurement-snapshot.service.js";
 
 function resolveReportWindowMinutes(value: number | undefined): number {
   return typeof value === "number" && Number.isFinite(value)
@@ -292,13 +296,29 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get("/bracelets/packets", { schema: getPacketRouteSchema }, async (request, reply) => {
-    const query = request.query as { limit?: number; deviceMac?: string };
-    const limit = typeof query.limit === "number" && Number.isFinite(query.limit) ? query.limit : 50;
+    const query = request.query as { limit?: number; deviceMac?: string; view?: string };
+    const view = query.view === "raw" ? "raw" : "snapshots";
+    const limit =
+      typeof query.limit === "number" && Number.isFinite(query.limit)
+        ? query.limit
+        : view === "snapshots"
+          ? 30
+          : 50;
     const deviceMac = typeof query.deviceMac === "string" ? query.deviceMac : undefined;
 
-    const packets = (await listPackets(limit, deviceMac)).map(enrichWithPatient);
+    if (view === "raw") {
+      const packets = (await listPackets(limit, deviceMac)).map(enrichWithPatient);
+      return reply.status(200).send({ view: "raw", packets });
+    }
 
-    return reply.status(200).send({ packets });
+    const rawLimit = Math.min(Math.max(limit * 20, limit), 200);
+    const packets = await listPackets(rawLimit, deviceMac);
+    const snapshots = buildSnapshotsFromPackets(packets, limit).map((snapshot) => ({
+      ...snapshot,
+      patient: resolvePatientForMac(snapshot.deviceMac),
+    }));
+
+    return reply.status(200).send({ view: "snapshots", snapshots });
   });
 
   app.post("/bracelets/packets", { schema: postPacketRouteSchema }, async (request, reply) => {
@@ -345,11 +365,20 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       );
     }
 
+    const snapshot = buildSnapshotFromBatchResults(batch.deviceMac, batch.source, results);
+
     return reply.status(200).send({
       deviceMac: batch.deviceMac,
       source: batch.source,
       patient: resolvePatientForMac(batch.deviceMac),
-      results,
+      snapshot: snapshot
+        ? { ...snapshot, patient: resolvePatientForMac(batch.deviceMac) }
+        : null,
+      stats: {
+        total: results.length,
+        ok: okCount,
+        failed: failedCount,
+      },
     });
   });
 }
