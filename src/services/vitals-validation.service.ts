@@ -13,6 +13,41 @@ export const MANDATORY_VITALS_ERROR =
 export const EMPTY_HEALTH_READING_ERROR =
   "Health packet has no measurable vital values (all zero)";
 
+export type FullVitals = {
+  heartRate: number;
+  spo2: number;
+  temperature: number;
+  hrv: number;
+  systolicPressure: number;
+  diastolicPressure: number;
+};
+
+const FULL_VITAL_LABELS: Record<keyof FullVitals, string> = {
+  heartRate: "heartRate",
+  spo2: "spo2",
+  temperature: "temperature",
+  hrv: "hrv",
+  systolicPressure: "systolicPressure",
+  diastolicPressure: "diastolicPressure",
+};
+
+export function hasCompleteVitals(vitals: FullVitals): boolean {
+  return (
+    vitals.heartRate > 0 &&
+    vitals.spo2 > 0 &&
+    vitals.temperature > 0 &&
+    vitals.hrv > 0 &&
+    vitals.systolicPressure > 0 &&
+    vitals.diastolicPressure > 0
+  );
+}
+
+export function missingVitalFields(vitals: FullVitals): string[] {
+  return (Object.keys(FULL_VITAL_LABELS) as Array<keyof FullVitals>).filter(
+    (key) => (vitals[key] ?? 0) <= 0,
+  );
+}
+
 export function hasMandatoryVitals(vitals: MandatoryVitals): boolean {
   return vitals.heartRate > 0 && vitals.spo2 > 0 && vitals.temperature > 0;
 }

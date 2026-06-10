@@ -1,5 +1,9 @@
 import type { SavedPacket } from "../repositories/packet.repository.js";
 import {
+  hasCompleteVitals,
+  missingVitalFields,
+} from "./vitals-validation.service.js";
+import {
   decodePacket,
   mergeHealthReadings,
   PacketDecoderError,
@@ -44,6 +48,8 @@ export type MeasurementSnapshot = {
   deviceMacReported: string | null;
   packetCount: number;
   failedCount: number;
+  complete: boolean;
+  missing: string[];
 };
 
 function freshDecoded(packet: SavedPacket): DecodedPacket | null {
@@ -158,12 +164,16 @@ export function buildSnapshotFromPackets(packets: SavedPacket[]): MeasurementSna
   const anchor = packets.reduce((best, packet) => (packet.id > best.id ? packet : best), packets[0]!);
   const failedCount = packets.filter((packet) => packet.decodeError).length;
 
+  const missing = missingVitalFields(vitals);
+
   return {
     id: anchor.id,
     deviceMac: anchor.deviceMac,
     source: anchor.source,
     measuredAt: new Date(measuredAt).toISOString(),
     vitals,
+    complete: hasCompleteVitals(vitals),
+    missing,
     sleep: sleepDecoded
       ? {
           date: sleepDecoded.date,

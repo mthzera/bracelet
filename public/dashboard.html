@@ -805,12 +805,15 @@
       const packetsInfo = s.failedCount > 0
         ? `${s.packetCount} <span class="error-msg">(${s.failedCount} erro)</span>`
         : `${s.packetCount}`;
+      const completeBadge = s.complete
+        ? '<span class="badge badge-health" title="Vitais completos">OK</span>'
+        : `<span class="badge badge-unknown" title="Faltam: ${(s.missing || []).join(', ')}">Incompleto</span>`;
       return `
         <tr onclick="toggleDetail('${id}')">
           <td>${s.id}</td>
           <td class="timestamp">${formatTime(s.measuredAt)}</td>
           <td style="font-size:12px">${patientName}<br><span class="mono">${s.deviceMac || '—'}</span></td>
-          <td>${summarizeSnapshot(s)}</td>
+          <td>${summarizeSnapshot(s)} ${completeBadge}</td>
           <td>${sleep}</td>
           <td>${battery}</td>
           <td>${packetsInfo}</td>

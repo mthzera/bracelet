@@ -366,18 +366,32 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const snapshot = buildSnapshotFromBatchResults(batch.deviceMac, batch.source, results);
+    const enrichedSnapshot = snapshot
+      ? { ...snapshot, patient: resolvePatientForMac(batch.deviceMac) }
+      : null;
+
+    if (enrichedSnapshot && !enrichedSnapshot.complete) {
+      request.log.warn(
+        {
+          deviceMac: batch.deviceMac,
+          missing: enrichedSnapshot.missing,
+          vitals: enrichedSnapshot.vitals,
+        },
+        "Batch saved but snapshot incomplete",
+      );
+    }
 
     return reply.status(200).send({
       deviceMac: batch.deviceMac,
       source: batch.source,
       patient: resolvePatientForMac(batch.deviceMac),
-      snapshot: snapshot
-        ? { ...snapshot, patient: resolvePatientForMac(batch.deviceMac) }
-        : null,
+      snapshot: enrichedSnapshot,
       stats: {
         total: results.length,
         ok: okCount,
         failed: failedCount,
+        complete: enrichedSnapshot?.complete ?? false,
+        missing: enrichedSnapshot?.missing ?? [],
       },
     });
   });
