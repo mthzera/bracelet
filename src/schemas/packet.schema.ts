@@ -3,10 +3,16 @@ import { normalizePacketType } from "../services/packet-decoder.service.js";
 
 const macAddressRegex = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
 
-// Aceita prefixo "0x" ou "0X" (normalizado depois via transform).
-const packetTypeRegex = /^0[xX][0-9A-Fa-f]{1,2}$/;
+// Aceita prefixo "0x" ou "0X" (normalizado depois via transform) OU o snapshot
+// consolidado gerado pelo ESP32 ("SNAPSHOT_VITALS"), que vem só com `metrics`.
+const packetTypeRegex = /^(0[xX][0-9A-Fa-f]{1,2}|SNAPSHOT_VITALS)$/;
 
 const rawHexRegex = /^([0-9A-Fa-f]{2}\s*)+$/;
+
+/** SNAPSHOT_VITALS não tem rawHex; carrega a leitura consolidada em `metrics`. */
+function isSnapshotVitalsType(packetType: string): boolean {
+  return packetType.trim() === "SNAPSHOT_VITALS";
+}
 
 /**
  * Métricas opcionais já interpretadas pelo ESP32 (espelham o rawHex do 0x28).
@@ -34,16 +40,36 @@ const packetItemSchema = z
   .object({
     packetType: z
       .string()
-      .regex(packetTypeRegex, 'packetType must be a hex literal (e.g. "0x28")')
+      .regex(packetTypeRegex, 'packetType must be a hex literal (e.g. "0x28") or "SNAPSHOT_VITALS"')
       .transform(normalizePacketType),
+    // Opcional só para SNAPSHOT_VITALS (que vem em `metrics`); obrigatório p/ raws.
     rawHex: z
       .string()
-      .min(1)
-      .regex(rawHexRegex, "rawHex must be space-separated hex byte pairs"),
+      .regex(rawHexRegex, "rawHex must be space-separated hex byte pairs")
+      .optional(),
     receivedAtMs: z.number().int().nonnegative(),
     metrics: metricsSchema,
   })
-  .passthrough();
+  .passthrough()
+  .superRefine((item, ctx) => {
+    if (isSnapshotVitalsType(item.packetType)) {
+      if (!item.metrics) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["metrics"],
+          message: "SNAPSHOT_VITALS requires a metrics object",
+        });
+      }
+      return;
+    }
+    if (!item.rawHex || item.rawHex.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["rawHex"],
+        message: "rawHex is required for raw packets",
+      });
+    }
+  });
 
 export const packetBatchPayloadSchema = z
   .object({

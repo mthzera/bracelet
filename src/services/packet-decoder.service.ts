@@ -46,6 +46,22 @@ export type DecodedHrvHistory = {
   recordCount?: number;
 };
 
+/**
+ * Snapshot consolidado gerado pelo ESP32 (packetType "SNAPSHOT_VITALS").
+ * Não vem de rawHex — carrega a leitura já interpretada em `metrics`.
+ * Campos ausentes/ inválidos ficam null (nunca 0).
+ */
+export type DecodedSnapshot = {
+  type: "snapshot";
+  heartRate: number | null;
+  spo2: number | null;
+  temperature: number | null;
+  hrv: number | null;
+  fatigue: number | null;
+  systolicPressure: number | null;
+  diastolicPressure: number | null;
+};
+
 /** Pacote 0x09 — tempo real (passos, calorias, distância, HR, SpO2, temperatura). */
 export type DecodedRealtime = {
   type: "0x09";
@@ -97,6 +113,7 @@ export type DecodedPacket =
   | DecodedRealtime
   | DecodedSleep
   | DecodedSport
+  | DecodedSnapshot
   | DecodedRaw;
 
 export type HealthMeasurementKind = "hrv" | "heartRate" | "spo2" | "temperature";
@@ -386,21 +403,54 @@ function decodeBloodPressure(bytes: number[]): {
   return { systolicPressure: systolic, diastolicPressure: diastolic };
 }
 
+/**
+ * 0x56 — histórico HRV/fadiga. Layout de cada registro (PDF §27):
+ *   0x56 ID1 ID2 YY MM DD HH mm SS D1 D2 D3 D4 …
+ * onde D1 (offset 9) = HRV e D4 (offset 12) = fadiga.
+ *
+ * O notify BLE pode trazer VÁRIOS registros concatenados, cada um iniciado pelo
+ * marcador 0x56. Iteramos pelos marcadores (em vez de assumir um stride fixo de
+ * 15/16 bytes) para nunca ler bytes soltos desalinhados — desalinhamento era o
+ * que produzia HRV fantasma como 53. Pegamos o ÚLTIMO registro com HRV válido.
+ */
 function decodeHrvHistory(bytes: number[]): DecodedHrvHistory {
   if (bytes.length < 13) {
     throw new PacketDecoderError("HRV history packet (0x56) requires at least 13 bytes");
   }
 
-  // PDF §27: registro mínimo 15 bytes; notify BLE costuma vir em blocos de 16 com CRC.
-  const recordLen = bytes.length % 16 === 0 ? 16 : 15;
-  const recordCount = Math.max(1, Math.floor(bytes.length / recordLen));
-  const recordStart = (recordCount - 1) * recordLen;
+  // Início de cada registro = posição de um marcador 0x56 que ainda comporta D4.
+  const recordStarts: number[] = [];
+  for (let i = 0; i + 12 < bytes.length; i++) {
+    if (bytes[i] === 0x56) recordStarts.push(i);
+  }
+  if (recordStarts.length === 0) recordStarts.push(0);
+
+  let hrv = 0;
+  let fatigue = 0;
+  let validRecords = 0;
+
+  for (const start of recordStarts) {
+    const recordHrv = bytes[start + 9] ?? 0;
+    const recordFatigue = bytes[start + 12] ?? 0;
+    if (isValidHrv(recordHrv) && recordHrv <= 200) {
+      hrv = recordHrv;
+      fatigue = recordFatigue; // fadiga do mesmo registro do HRV (alinhada)
+      validRecords++;
+    }
+  }
+
+  // Fallback: nenhum registro com HRV válido — usa o último marcador como-está.
+  if (validRecords === 0) {
+    const start = recordStarts[recordStarts.length - 1] ?? 0;
+    hrv = bytes[start + 9] ?? 0;
+    fatigue = bytes[start + 12] ?? 0;
+  }
 
   return {
     type: "0x56",
-    hrv: bytes[recordStart + 9] ?? 0,
-    fatigue: bytes[recordStart + 12] ?? 0,
-    recordCount: recordCount > 1 ? recordCount : undefined,
+    hrv,
+    fatigue,
+    recordCount: recordStarts.length > 1 ? recordStarts.length : undefined,
   };
 }
 

@@ -50,9 +50,14 @@ import {
 } from "../services/teams-report.service.js";
 import {
   buildCycleSummaries,
-  buildSnapshotFromBatchResults,
   buildSnapshotsFromPackets,
 } from "../services/measurement-snapshot.service.js";
+import {
+  applySnapshotVitals,
+  buildConsolidatedSnapshot,
+  SNAPSHOT_VITALS_TYPE,
+  type InboundPacket,
+} from "../services/vitals-consolidation.service.js";
 
 function resolveReportWindowMinutes(value: number | undefined): number {
   return typeof value === "number" && Number.isFinite(value)
@@ -92,8 +97,36 @@ async function processInboundPacket(
     receivedAtMs: item.receivedAtMs,
   };
 
+  // SNAPSHOT_VITALS não tem rawHex: persiste a leitura consolidada (vinda em
+  // `metrics`) como debug/histórico. Não passa pelo decoder de hex.
+  if (item.packetType === SNAPSHOT_VITALS_TYPE) {
+    const vitals = applySnapshotVitals({ packetType: item.packetType, metrics: item.metrics });
+    const decoded: DecodedPacket = { type: "snapshot", ...vitals };
+    const saved = await savePacket({
+      payload,
+      crcValid: false,
+      decoded,
+      receivedAtMs: item.receivedAtMs,
+      ingestionBatchId,
+    });
+    log.info(
+      { id: saved.id, deviceMac: payload.deviceMac, vitals },
+      "SNAPSHOT_VITALS saved",
+    );
+    return {
+      ok: true,
+      id: saved.id,
+      ...base,
+      bytes: [],
+      crcValid: false,
+      decoded,
+      mergedHealth: null,
+      savedAt: saved.createdAt,
+    };
+  }
+
   try {
-    let { bytes, decoded, crcValid } = decodePacket(item.packetType, item.rawHex);
+    let { bytes, decoded, crcValid } = decodePacket(item.packetType, item.rawHex ?? "");
 
     // 0x28 é o "active measurement packet": nunca descartamos por vir com campos
     // zerados — o raw é sempre persistido (rule 1). Só registramos se há alguma
@@ -203,7 +236,7 @@ async function processInboundPacket(
 
       let bytes: number[] | undefined;
       try {
-        bytes = rawHexToBytes(item.rawHex);
+        bytes = rawHexToBytes(item.rawHex ?? "");
       } catch {
         bytes = undefined;
       }
@@ -392,7 +425,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
         deviceMac: batch.deviceMac,
         source: batch.source,
         packetType: item.packetType,
-        rawHex: item.rawHex,
+        rawHex: item.rawHex ?? "",
         metrics: item.metrics,
       };
 
@@ -413,19 +446,35 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       );
     }
 
-    const snapshot = buildSnapshotFromBatchResults(batch.deviceMac, batch.source, results);
-    const enrichedSnapshot = snapshot
-      ? { ...snapshot, patient: resolvePatientForMac(batch.deviceMac) }
-      : null;
+    // Consolida o body INTEIRO em UMA leitura principal confiável (rules 1, 2, 8):
+    // SNAPSHOT_VITALS é principal quando presente; senão funde os raws com
+    // prioridade de fonte; zero/inválido nunca sobrescreve valor válido.
+    const inbound: InboundPacket[] = batch.packets.map((item) => ({
+      packetType: item.packetType,
+      rawHex: item.rawHex,
+      metrics: item.metrics,
+    }));
+    const consolidated = buildConsolidatedSnapshot(inbound);
 
-    if (enrichedSnapshot && !enrichedSnapshot.complete) {
+    const measuredAt = results.reduce(
+      (latest, result) => (result.savedAt > latest ? result.savedAt : latest),
+      results[0]?.savedAt ?? new Date().toISOString(),
+    );
+
+    const snapshot = {
+      deviceMac: batch.deviceMac,
+      source: batch.source,
+      measuredAt,
+      vitals: consolidated.vitals,
+      sources: consolidated.sources,
+      quality: consolidated.quality,
+      patient: resolvePatientForMac(batch.deviceMac),
+    };
+
+    if (!consolidated.quality.snapshotComplete) {
       request.log.warn(
-        {
-          deviceMac: batch.deviceMac,
-          missing: enrichedSnapshot.missing,
-          vitals: enrichedSnapshot.vitals,
-        },
-        "Batch saved but snapshot incomplete",
+        { deviceMac: batch.deviceMac, vitals: consolidated.vitals, sources: consolidated.sources },
+        "Consolidated snapshot incomplete",
       );
     }
 
@@ -434,13 +483,16 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       source: batch.source,
       ingestionBatchId,
       patient: resolvePatientForMac(batch.deviceMac),
-      snapshot: enrichedSnapshot,
+      snapshot,
+      usedSnapshotVitals: consolidated.usedSnapshotVitals,
+      ignoredPartialSnapshots: consolidated.stats.ignoredPartialSnapshots,
       stats: {
         total: results.length,
         ok: okCount,
         failed: failedCount,
-        complete: enrichedSnapshot?.complete ?? false,
-        missing: enrichedSnapshot?.missing ?? [],
+        rawSaved: okCount,
+        invalidIgnored: consolidated.stats.invalidIgnored,
+        snapshotComplete: consolidated.quality.snapshotComplete,
       },
     });
   });

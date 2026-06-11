@@ -93,6 +93,53 @@ const measurementSnapshotSchema = {
   },
 } as const;
 
+const consolidatedVitalsSchema = {
+  type: "object",
+  description: "Leitura consolidada. Vitais ausentes/inválidos = null (nunca 0).",
+  properties: {
+    heartRate: { type: "number", nullable: true, example: 83 },
+    spo2: { type: "number", nullable: true, example: 97 },
+    temperature: { type: "number", nullable: true, example: 36.6 },
+    hrv: { type: "number", nullable: true, example: 75 },
+    fatigue: { type: "number", nullable: true, example: 41 },
+    systolicPressure: { type: "number", nullable: true, example: 123 },
+    diastolicPressure: { type: "number", nullable: true, example: 78 },
+  },
+} as const;
+
+const consolidatedSourcesSchema = {
+  type: "object",
+  description: "Origem efetiva de cada vital na leitura consolidada (rule 9).",
+  properties: {
+    heartRate: { type: "string", nullable: true, example: "0x54_HISTORY" },
+    spo2: { type: "string", nullable: true, example: "0x66_HISTORY_AUTO" },
+    temperature: { type: "string", nullable: true, example: "0x65_HISTORY_AUTO" },
+    hrv: { type: "string", nullable: true, example: "0x56_HISTORY" },
+    fatigue: { type: "string", nullable: true, example: "0x56_HISTORY" },
+    bloodPressure: { type: "string", nullable: true, example: "0x28_REALTIME" },
+  },
+} as const;
+
+const consolidatedSnapshotSchema = {
+  type: "object",
+  required: ["deviceMac", "source", "measuredAt", "vitals", "sources", "quality"],
+  properties: {
+    deviceMac: { type: "string" },
+    source: { type: "string", example: "ESP32" },
+    measuredAt: { type: "string", format: "date-time" },
+    vitals: consolidatedVitalsSchema,
+    sources: consolidatedSourcesSchema,
+    quality: {
+      type: "object",
+      properties: {
+        snapshotComplete: { type: "boolean" },
+        bloodPressure: { type: "string", enum: ["estimated", "absent"] },
+      },
+    },
+    patient: patientFieldSchema,
+  },
+} as const;
+
 export const packetBatchSuccessResponseSchema = {
   type: "object",
   required: ["deviceMac", "source", "snapshot", "stats"],
@@ -101,13 +148,24 @@ export const packetBatchSuccessResponseSchema = {
     source: { type: "string", example: "ESP32" },
     ingestionBatchId: { type: "string", description: "Cycle id applied to every packet in this batch" },
     patient: patientFieldSchema,
-    snapshot: { ...measurementSnapshotSchema, nullable: true },
+    snapshot: { ...consolidatedSnapshotSchema, nullable: true },
+    usedSnapshotVitals: {
+      type: "boolean",
+      description: "true quando a leitura principal veio de um pacote SNAPSHOT_VITALS",
+    },
+    ignoredPartialSnapshots: {
+      type: "integer",
+      description: "Qtd de raws de saúde que NÃO viraram leitura principal (havia SNAPSHOT_VITALS)",
+    },
     stats: {
       type: "object",
       properties: {
-        total: { type: "integer" },
+        total: { type: "integer", description: "Pacotes processados no body" },
         ok: { type: "integer" },
         failed: { type: "integer" },
+        rawSaved: { type: "integer", description: "Raws persistidos" },
+        invalidIgnored: { type: "integer", description: "Leituras fora de faixa ignoradas" },
+        snapshotComplete: { type: "boolean" },
       },
     },
   },

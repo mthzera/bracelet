@@ -22,6 +22,7 @@ import {
   type DecodedMac,
   type DecodedPacket,
   type DecodedSleep,
+  type DecodedSnapshot,
 } from "./packet-decoder.service.js";
 
 /**
@@ -369,6 +370,9 @@ function buildCycleSummary(group: SavedPacket[]): CycleSummary | null {
   let firmware: string | null = null;
   let sleep: SnapshotSleep | null = null;
   let deviceMacReported: string | null = null;
+  // SNAPSHOT_VITALS consolidado pelo ESP32: quando presente no ciclo, é a fonte
+  // principal e sobrepõe a média dos raws (rule 1).
+  let snapshotVitals: DecodedSnapshot | null = null;
 
   const sources: CycleSources = {
     activePackets: false,
@@ -467,23 +471,29 @@ function buildCycleSummary(group: SavedPacket[]): CycleSummary | null {
       case "0x22":
         if (decoded?.type === "0x22") deviceMacReported = decoded.mac;
         break;
+      case "snapshot_vitals":
+        // sorted asc -> mantém o snapshot mais recente do ciclo.
+        if (decoded?.type === "snapshot") snapshotVitals = decoded;
+        break;
     }
   }
 
   rawPackets.sort((a, b) => b.id - a.id);
 
   // Média dos BPM válidos da janela (+ extremos).
-  const heartRate = avgRound(hrValues);
   const heartRateMin = hrValues.length > 0 ? Math.min(...hrValues) : null;
   const heartRateMax = hrValues.length > 0 ? Math.max(...hrValues) : null;
 
-  const temperature = avgRound1(tempValues);
+  // SNAPSHOT_VITALS (quando existe no ciclo) é a fonte principal e sobrepõe a
+  // média dos raws; se um campo do snapshot vier null, cai pra média dos raws.
+  const heartRate = snapshotVitals?.heartRate ?? avgRound(hrValues);
+  const temperature = snapshotVitals?.temperature ?? avgRound1(tempValues);
   // HRV/fadiga: prioriza o histórico 0x56 (valor real); 0x28 é baseline fixo.
-  const hrv = avgRound(hrv56.length > 0 ? hrv56 : hrv28);
-  const fatigue = avgRound(fatigue56.length > 0 ? fatigue56 : fatigue28);
-  const spo2 = avgRound(spo2Values);
-  const systolic = avgRound(systolicValues);
-  const diastolic = avgRound(diastolicValues);
+  const hrv = snapshotVitals?.hrv ?? avgRound(hrv56.length > 0 ? hrv56 : hrv28);
+  const fatigue = snapshotVitals?.fatigue ?? avgRound(fatigue56.length > 0 ? fatigue56 : fatigue28);
+  const spo2 = snapshotVitals?.spo2 ?? avgRound(spo2Values);
+  const systolic = snapshotVitals?.systolicPressure ?? avgRound(systolicValues);
+  const diastolic = snapshotVitals?.diastolicPressure ?? avgRound(diastolicValues);
 
   const summary: CycleSummaryData = {
     heartRate,
@@ -540,37 +550,4 @@ export function buildCycleSummaries(
   }
 
   return summaries;
-}
-
-export type BatchProcessInput = {
-  ok: boolean;
-  id: number;
-  packetType: string;
-  receivedAtMs: number;
-  savedAt: string;
-  decoded?: DecodedPacket;
-  error?: string;
-};
-
-/** Consolida o batch recém-processado (mesmo ciclo ESP32). */
-export function buildSnapshotFromBatchResults(
-  deviceMac: string,
-  source: string,
-  results: BatchProcessInput[],
-): MeasurementSnapshot | null {
-  const packets: SavedPacket[] = results.map((result) => ({
-    id: result.id,
-    deviceMac,
-    packetType: result.packetType,
-    rawHex: "",
-    source,
-    bytes: null,
-    crcValid: result.ok,
-    decoded: result.ok ? (result.decoded ?? null) : null,
-    decodeError: result.ok ? null : (result.error ?? "decode error"),
-    ingestionBatchId: null,
-    createdAt: result.savedAt,
-  }));
-
-  return buildSnapshotFromPackets(packets);
 }
