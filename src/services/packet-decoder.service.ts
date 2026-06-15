@@ -236,14 +236,18 @@ function decodeFirmware(bytes: number[]): DecodedFirmware {
   };
 }
 
+function bcd(b: number): number {
+  return ((b >> 4) * 10) + (b & 0x0f);
+}
+
 function decodeSleep(bytes: number[]): DecodedSleep {
   const recordId = (bytes[1] ?? 0) | ((bytes[2] ?? 0) << 8);
-  const yy = bytes[3] ?? 0;
-  const mo = bytes[4] ?? 0;
-  const dd = bytes[5] ?? 0;
-  const hh = bytes[6] ?? 0;
-  const mm = bytes[7] ?? 0;
-  const ss = bytes[8] ?? 0;
+  const yy = bcd(bytes[3] ?? 0);
+  const mo = bcd(bytes[4] ?? 0);
+  const dd = bcd(bytes[5] ?? 0);
+  const hh = bcd(bytes[6] ?? 0);
+  const mm = bcd(bytes[7] ?? 0);
+  const ss = bcd(bytes[8] ?? 0);
   const segLen = bytes[9] ?? 0;
   return {
     type: "0x53",

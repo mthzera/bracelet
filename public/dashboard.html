@@ -829,7 +829,7 @@
       </div>
       <div class="metric-row">
         <span class="metric-name">&#x23F1;&#xFE0F; Tempo ativo</span>
-        <span><span class="metric-val">${d.movementTimeRaw ?? '—'}</span><span class="metric-unit">raw</span></span>
+        <span><span class="metric-val">${d.movementTimeRaw > 0 ? Math.floor(d.movementTimeRaw / 60) : (d.movementTimeRaw ?? '—')}</span>${d.movementTimeRaw > 0 ? '<span class="metric-unit">min</span>' : ''}</span>
       </div>
       <div class="panel-ts">${relTime(field(r, 'createdAt', 'created_at'))}</div>
     `;
@@ -988,7 +988,7 @@
     diastolicPressure: 'Diastólica (mmHg)', measurementMode: 'Modo', measurementType: 'Tipo (byte)',
     battery: 'Bateria (%)', mac: 'MAC', major: 'Major', minor: 'Minor', patch: 'Patch',
     steps: 'Passos', caloriesKcal: 'Calorias (kcal)', distanceKm: 'Distância (km)',
-    movementTimeRaw: 'Tempo ativo (raw)', fastMovementTimeRaw: 'Tempo intenso (raw)',
+    movementTimeRaw: 'Tempo ativo (s)', fastMovementTimeRaw: 'Tempo intenso (s)',
     caloriesRaw: 'Calorias (raw)', exerciseTime: 'Tempo exercício (s)',
     recordId: 'Record ID', date: 'Data', time: 'Hora', sleepMinutes: 'Minutos de sono',
     originalType: 'Tipo original', bytesReceived: 'Bytes recebidos',

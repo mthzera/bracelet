@@ -1,618 +1,1305 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <SPIFFS.h>
 
- #include <WiFi.h>
- #include <WiFiClientSecure.h>
- #include <HTTPClient.h>
- 
- #include <BLEDevice.h>
- #include <BLEUtils.h>
- #include <BLEClient.h>
- #include <BLEAddress.h>
- 
- #include "soc/soc.h"
- #include "soc/rtc_cntl_reg.h"
- 
- // ===================== CONFIGURAÇÕES =====================
- 
- const char* WIFI_SSID = "IoTs";
- const char* WIFI_PASS = "AneryIot158";
- 
- const char* API_BASE = "https://bracelet-pn7r.onrender.com";
- const char* API_BATCH_URL = "https://bracelet-pn7r.onrender.com/bracelets/packets";
- 
- // MAC atual da pulseira que você está usando
- const char* DEVICE_MAC = "ef:7a:0d:30:b3:fa";
- 
- // UUIDs 2208A
- static BLEUUID SERVICE_UUID((uint16_t)0xFFF0);
- static BLEUUID TX_UUID((uint16_t)0xFFF6);  // ESP32 -> pulseira
- static BLEUUID RX_UUID((uint16_t)0xFFF7);  // pulseira -> ESP32
- 
- // ===================== LOGS =====================
- 
- #define LOG_BLE_RX 1
- #define LOG_BLE_TX 1
- #define LOG_HTTP 1
- #define LOG_QUEUE 1
- #define LOG_STATE 1
- 
-// ===================== INTERVALOS =====================
+#include <BLEDevice.h>
+#include <BLEClient.h>
+#include <BLEUtils.h>
+#include <BLEAddress.h>
 
-// Controle para não encher fila com 0x28/0x09 a cada segundo
-const unsigned long RX_028_MIN_GAP_MS = 3000;   // 1 pacote 0x28 a cada 3s por subtipo
-const unsigned long RX_009_MIN_GAP_MS = 15000;  // 1 pacote 0x09 a cada 15s
-const unsigned long RX_OTHER_MIN_GAP_MS = 1500;
+#include "esp_sleep.h"
 
-// Janelas menores de medição
-const unsigned long BLE_COLLECT_WINDOW_MS = 70UL * 1000UL;
-const unsigned long HEALTH_MEASURE_WINDOW_MS = 8000;
+// ============================================================
+// CONFIG
+// ============================================================
 
-// Tempo final esperando resposta dos históricos antes de desligar BLE
-const unsigned long HISTORY_RESPONSE_WAIT_MS = 6000;
+const char* WIFI_SSID = "IoTs";
+const char* WIFI_PASS = "altana@iot";
 
-// Intervalo entre comandos de histórico
-const unsigned long HISTORY_COMMAND_GAP_MS = 700;
- 
- // Wi-Fi / Render
- const unsigned long WIFI_RETRY_INTERVAL_MS = 5000;
- const unsigned long RENDER_PING_INTERVAL_MS = 8000;
- const unsigned long HTTP_RETRY_INTERVAL_MS = 10000;
- 
- // ===================== FILA =====================
- 
-#define RAW_HEX_MAX_LEN 360
-#define PACKET_TYPE_LEN 8
-#define HTTP_QUEUE_SIZE 50
-#define BATCH_MAX_PACKETS 50
-#define BATCH_PAYLOAD_MAX_LEN 9000
- 
- struct RawPacketItem {
-   bool used;
-   char packetType[PACKET_TYPE_LEN];
-   char rawHex[RAW_HEX_MAX_LEN];
-   unsigned long receivedAtMs;
- };
- 
-RawPacketItem httpQueue[HTTP_QUEUE_SIZE];
-int queueCount = 0;
+const char* API_BASE_URL = "https://bracelet-pn7r.onrender.com";
+const char* API_PATH = "/bracelets/packets";
 
-static char batchPayload[BATCH_PAYLOAD_MAX_LEN];
- 
- // ===================== BLE GLOBAL =====================
- 
- BLEClient* bleClient = nullptr;
- BLERemoteCharacteristic* txChar = nullptr;
- BLERemoteCharacteristic* rxChar = nullptr;
- 
- volatile bool bleConnected = false;
- bool bleInitialized = false;
- 
- unsigned long lastBleReconnectAttempt = 0;
- 
- // ===================== ESTADOS =====================
- 
- enum MainState {
-   STATE_BLE_START,
-   STATE_BLE_COLLECT,
-   STATE_BLE_QUERY_HISTORY,
-   STATE_BLE_SHUTDOWN,
-   STATE_WIFI_START,
-   STATE_RENDER_WAKE,
-   STATE_HTTP_SEND_BATCH,
-   STATE_WIFI_SHUTDOWN
- };
- 
- MainState mainState = STATE_BLE_START;
- unsigned long stateStartedAt = 0;
- 
- enum HealthCommandState {
-   HEALTH_IDLE,
-   HEALTH_START_HR,
-   HEALTH_STOP_HR,
-   HEALTH_START_SPO2,
-   HEALTH_STOP_SPO2,
-   HEALTH_START_TEMP,
-   HEALTH_STOP_TEMP,
-  HEALTH_START_HRV,
-  HEALTH_STOP_HRV,
-  HEALTH_DONE
+const char* DEVICE_MAC = "db:31:0d:30:7b:f8";
+
+static BLEUUID SERVICE_UUID((uint16_t)0xFFF0);
+static BLEUUID TX_UUID((uint16_t)0xFFF6); // ESP32 -> pulseira
+static BLEUUID RX_UUID((uint16_t)0xFFF7); // pulseira -> ESP32
+
+const char* PACKETS_FILE = "/packets.ndjson";
+const char* VITALS_SNAPSHOT_FILE = "/vitals_snapshot.json";
+
+// ============================================================
+// BOOTS
+// ============================================================
+// bootStep 0 = configura automáticos no padrão do app JC Vital
+// bootStep 1 = lê históricos automáticos + medições oportunistas e salva SNAPSHOT_VITALS
+// bootStep 2 = envia somente o snapshot para API
+
+RTC_DATA_ATTR int bootStep = 0;
+RTC_DATA_ATTR uint32_t bootCounter = 0;
+RTC_DATA_ATTR bool autoAlreadyConfigured = false;
+
+// Intervalo entre snapshots enviados para a API.
+// 1800s = 30 minutos = 2 envios por hora.
+const uint64_t COLLECT_SLEEP_SECONDS = 1800;
+const uint64_t SHORT_SLEEP_SECONDS = 5;
+
+// ============================================================
+// ESTRATÉGIA DE MEDIÇÃO
+// ============================================================
+
+// LÓGICA APP-LIKE:
+// - Configura a pulseira com os mínimos reais vistos no JC Vital.
+// - Deixa a pulseira medir sozinha durante 30 minutos.
+// - No BOOT 1, lê os históricos/últimos registros como o app faz.
+// - Faz medições ativas só como complemento/fallback.
+// - HRV/stress vem principalmente do 0x56. Pressão é oportunista.
+
+const bool SEND_ONLY_SNAPSHOT_TO_API = true;
+const bool SAVE_0X28_DEBUG_RAW = false;
+const bool READ_HISTORY_DEBUG = false;
+const bool SAVE_HISTORY_RAW_DEBUG = false;
+const bool USE_HISTORY_AS_FALLBACK = true;
+
+// Se true, reconfigura os automáticos sempre que passar pelo BOOT 0.
+// Em produção deixe false: o app configura uma vez e deixa a pulseira trabalhar.
+const bool FORCE_AUTO_CONFIG_EVERY_BOOT0 = false;
+
+// Complementos ativos. O principal agora é histórico automático.
+const bool USE_ACTIVE_HEART_BP_REFRESH = true;
+const bool USE_ACTIVE_SPO2_IF_MISSING = true;
+const bool USE_ACTIVE_TEMP_IF_MISSING = true;
+const bool TRY_ACTIVE_HRV_DEBUG = true;
+
+// Automático fica ligado para gerar histórico recente durante o sono.
+// Isso ajuda SpO2 e principalmente HRV/fadiga, que podem demorar ou vir melhor pelo histórico.
+const bool AUTO_CONFIG_ENABLED = true;
+const bool AUTO_DISABLE_ON_BOOT0 = false;
+
+// Mínimos observados no app JC Vital.
+const uint16_t AUTO_BPM_INTERVAL_MIN = 15;
+const uint16_t AUTO_SPO2_INTERVAL_MIN = 30;
+const uint16_t AUTO_TEMP_INTERVAL_MIN = 15;
+const uint16_t AUTO_HRV_INTERVAL_MIN = 15;
+
+// Tempos das medições ativas.
+// Se quiser mais estabilidade, aumente HR/BP, SpO2 e HRV para 45s.
+const unsigned long ACTIVE_WARMUP_MS = 5000UL;
+const unsigned long ACTIVE_HEART_BP_MS = 45000UL;   // BPM ativo + pressão oportunista
+const unsigned long ACTIVE_SPO2_MS = 120000UL;       // fallback: SpO2 pode demorar
+const unsigned long ACTIVE_TEMP_MS = 20000UL;        // fallback: temperatura costuma vir rápido
+const unsigned long ACTIVE_HRV_MS = 90000UL;         // debug: HRV real costuma vir melhor pelo 0x56
+const unsigned long GAP_BETWEEN_ACTIVE_MODES_MS = 1200UL;
+
+// Para não parar no primeiro pacote válido isolado.
+const unsigned long ACTIVE_STABLE_AFTER_TARGET_MS = 5000UL;
+const uint8_t MIN_BPM_SAMPLES = 2;
+const uint8_t MIN_BP_SAMPLES = 2;
+const uint8_t MIN_SPO2_SAMPLES = 2;
+const uint8_t MIN_TEMP_SAMPLES = 2;
+const uint8_t MIN_HRV_SAMPLES = 1;
+const uint8_t MIN_FATIGUE_SAMPLES = 1;
+
+// Logs e debug
+const unsigned long PRINT_028_EVERY_MS = 3000UL;
+const unsigned long SAVE_028_EVERY_MS = 5000UL;
+
+unsigned long lastPrint028 = 0;
+unsigned long lastSave028 = 0;
+
+// ============================================================
+// SNAPSHOT
+// ============================================================
+
+struct VitalsSnapshot {
+  bool hasBpm;
+  uint8_t bpm;
+  const char* bpmSource;
+  uint32_t bpmAtMs;
+  uint16_t bpmSamples;
+
+  bool hasSpo2;
+  uint8_t spo2;
+  const char* spo2Source;
+  uint32_t spo2AtMs;
+  uint16_t spo2Samples;
+
+  bool hasTemperature;
+  float temperature;
+  const char* temperatureSource;
+  uint32_t temperatureAtMs;
+  uint16_t temperatureSamples;
+
+  bool hasHrv;
+  uint8_t hrv;
+  const char* hrvSource;
+  uint32_t hrvAtMs;
+  uint16_t hrvSamples;
+
+  bool hasFatigue;
+  uint8_t fatigue;
+  const char* fatigueSource;
+  uint32_t fatigueAtMs;
+  uint16_t fatigueSamples;
+
+  bool hasBloodPressure;
+  uint8_t systolic;
+  uint8_t diastolic;
+  const char* bpSource;
+  const char* bpQuality;
+  uint32_t bpAtMs;
+  uint16_t bpSamples;
+
+  uint32_t createdAtMs;
 };
- 
- HealthCommandState healthState = HEALTH_IDLE;
- unsigned long healthStateStartedAt = 0;
- 
- int historyIndex = 0;
- unsigned long lastHistoryCommandAt = 0;
- bool historyCommandsFinished = false;
- 
- unsigned long lastWifiTryAt = 0;
- unsigned long lastRenderPingAt = 0;
- unsigned long lastHttpTryAt = 0;
- 
- // ===================== UTILS =====================
- 
- void changeState(MainState next) {
-   mainState = next;
-   stateStartedAt = millis();
- 
- #if LOG_STATE
-   Serial.print("[STATE] -> ");
-   switch (next) {
-     case STATE_BLE_START: Serial.println("BLE_START"); break;
-     case STATE_BLE_COLLECT: Serial.println("BLE_COLLECT"); break;
-     case STATE_BLE_QUERY_HISTORY: Serial.println("BLE_QUERY_HISTORY"); break;
-     case STATE_BLE_SHUTDOWN: Serial.println("BLE_SHUTDOWN"); break;
-     case STATE_WIFI_START: Serial.println("WIFI_START"); break;
-     case STATE_RENDER_WAKE: Serial.println("RENDER_WAKE"); break;
-     case STATE_HTTP_SEND_BATCH: Serial.println("HTTP_SEND_BATCH"); break;
-     case STATE_WIFI_SHUTDOWN: Serial.println("WIFI_SHUTDOWN"); break;
-   }
- #endif
- }
- 
- uint8_t calcCrc(uint8_t* p, uint8_t len = 16) {
-   uint16_t s = 0;
-   for (int i = 0; i < len - 1; i++) {
-     s += p[i];
-   }
-   return s & 0xFF;
- }
- 
- void rawToHex(const uint8_t* data, size_t len, char* out, size_t outSize) {
-   if (!out || outSize == 0) return;
- 
-   out[0] = '\0';
- 
-   size_t maxBytes = len;
-   size_t maxByOutput = (outSize - 1) / 3;
- 
-   if (maxBytes > maxByOutput) {
-     maxBytes = maxByOutput;
-   }
- 
-   for (size_t i = 0; i < maxBytes; i++) {
-     char tmp[4];
-     snprintf(tmp, sizeof(tmp), "%02X ", data[i]);
-     strncat(out, tmp, outSize - strlen(out) - 1);
-   }
- 
-   size_t l = strlen(out);
-   if (l > 0 && out[l - 1] == ' ') {
-     out[l - 1] = '\0';
-   }
- }
- 
- void packetTypeToString(uint8_t packetType, char* out, size_t outSize) {
-   snprintf(out, outSize, "0x%02X", packetType);
- }
- 
- bool isBleReady() {
-   return bleClient && bleClient->isConnected() && txChar && rxChar && bleConnected;
- }
- 
- // ===================== FILA =====================
- 
-void enqueueRawPacket(const char* packetType, const char* rawHex) {
-  if (!packetType || !rawHex) return;
 
-  if (queueCount >= HTTP_QUEUE_SIZE) {
-#if LOG_QUEUE
-    Serial.println("[QUEUE] Limite 50 atingido. Ignorando novo pacote até enviar batch.");
-#endif
-    return;
+VitalsSnapshot snapshot;
+
+uint32_t measurementSessionId = 0;
+uint32_t measurementSessionStartedAtMs = 0;
+uint32_t currentActiveModeStartedAtMs = 0;
+uint32_t currentActiveModeAcceptAfterMs = 0;
+uint8_t currentActiveMode = 0;
+const char* currentActiveModeLabel = "NONE";
+bool captureFreshActiveEnabled = false;
+
+// ============================================================
+// BLE
+// ============================================================
+
+BLEClient* client = nullptr;
+BLERemoteCharacteristic* txChar = nullptr;
+BLERemoteCharacteristic* rxChar = nullptr;
+
+bool bleReady = false;
+bool captureHistoryEnabled = false;
+
+// ============================================================
+// AUTO CONFIG
+// ============================================================
+
+#define AUTO_MODE_OFF 0x00
+#define AUTO_MODE_INTERVAL 0x02
+#define AUTO_DAYS_ALL 0x7F
+
+int autoMode[5] = { -1, -1, -1, -1, -1 };
+int autoInterval[5] = { -1, -1, -1, -1, -1 };
+
+// ============================================================
+// UTILS
+// ============================================================
+
+uint8_t crc16(uint8_t* p) {
+  uint16_t s = 0;
+
+  for (int i = 0; i < 15; i++) {
+    s += p[i];
   }
 
-  RawPacketItem& item = httpQueue[queueCount];
-  item.used = true;
-
-  strncpy(item.packetType, packetType, PACKET_TYPE_LEN - 1);
-  item.packetType[PACKET_TYPE_LEN - 1] = '\0';
-
-  strncpy(item.rawHex, rawHex, RAW_HEX_MAX_LEN - 1);
-  item.rawHex[RAW_HEX_MAX_LEN - 1] = '\0';
-
-  item.receivedAtMs = millis();
-
-  queueCount++;
-
-#if LOG_QUEUE
-  Serial.printf("[QUEUE] + %s | fila=%d/%d\n", packetType, queueCount, HTTP_QUEUE_SIZE);
-#endif
+  return s & 0xFF;
 }
- 
- void removeQueueItems(int count) {
-   if (count <= 0 || queueCount <= 0) return;
- 
-   if (count >= queueCount) {
-     queueCount = 0;
-     return;
-   }
- 
-   for (int i = count; i < queueCount; i++) {
-     httpQueue[i - count] = httpQueue[i];
-   }
- 
-   queueCount -= count;
- }
- 
- // ===================== WIFI =====================
- 
-void wifiOff() {
-  if (WiFi.getMode() == WIFI_OFF) {
-    return;
+
+String toHex(uint8_t* data, size_t len) {
+  String out;
+  out.reserve(len * 3);
+
+  for (size_t i = 0; i < len; i++) {
+    if (data[i] < 16) out += "0";
+    out += String(data[i], HEX);
+    if (i < len - 1) out += " ";
   }
 
-  Serial.println("[WIFI] Desligando Wi-Fi...");
-
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  delay(500);
+  out.toUpperCase();
+  return out;
 }
- 
- bool wifiStartOrEnsure() {
-   if (WiFi.status() == WL_CONNECTED) {
-     return true;
-   }
- 
-   unsigned long now = millis();
- 
-   if (now - lastWifiTryAt < WIFI_RETRY_INTERVAL_MS) {
-     return false;
-   }
- 
-   lastWifiTryAt = now;
- 
- #if LOG_STATE
-   Serial.println("[WIFI] Ligando/conectando...");
- #endif
- 
-   WiFi.mode(WIFI_STA);
-   WiFi.setSleep(false);
-   WiFi.begin(WIFI_SSID, WIFI_PASS);
- 
-   unsigned long start = millis();
- 
-   while (millis() - start < 12000) {
-     if (WiFi.status() == WL_CONNECTED) {
-       Serial.printf("[WIFI] Conectado. IP=%s RSSI=%d\n",
-                     WiFi.localIP().toString().c_str(),
-                     WiFi.RSSI());
-       return true;
-     }
- 
-     delay(250);
-   }
- 
-   Serial.printf("[WIFI] Ainda não conectou. Status=%d\n", WiFi.status());
-   return false;
- }
- 
- // ===================== HTTP =====================
- 
- bool pingRenderHealth() {
-   if (WiFi.status() != WL_CONNECTED) return false;
- 
-   WiFiClientSecure client;
-   client.setInsecure();
-   client.setHandshakeTimeout(30);
- 
-   HTTPClient http;
-   http.setReuse(false);
-   http.setTimeout(25000);
- 
-   String url = String(API_BASE) + "/health";
- 
- #if LOG_HTTP
-   Serial.println("[HTTP] GET /health...");
- #endif
- 
-   if (!http.begin(client, url)) {
- #if LOG_HTTP
-     Serial.println("[HTTP] begin /health falhou.");
- #endif
-     return false;
-   }
- 
-   http.addHeader("Connection", "close");
- 
-   int code = http.GET();
-   http.end();
- 
- #if LOG_HTTP
-   Serial.printf("[HTTP] /health -> %d\n", code);
- #endif
- 
-   return code >= 200 && code < 500;
- }
- 
-bool buildBatchPayload(int& itemsInBatch) {
-  if (queueCount <= 0) return false;
 
-  batchPayload[0] = '\0';
-  itemsInBatch = 0;
+String packetTypeString(uint8_t type) {
+  char buf[5];
+  snprintf(buf, sizeof(buf), "0x%02X", type);
+  return String(buf);
+}
 
-  int written = snprintf(
-    batchPayload,
-    BATCH_PAYLOAD_MAX_LEN,
-    "{\"deviceMac\":\"%s\",\"source\":\"ESP32\",\"packets\":[",
-    DEVICE_MAC
-  );
+void printHeap(const char* label) {
+  Serial.print("[MEM] ");
+  Serial.print(label);
+  Serial.print(" freeHeap=");
+  Serial.println(ESP.getFreeHeap());
+}
 
-  if (written <= 0 || written >= BATCH_PAYLOAD_MAX_LEN) {
+const char* activeModeName(uint8_t mode) {
+  if (mode == 0x01) return "HRV_FATIGUE";
+  if (mode == 0x02) return "HEART_BP";
+  if (mode == 0x03) return "SPO2";
+  if (mode == 0x04) return "TEMP";
+  return "UNKNOWN";
+}
+
+const char* activeModeSource(uint8_t mode) {
+  if (mode == 0x01) return "0x28_ACTIVE_FRESH_HRV_FATIGUE";
+  if (mode == 0x02) return "0x28_ACTIVE_FRESH_HEART_BP";
+  if (mode == 0x03) return "0x28_ACTIVE_FRESH_SPO2";
+  if (mode == 0x04) return "0x28_ACTIVE_FRESH_TEMP";
+  return "0x28_ACTIVE_FRESH";
+}
+
+// ============================================================
+// SLEEP
+// ============================================================
+
+void goToDeepSleep(uint64_t seconds, int nextStep) {
+  Serial.print("[SLEEP] Próximo step=");
+  Serial.print(nextStep);
+  Serial.print(" dormindo por ");
+  Serial.print(seconds);
+  Serial.println("s");
+
+  bootStep = nextStep;
+
+  Serial.flush();
+
+  esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
+  esp_deep_sleep_start();
+}
+
+// ============================================================
+// SPIFFS
+// ============================================================
+
+bool initStorage() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("[FS] Falha ao iniciar SPIFFS.");
     return false;
   }
 
-  int limit = queueCount;
-  if (limit > BATCH_MAX_PACKETS) {
-    limit = BATCH_MAX_PACKETS;
-  }
-
-  for (int i = 0; i < limit; i++) {
-    char itemJson[520];
-
-    snprintf(
-      itemJson,
-      sizeof(itemJson),
-      "%s{\"packetType\":\"%s\",\"rawHex\":\"%s\",\"receivedAtMs\":%lu}",
-      itemsInBatch > 0 ? "," : "",
-      httpQueue[i].packetType,
-      httpQueue[i].rawHex,
-      httpQueue[i].receivedAtMs
-    );
-
-    if (strlen(batchPayload) + strlen(itemJson) + 4 >= BATCH_PAYLOAD_MAX_LEN) {
-      break;
-    }
-
-    strcat(batchPayload, itemJson);
-    itemsInBatch++;
-  }
-
-  if (itemsInBatch <= 0) return false;
-
-  strcat(batchPayload, "]}");
-
+  Serial.println("[FS] SPIFFS OK.");
   return true;
 }
- 
-bool postBatchToApi() {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  if (queueCount <= 0) return true;
 
-  int itemsInBatch = 0;
-
-  if (!buildBatchPayload(itemsInBatch)) {
-    Serial.println("[HTTP] Falha ao montar batch payload.");
-    return false;
+void clearPacketsFile() {
+  if (SPIFFS.exists(PACKETS_FILE)) {
+    SPIFFS.remove(PACKETS_FILE);
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setHandshakeTimeout(30);
-
-  HTTPClient http;
-  http.setReuse(false);
-  http.setTimeout(30000);
-
-#if LOG_HTTP
-  Serial.printf("[HTTP] POST batch | itens=%d | fila=%d\n", itemsInBatch, queueCount);
-#endif
-
-  if (!http.begin(client, API_BATCH_URL)) {
-#if LOG_HTTP
-    Serial.println("[HTTP] begin batch falhou.");
-#endif
-    return false;
+  if (SPIFFS.exists(VITALS_SNAPSHOT_FILE)) {
+    SPIFFS.remove(VITALS_SNAPSHOT_FILE);
   }
 
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Connection", "close");
-
-  int code = http.POST((uint8_t*)batchPayload, strlen(batchPayload));
-
-#if LOG_HTTP
-  Serial.printf("[HTTP] batch status=%d\n", code);
-#endif
-
-  if (code > 0) {
-    String res = http.getString();
-#if LOG_HTTP
-    Serial.print("[HTTP] response size=");
-    Serial.println(res.length());
-#endif
+  File f = SPIFFS.open(PACKETS_FILE, FILE_WRITE);
+  if (!f) {
+    Serial.println("[FS] Falha ao criar arquivo de pacotes.");
+    return;
   }
 
-  http.end();
-
-  if (code == 200 || code == 201 || code == 202) {
-    removeQueueItems(itemsInBatch);
-    Serial.printf("[HTTP] Batch OK. Removidos=%d | fila=%d\n", itemsInBatch, queueCount);
-    return true;
-  }
-
-  Serial.println("[HTTP] Batch falhou. Mantendo fila.");
-  return false;
+  f.close();
+  Serial.println("[FS] Arquivo de pacotes limpo.");
 }
- 
- // ===================== BLE CALLBACKS =====================
- 
- class BraceletCallbacks : public BLEClientCallbacks {
-   void onConnect(BLEClient*) override {
-     bleConnected = true;
-     Serial.println("[BLE] Callback conectado.");
-   }
- 
-   void onDisconnect(BLEClient*) override {
-     bleConnected = false;
-     txChar = nullptr;
-     rxChar = nullptr;
-     Serial.println("[BLE] Callback desconectado.");
-   }
- };
- 
- BraceletCallbacks braceletCallbacks;
- 
-void notifyCallback(
-  BLERemoteCharacteristic* characteristic,
-  uint8_t* data,
-  size_t len,
-  bool isNotify
-) {
-  if (!data || len == 0) return;
+
+void appendRawPacketToFile(const char* packetType, const String& rawHex, uint32_t receivedAtMs) {
+  if (SEND_ONLY_SNAPSHOT_TO_API) {
+    return;
+  }
+
+  File f = SPIFFS.open(PACKETS_FILE, FILE_APPEND);
+  if (!f) {
+    Serial.println("[FS] Falha ao abrir arquivo para append.");
+    return;
+  }
+
+  f.print("{\"packetType\":\"");
+  f.print(packetType);
+  f.print("\",\"rawHex\":\"");
+  f.print(rawHex);
+  f.print("\",\"receivedAtMs\":");
+  f.print(receivedAtMs);
+  f.println("}");
+
+  f.close();
+
+  Serial.print("[FS] Salvo raw ");
+  Serial.print(packetType);
+  Serial.print(" rawLen=");
+  Serial.println(rawHex.length());
+}
+
+void appendMetricsPacket028ToFile(
+  const String& rawHex,
+  uint8_t mode,
+  uint8_t bpm,
+  uint8_t spo2,
+  uint8_t hrv,
+  uint8_t fadiga,
+  uint8_t pressaoAlta,
+  uint8_t pressaoBaixa,
+  float temp,
+  uint32_t receivedAtMs) {
+
+  if (SEND_ONLY_SNAPSHOT_TO_API || !SAVE_0X28_DEBUG_RAW) {
+    return;
+  }
+
+  File f = SPIFFS.open(PACKETS_FILE, FILE_APPEND);
+  if (!f) {
+    Serial.println("[FS] Falha ao abrir arquivo para append metrics.");
+    return;
+  }
+
+  f.print("{\"packetType\":\"0x28\",");
+  f.print("\"rawHex\":\"");
+  f.print(rawHex);
+  f.print("\",\"receivedAtMs\":");
+  f.print(receivedAtMs);
+  f.print(",\"metrics\":{");
+
+  f.print("\"measurementMode\":");
+  f.print(mode);
+
+  f.print(",\"bpm\":");
+  f.print(bpm);
+
+  f.print(",\"spo2\":");
+  f.print(spo2);
+
+  f.print(",\"temperature\":");
+  f.print(temp, 1);
+
+  f.print(",\"hrv\":");
+  f.print(hrv);
+
+  f.print(",\"fatigue\":");
+  f.print(fadiga);
+
+  f.print(",\"bloodPressureSystolic\":");
+  f.print(pressaoAlta);
+
+  f.print(",\"bloodPressureDiastolic\":");
+  f.print(pressaoBaixa);
+
+  f.println("}}");
+
+  f.close();
+}
+
+int countPacketLines() {
+  File f = SPIFFS.open(PACKETS_FILE, FILE_READ);
+  if (!f) return 0;
+
+  int count = 0;
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+
+    if (line.length() > 0) {
+      count++;
+    }
+  }
+
+  f.close();
+  return count;
+}
+
+// ============================================================
+// VALIDAÇÃO E SNAPSHOT
+// ============================================================
+
+void resetSnapshot() {
+  snapshot.hasBpm = false;
+  snapshot.bpm = 0;
+  snapshot.bpmSource = "missing";
+  snapshot.bpmAtMs = 0;
+  snapshot.bpmSamples = 0;
+
+  snapshot.hasSpo2 = false;
+  snapshot.spo2 = 0;
+  snapshot.spo2Source = "missing";
+  snapshot.spo2AtMs = 0;
+  snapshot.spo2Samples = 0;
+
+  snapshot.hasTemperature = false;
+  snapshot.temperature = 0;
+  snapshot.temperatureSource = "missing";
+  snapshot.temperatureAtMs = 0;
+  snapshot.temperatureSamples = 0;
+
+  snapshot.hasHrv = false;
+  snapshot.hrv = 0;
+  snapshot.hrvSource = "missing";
+  snapshot.hrvAtMs = 0;
+  snapshot.hrvSamples = 0;
+
+  snapshot.hasFatigue = false;
+  snapshot.fatigue = 0;
+  snapshot.fatigueSource = "missing";
+  snapshot.fatigueAtMs = 0;
+  snapshot.fatigueSamples = 0;
+
+  snapshot.hasBloodPressure = false;
+  snapshot.systolic = 0;
+  snapshot.diastolic = 0;
+  snapshot.bpSource = "missing";
+  snapshot.bpQuality = "missing";
+  snapshot.bpAtMs = 0;
+  snapshot.bpSamples = 0;
+
+  snapshot.createdAtMs = millis();
+}
+
+bool validBpm(uint8_t bpm) {
+  return bpm >= 35 && bpm <= 220;
+}
+
+bool validSpo2(uint8_t spo2) {
+  return spo2 >= 50 && spo2 <= 100;
+}
+
+bool validTemperature(float temp) {
+  return temp >= 30.0 && temp <= 43.0;
+}
+
+bool validHrv(uint8_t hrv) {
+  return hrv > 0 && hrv <= 200;
+}
+
+bool validFatigue(uint8_t fatigue) {
+  return fatigue >= 1 && fatigue <= 100;
+}
+
+bool validBloodPressure(uint8_t sys, uint8_t dia) {
+  if (sys < 70 || sys > 220) return false;
+  if (dia < 40 || dia > 140) return false;
+  if (sys <= dia) return false;
+  if ((sys - dia) < 15) return false;
+  return true;
+}
+
+float parseTempLittleEndian(uint8_t low, uint8_t high) {
+  uint16_t raw = ((uint16_t)high << 8) | low;
+  return raw / 10.0;
+}
+
+void updateSnapshotBpm(uint8_t bpm, const char* source) {
+  if (!validBpm(bpm)) return;
+
+  snapshot.hasBpm = true;
+  snapshot.bpm = bpm;
+  snapshot.bpmSource = source;
+  snapshot.bpmAtMs = millis();
+  snapshot.bpmSamples++;
+}
+
+void updateSnapshotSpo2(uint8_t spo2, const char* source) {
+  if (!validSpo2(spo2)) return;
+
+  snapshot.hasSpo2 = true;
+  snapshot.spo2 = spo2;
+  snapshot.spo2Source = source;
+  snapshot.spo2AtMs = millis();
+  snapshot.spo2Samples++;
+}
+
+void updateSnapshotTemperature(float temp, const char* source) {
+  if (!validTemperature(temp)) return;
+
+  snapshot.hasTemperature = true;
+  snapshot.temperature = temp;
+  snapshot.temperatureSource = source;
+  snapshot.temperatureAtMs = millis();
+  snapshot.temperatureSamples++;
+}
+
+void updateSnapshotHrv(uint8_t hrv, const char* source) {
+  if (!validHrv(hrv)) return;
+
+  snapshot.hasHrv = true;
+  snapshot.hrv = hrv;
+  snapshot.hrvSource = source;
+  snapshot.hrvAtMs = millis();
+  snapshot.hrvSamples++;
+}
+
+void updateSnapshotFatigue(uint8_t fatigue, const char* source) {
+  if (!validFatigue(fatigue)) return;
+
+  snapshot.hasFatigue = true;
+  snapshot.fatigue = fatigue;
+  snapshot.fatigueSource = source;
+  snapshot.fatigueAtMs = millis();
+  snapshot.fatigueSamples++;
+}
+
+void updateSnapshotBloodPressure(uint8_t sys, uint8_t dia, const char* source, const char* quality) {
+  if (!validBloodPressure(sys, dia)) return;
+
+  snapshot.hasBloodPressure = true;
+  snapshot.systolic = sys;
+  snapshot.diastolic = dia;
+  snapshot.bpSource = source;
+  snapshot.bpQuality = quality;
+  snapshot.bpAtMs = millis();
+  snapshot.bpSamples++;
+}
+
+bool snapshotComplete() {
+  return snapshot.hasBpm &&
+         snapshot.hasSpo2 &&
+         snapshot.hasTemperature &&
+         snapshot.hasHrv &&
+         snapshot.hasFatigue &&
+         snapshot.hasBloodPressure;
+}
+
+void printSnapshotDebug() {
+  Serial.println("========== SNAPSHOT DEBUG ==========");
+  Serial.print("sessionId=");
+  Serial.println(measurementSessionId);
+  Serial.print("strategy=APP_LIKE_AUTO_HISTORY_2_PER_HOUR freshOnly=false complete=");
+  Serial.println(snapshotComplete() ? "true" : "false");
+
+  Serial.print("bpm=");
+  if (snapshot.hasBpm) Serial.print(snapshot.bpm); else Serial.print("null");
+  Serial.print(" source=");
+  Serial.print(snapshot.bpmSource);
+  Serial.print(" samples=");
+  Serial.println(snapshot.bpmSamples);
+
+  Serial.print("spo2=");
+  if (snapshot.hasSpo2) Serial.print(snapshot.spo2); else Serial.print("null");
+  Serial.print(" source=");
+  Serial.print(snapshot.spo2Source);
+  Serial.print(" samples=");
+  Serial.println(snapshot.spo2Samples);
+
+  Serial.print("temp=");
+  if (snapshot.hasTemperature) Serial.print(snapshot.temperature, 1); else Serial.print("null");
+  Serial.print(" source=");
+  Serial.print(snapshot.temperatureSource);
+  Serial.print(" samples=");
+  Serial.println(snapshot.temperatureSamples);
+
+  Serial.print("hrv=");
+  if (snapshot.hasHrv) Serial.print(snapshot.hrv); else Serial.print("null");
+  Serial.print(" source=");
+  Serial.print(snapshot.hrvSource);
+  Serial.print(" samples=");
+  Serial.println(snapshot.hrvSamples);
+
+  Serial.print("fatigue=");
+  if (snapshot.hasFatigue) Serial.print(snapshot.fatigue); else Serial.print("null");
+  Serial.print(" source=");
+  Serial.print(snapshot.fatigueSource);
+  Serial.print(" samples=");
+  Serial.println(snapshot.fatigueSamples);
+
+  Serial.print("bp=");
+  if (snapshot.hasBloodPressure) {
+    Serial.print(snapshot.systolic);
+    Serial.print("/");
+    Serial.print(snapshot.diastolic);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(" source=");
+  Serial.print(snapshot.bpSource);
+  Serial.print(" samples=");
+  Serial.println(snapshot.bpSamples);
+
+  Serial.println("====================================");
+}
+
+void saveVitalsSnapshotToFile() {
+  File f = SPIFFS.open(VITALS_SNAPSHOT_FILE, FILE_WRITE);
+
+  if (!f) {
+    Serial.println("[SNAPSHOT] Falha ao abrir arquivo de snapshot.");
+    return;
+  }
+
+  f.print("{");
+  f.print("\"packetType\":\"SNAPSHOT_VITALS\",");
+  f.print("\"receivedAtMs\":");
+  f.print(millis());
+  f.print(",");
+
+  f.print("\"bootCounter\":");
+  f.print(bootCounter);
+  f.print(",");
+
+  f.print("\"measurementSessionId\":");
+  f.print(measurementSessionId);
+  f.print(",");
+
+  f.print("\"measurementSessionStartedAtMs\":");
+  f.print(measurementSessionStartedAtMs);
+  f.print(",");
+
+  f.print("\"measurementStrategy\":\"APP_LIKE_AUTO_HISTORY_2_PER_HOUR\",");
+  f.print("\"freshOnly\":false,");
+
+  f.print("\"autoConfig\":{");
+  f.print("\"heartRateMin\":"); f.print(AUTO_BPM_INTERVAL_MIN);
+  f.print(",\"spo2Min\":"); f.print(AUTO_SPO2_INTERVAL_MIN);
+  f.print(",\"temperatureMin\":"); f.print(AUTO_TEMP_INTERVAL_MIN);
+  f.print(",\"hrvStressMin\":"); f.print(AUTO_HRV_INTERVAL_MIN);
+  f.print("},");
+
+  f.print("\"metrics\":{");
+
+  f.print("\"bpm\":");
+  if (snapshot.hasBpm) f.print(snapshot.bpm); else f.print("null");
+
+  f.print(",\"spo2\":");
+  if (snapshot.hasSpo2) f.print(snapshot.spo2); else f.print("null");
+
+  f.print(",\"temperature\":");
+  if (snapshot.hasTemperature) f.print(snapshot.temperature, 1); else f.print("null");
+
+  f.print(",\"hrv\":");
+  if (snapshot.hasHrv) f.print(snapshot.hrv); else f.print("null");
+
+  f.print(",\"fatigue\":");
+  if (snapshot.hasFatigue) f.print(snapshot.fatigue); else f.print("null");
+
+  f.print(",\"bloodPressureSystolic\":");
+  if (snapshot.hasBloodPressure) f.print(snapshot.systolic); else f.print("null");
+
+  f.print(",\"bloodPressureDiastolic\":");
+  if (snapshot.hasBloodPressure) f.print(snapshot.diastolic); else f.print("null");
+
+  f.print("},");
+
+  f.print("\"sources\":{");
+  f.print("\"bpm\":\"");
+  f.print(snapshot.bpmSource);
+  f.print("\",");
+  f.print("\"spo2\":\"");
+  f.print(snapshot.spo2Source);
+  f.print("\",");
+  f.print("\"temperature\":\"");
+  f.print(snapshot.temperatureSource);
+  f.print("\",");
+  f.print("\"hrv\":\"");
+  f.print(snapshot.hrvSource);
+  f.print("\",");
+  f.print("\"fatigue\":\"");
+  f.print(snapshot.fatigueSource);
+  f.print("\",");
+  f.print("\"bloodPressure\":\"");
+  f.print(snapshot.bpSource);
+  f.print("\"");
+  f.print("},");
+
+  f.print("\"sampleCounts\":{");
+  f.print("\"bpm\":");
+  f.print(snapshot.bpmSamples);
+  f.print(",\"spo2\":");
+  f.print(snapshot.spo2Samples);
+  f.print(",\"temperature\":");
+  f.print(snapshot.temperatureSamples);
+  f.print(",\"hrv\":");
+  f.print(snapshot.hrvSamples);
+  f.print(",\"fatigue\":");
+  f.print(snapshot.fatigueSamples);
+  f.print(",\"bloodPressure\":");
+  f.print(snapshot.bpSamples);
+  f.print("},");
+
+  f.print("\"quality\":{");
+  f.print("\"snapshotComplete\":");
+  f.print(snapshotComplete() ? "true" : "false");
+  f.print(",\"bloodPressure\":\"");
+  f.print(snapshot.bpQuality);
+  f.print("\",");
+  f.print("\"freshOnly\":false");
+  f.print("}");
+
+  f.println("}");
+
+  f.close();
+
+  Serial.print("[SNAPSHOT] Salvo. complete=");
+  Serial.println(snapshotComplete() ? "true" : "false");
+}
+
+void appendSnapshotToPacketsFile() {
+  File src = SPIFFS.open(VITALS_SNAPSHOT_FILE, FILE_READ);
+  if (!src) {
+    Serial.println("[SNAPSHOT] Snapshot não encontrado para anexar.");
+    return;
+  }
+
+  String line = src.readStringUntil('\n');
+  line.trim();
+  src.close();
+
+  if (line.length() == 0) {
+    Serial.println("[SNAPSHOT] Snapshot vazio.");
+    return;
+  }
+
+  File dst = SPIFFS.open(PACKETS_FILE, FILE_APPEND);
+  if (!dst) {
+    Serial.println("[SNAPSHOT] Falha ao anexar snapshot no packets file.");
+    return;
+  }
+
+  dst.println(line);
+  dst.close();
+
+  Serial.println("[SNAPSHOT] Snapshot anexado ao packets.ndjson.");
+}
+
+// ============================================================
+// BLE SEND
+// ============================================================
+
+void sendRaw16(uint8_t* pkt) {
+  if (!bleReady || !txChar) {
+    Serial.println("[BLE TX] Ignorado: BLE não pronto.");
+    return;
+  }
+
+  pkt[15] = crc16(pkt);
+
+  Serial.print("[BLE TX] ");
+  Serial.println(toHex(pkt, 16));
+
+  txChar->writeValue(pkt, 16, true);
+}
+
+void sendCmd(uint8_t cmd, uint8_t p1 = 0, uint8_t p2 = 0, uint8_t p3 = 0) {
+  uint8_t pkt[16] = {
+    cmd, p1, p2, p3,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0
+  };
+
+  sendRaw16(pkt);
+}
+
+void startActive028(uint8_t mode) {
+  // 0x28 mode 0x01 HRV/fadiga | 0x02 HR/BP | 0x03 SpO2 | 0x04 temp
+  sendCmd(0x28, mode, 0x01);
+}
+
+void stopActive028(uint8_t mode) {
+  sendCmd(0x28, mode, 0x00);
+}
+
+// ============================================================
+// HISTÓRICOS OPCIONAIS
+// ============================================================
+
+void readHistoryBpm() {
+  sendCmd(0x54, 0x00, 0x00, 0x00);
+}
+
+void readHistoryHrvFatigue() {
+  sendCmd(0x56, 0x00, 0x00, 0x00);
+}
+
+void readHistorySpo2Manual() {
+  sendCmd(0x60, 0x00, 0x00, 0x00);
+}
+
+void readHistorySpo2Auto() {
+  sendCmd(0x66, 0x00, 0x00, 0x00);
+}
+
+void readHistoryTempManual() {
+  sendCmd(0x62, 0x00, 0x00, 0x00);
+}
+
+void readHistoryTempAuto() {
+  sendCmd(0x65, 0x00, 0x00, 0x00);
+}
+
+// ============================================================
+// AUTO CONFIG OPCIONAL
+// ============================================================
+
+void readAutoConfig(uint8_t type) {
+  sendCmd(0x2B, type, 0x00, 0x00);
+}
+
+void setAutoConfigRaw(uint8_t type, uint8_t mode, uint16_t intervalMin) {
+  uint8_t pkt[16] = {
+    0x2A,
+    mode,
+    0x00,
+    0x00,
+    0x23,
+    0x59,
+    AUTO_DAYS_ALL,
+    (uint8_t)((intervalMin >> 8) & 0xFF),
+    (uint8_t)(intervalMin & 0xFF),
+    type,
+    0, 0, 0, 0, 0, 0
+  };
+
+  Serial.print("[AUTO SET] tipo=");
+  Serial.print(type);
+  Serial.print(" modo=");
+  Serial.print(mode);
+  Serial.print(" intervalo=");
+  Serial.print(intervalMin);
+  Serial.println("min");
+
+  sendRaw16(pkt);
+}
+
+void setAutoConfig(uint8_t type, uint16_t intervalMin) {
+  setAutoConfigRaw(type, AUTO_MODE_INTERVAL, intervalMin);
+}
+
+void disableAutoConfig(uint8_t type) {
+  setAutoConfigRaw(type, AUTO_MODE_OFF, 0);
+}
+
+void clearAutoStatus() {
+  for (int i = 0; i < 5; i++) {
+    autoMode[i] = -1;
+    autoInterval[i] = -1;
+  }
+}
+
+void handleAutoConfigPacket(uint8_t* data, size_t len, String raw) {
+  if (len < 10) {
+    Serial.println("[AUTO CONFIG] Pacote curto.");
+    return;
+  }
+
+  uint8_t mode = data[1];
+  uint8_t startHour = data[2];
+  uint8_t startMin = data[3];
+  uint8_t endHour = data[4];
+  uint8_t endMin = data[5];
+  uint8_t days = data[6];
+  uint16_t intervalMin = ((uint16_t)data[7] << 8) | data[8];
+  uint8_t type = data[9];
+
+  if (type <= 4) {
+    autoMode[type] = mode;
+    autoInterval[type] = intervalMin;
+  }
+
+  Serial.print("[AUTO CONFIG] tipo=");
+  Serial.print(type);
+  Serial.print(" modo=");
+  Serial.print(mode);
+  Serial.print(" inicio=");
+  Serial.print(startHour, HEX);
+  Serial.print(":");
+  Serial.print(startMin, HEX);
+  Serial.print(" fim=");
+  Serial.print(endHour, HEX);
+  Serial.print(":");
+  Serial.print(endMin, HEX);
+  Serial.print(" dias=0x");
+  Serial.print(days, HEX);
+  Serial.print(" intervalo=");
+  Serial.print(intervalMin);
+  Serial.println("min");
+
+  Serial.print("[AUTO CONFIG RAW] ");
+  Serial.println(raw);
+}
+
+void ensureAutoConfigForType(uint8_t type, uint16_t intervalMin) {
+  if (type > 4) return;
+
+  autoMode[type] = -1;
+  autoInterval[type] = -1;
+
+  Serial.print("[AUTO] Lendo config tipo=");
+  Serial.println(type);
+
+  readAutoConfig(type);
+
+  unsigned long start = millis();
+
+  while (millis() - start < 2500) {
+    delay(100);
+
+    if (autoMode[type] != -1) {
+      break;
+    }
+  }
+
+  if (autoMode[type] == AUTO_MODE_INTERVAL && autoInterval[type] == intervalMin) {
+    Serial.print("[AUTO] Tipo ");
+    Serial.print(type);
+    Serial.println(" já está correto.");
+    return;
+  }
+
+  setAutoConfig(type, intervalMin);
+  delay(1500);
+}
+
+void ensureAutoConfigs() {
+  Serial.println("[AUTO] Conferindo configurações automáticas...");
+
+  clearAutoStatus();
+
+  ensureAutoConfigForType(0x01, AUTO_BPM_INTERVAL_MIN);
+  delay(700);
+  ensureAutoConfigForType(0x02, AUTO_SPO2_INTERVAL_MIN);
+  delay(700);
+  ensureAutoConfigForType(0x03, AUTO_TEMP_INTERVAL_MIN);
+  delay(700);
+  ensureAutoConfigForType(0x04, AUTO_HRV_INTERVAL_MIN);
+  delay(700);
+
+  Serial.println("[AUTO] Configurações automáticas verificadas.");
+}
+
+void disableAutoConfigs() {
+  Serial.println("[AUTO] Desligando medições automáticas...");
+  disableAutoConfig(0x01);
+  delay(700);
+  disableAutoConfig(0x02);
+  delay(700);
+  disableAutoConfig(0x03);
+  delay(700);
+  disableAutoConfig(0x04);
+  delay(700);
+  Serial.println("[AUTO] Automático desligado.");
+}
+
+// ============================================================
+// PARSE 0x28 ATIVO
+// ============================================================
+
+void handleActivePacket028(uint8_t* data, size_t len, String raw) {
+  if (len < 10) {
+    Serial.println("[0x28] Pacote curto, ignorado.");
+    return;
+  }
+
+  if (!captureFreshActiveEnabled) {
+    return;
+  }
 
   unsigned long now = millis();
 
-  static unsigned long last028BySubtype[8] = {0};
-  static unsigned long last009At = 0;
-  static unsigned long lastOtherByType[256] = {0};
-
-  uint8_t type = data[0];
-
-  // Limita volume do 0x28 por subtipo: HR, SpO2, Temp, HRV
-  if (type == 0x28 && len > 1) {
-    uint8_t subtype = data[1];
-    if (subtype < 8) {
-      if (now - last028BySubtype[subtype] < RX_028_MIN_GAP_MS) {
-        return;
-      }
-      last028BySubtype[subtype] = now;
-    }
-  }
-
-  // Limita 0x09, porque tempo real gera pacote demais
-  else if (type == 0x09) {
-    if (now - last009At < RX_009_MIN_GAP_MS) {
-      return;
-    }
-    last009At = now;
-  }
-
-  // Limita duplicidade de outros pacotes, tipo 0x13, 0x22, 0x27, 0x41
-  else {
-    if (now - lastOtherByType[type] < RX_OTHER_MIN_GAP_MS) {
-      return;
-    }
-    lastOtherByType[type] = now;
-  }
-
-  if (queueCount >= HTTP_QUEUE_SIZE) {
-#if LOG_QUEUE
-    Serial.println("[QUEUE] Cheia. RX ignorado.");
-#endif
+  // Garante que o snapshot só aceite amostras depois do START ativo e depois do warmup.
+  if (now < currentActiveModeAcceptAfterMs) {
     return;
   }
 
-  char rawHex[RAW_HEX_MAX_LEN];
-  char packetType[PACKET_TYPE_LEN];
+  uint8_t packetMode = data[1];
+  uint8_t bpm = data[2];
+  uint8_t spo2 = data[3];
+  uint8_t hrv = data[4];
+  uint8_t fadiga = data[5];
+  uint8_t pressaoAlta = data[6];
+  uint8_t pressaoBaixa = data[7];
+  float temp = parseTempLittleEndian(data[8], data[9]);
 
-  rawToHex(data, len, rawHex, sizeof(rawHex));
-  packetTypeToString(type, packetType, sizeof(packetType));
-
-#if LOG_BLE_RX
-  Serial.printf("[BLE RX] %s len=%u | fila=%d/%d\n", packetType, len, queueCount, HTTP_QUEUE_SIZE);
-#endif
-
-  enqueueRawPacket(packetType, rawHex);
-}
- 
- // ===================== BLE =====================
- 
-bool startBle() {
-  if (bleInitialized) {
-    return true;
+  // Evita aceitar notificação atrasada de outro modo.
+  // Ex.: iniciou SpO2, mas ainda chegou um 0x28 do modo HR/BP anterior.
+  if (packetMode != currentActiveMode) {
+    Serial.print("[0x28 ACTIVE] Ignorado por modo diferente. collecting=0x");
+    Serial.print(currentActiveMode, HEX);
+    Serial.print(" packetMode=0x");
+    Serial.println(packetMode, HEX);
+    return;
   }
 
-  Serial.println("[BLE] Inicializando BLE...");
-  BLEDevice::init("ESP32_2208A_GATEWAY");
-  bleInitialized = true;
-  delay(500);
+  const char* source = activeModeSource(currentActiveMode);
 
-  return true;
-}
+  // Usa somente o campo esperado do modo ativo atual.
+  // Isso evita que um valor antigo/cacheado de outro campo sobrescreva o snapshot.
+  if (currentActiveMode == 0x02) {
+    // HEART/BP: usa BPM e pressão. Pressão continua marcada como estimada.
+    updateSnapshotBpm(bpm, source);
 
-void blePauseForWifi() {
-  Serial.println("[BLE] Pausando BLE para usar Wi-Fi...");
-
-  if (bleClient && bleClient->isConnected()) {
-    bleClient->disconnect();
-    delay(500);
+    if (validBloodPressure(pressaoAlta, pressaoBaixa)) {
+      updateSnapshotBloodPressure(pressaoAlta, pressaoBaixa, source, "estimated");
+    }
+  } else if (currentActiveMode == 0x03) {
+    // SpO2 ativo
+    updateSnapshotSpo2(spo2, source);
+  } else if (currentActiveMode == 0x04) {
+    // Temperatura ativa
+    updateSnapshotTemperature(temp, source);
+  } else if (currentActiveMode == 0x01) {
+    // HRV/fadiga ativo
+    updateSnapshotHrv(hrv, source);
+    updateSnapshotFatigue(fadiga, source);
   }
 
-  bleConnected = false;
-  txChar = nullptr;
-  rxChar = nullptr;
+  if (now - lastPrint028 >= PRINT_028_EVERY_MS) {
+    lastPrint028 = now;
 
-  // NÃO chamar BLEDevice::deinit(true) aqui.
-  // Manter a stack BLE inicializada evita falha ao criar client no próximo ciclo.
-}
-
-bool connectBracelet() {
-  if (!startBle()) return false;
-
-  bleConnected = false;
-  txChar = nullptr;
-  rxChar = nullptr;
-
-  if (bleClient && bleClient->isConnected()) {
-    bleClient->disconnect();
-    delay(500);
+    Serial.print("[0x28 ACTIVE FRESH] collecting=");
+    Serial.print(currentActiveModeLabel);
+    Serial.print(" packetMode=0x");
+    Serial.print(packetMode, HEX);
+    Serial.print(" bpm=");
+    Serial.print(bpm);
+    Serial.print(" spo2=");
+    Serial.print(spo2);
+    Serial.print(" temp=");
+    Serial.print(temp, 1);
+    Serial.print(" hrv=");
+    Serial.print(hrv);
+    Serial.print(" fadiga=");
+    Serial.print(fadiga);
+    Serial.print(" bp=");
+    Serial.print(pressaoAlta);
+    Serial.print("/");
+    Serial.print(pressaoBaixa);
+    Serial.print(" bpValid=");
+    Serial.print(validBloodPressure(pressaoAlta, pressaoBaixa) ? "true" : "false");
+    Serial.print(" raw=");
+    Serial.println(raw);
   }
 
-  if (!bleClient) {
-    Serial.println("[BLE] Criando BLE client...");
-    bleClient = BLEDevice::createClient();
+  if (SAVE_0X28_DEBUG_RAW && now - lastSave028 >= SAVE_028_EVERY_MS) {
+    lastSave028 = now;
+    appendMetricsPacket028ToFile(raw, packetMode, bpm, spo2, hrv, fadiga, pressaoAlta, pressaoBaixa, temp, millis());
+  }
+}
 
-    if (!bleClient) {
-      Serial.println("[BLE] Falha ao criar BLE client. Tentando resetar stack BLE uma vez...");
+// ============================================================
+// PARSE HISTÓRICO OPCIONAL
+// ============================================================
 
-      BLEDevice::deinit(true);
-      bleInitialized = false;
-      delay(1500);
+void handleHistoryPacket(uint8_t type, uint8_t* data, size_t len, String raw) {
+  if (!USE_HISTORY_AS_FALLBACK) {
+    return;
+  }
 
-      BLEDevice::init("ESP32_2208A_GATEWAY");
-      bleInitialized = true;
-      delay(800);
+  // Fallback só preenche campo ausente. Nunca sobrescreve medição ativa fresca.
+  if (len < 10) {
+    Serial.println("[HIST PARSE] Pacote curto.");
+    return;
+  }
 
-      bleClient = BLEDevice::createClient();
+  if (type == 0x54 && !snapshot.hasBpm) {
+    for (int i = (int)len - 1; i >= 9; i--) {
+      uint8_t bpm = data[i];
+      if (validBpm(bpm)) {
+        updateSnapshotBpm(bpm, "0x54_AUTO_HISTORY_FALLBACK");
+        break;
+      }
+    }
+    return;
+  }
 
-      if (!bleClient) {
-        Serial.println("[BLE] Falha definitiva ao criar BLE client.");
-        return false;
+  if (type == 0x56 && (!snapshot.hasHrv || !snapshot.hasFatigue)) {
+    bool found = false;
+
+    for (int offset = 0; offset + 12 < (int)len; offset += 15) {
+      if (data[offset] != 0x56) continue;
+
+      uint8_t hrv = data[offset + 9];
+      uint8_t fatigue = data[offset + 12];
+
+      if (validHrv(hrv) && validFatigue(fatigue)) {
+        if (!snapshot.hasHrv) updateSnapshotHrv(hrv, "0x56_AUTO_HISTORY_FALLBACK");
+        if (!snapshot.hasFatigue) updateSnapshotFatigue(fatigue, "0x56_AUTO_HISTORY_FALLBACK");
+        found = true;
       }
     }
 
-    bleClient->setClientCallbacks(&braceletCallbacks);
+    if (!found && len >= 13) {
+      uint8_t hrv = data[9];
+      uint8_t fatigue = data[12];
+      if (validHrv(hrv) && validFatigue(fatigue)) {
+        if (!snapshot.hasHrv) updateSnapshotHrv(hrv, "0x56_AUTO_HISTORY_FALLBACK");
+        if (!snapshot.hasFatigue) updateSnapshotFatigue(fatigue, "0x56_AUTO_HISTORY_FALLBACK");
+      }
+    }
+    return;
   }
 
-  Serial.printf("[BLE] Conectando na pulseira %s...\n", DEVICE_MAC);
-
-  BLEAddress address(DEVICE_MAC);
-
-  bool connected = bleClient->connect(address, BLE_ADDR_TYPE_RANDOM);
-
-  if (!connected) {
-    Serial.println("[BLE] Falhou RANDOM. Tentando PUBLIC...");
-    delay(500);
-    connected = bleClient->connect(address, BLE_ADDR_TYPE_PUBLIC);
+  if ((type == 0x60 || type == 0x66) && !snapshot.hasSpo2) {
+    const char* source = (type == 0x66) ? "0x66_AUTO_HISTORY_FALLBACK" : "0x60_AUTO_HISTORY_FALLBACK";
+    for (int i = (int)len - 1; i >= 9; i--) {
+      uint8_t spo2 = data[i];
+      if (validSpo2(spo2)) {
+        updateSnapshotSpo2(spo2, source);
+        break;
+      }
+    }
+    return;
   }
 
-  if (!connected) {
-    Serial.println("[BLE] Falha ao conectar na pulseira.");
-    bleConnected = false;
-    txChar = nullptr;
-    rxChar = nullptr;
+  if ((type == 0x62 || type == 0x65) && !snapshot.hasTemperature) {
+    const char* source = (type == 0x65) ? "0x65_AUTO_HISTORY_FALLBACK" : "0x62_AUTO_HISTORY_FALLBACK";
+    for (int i = (int)len - 2; i >= 9; i--) {
+      float temp = parseTempLittleEndian(data[i], data[i + 1]);
+      if (validTemperature(temp)) {
+        updateSnapshotTemperature(temp, source);
+        break;
+      }
+    }
+    return;
+  }
+}
+
+// ============================================================
+// PARSE/DEBUG PACOTE 0x09 - pacote live que o app parece usar
+// ============================================================
+
+void handlePacket09(uint8_t* data, size_t len, String raw) {
+  Serial.print("[0x09 DEBUG] len=");
+  Serial.print(len);
+  Serial.print(" raw=");
+  Serial.println(raw);
+
+  Serial.print("[0x09 BYTES]");
+  for (size_t i = 0; i < len; i++) {
+    Serial.print(" [");
+    Serial.print(i);
+    Serial.print("]=");
+    if (data[i] < 16) Serial.print("0");
+    Serial.print(data[i], HEX);
+  }
+  Serial.println();
+
+  if (len >= 24) {
+    uint8_t possibleBpm = data[21];
+    float possibleTemp = parseTempLittleEndian(data[22], data[23]);
+
+    Serial.print("[0x09 PARSE] possibleBpm=");
+    Serial.print(possibleBpm);
+    Serial.print(" possibleTemp=");
+    Serial.println(possibleTemp, 1);
+
+    if (validBpm(possibleBpm) && !snapshot.hasBpm) {
+      updateSnapshotBpm(possibleBpm, "0x09_LIVE_PACKET");
+    }
+
+    if (validTemperature(possibleTemp) && !snapshot.hasTemperature) {
+      updateSnapshotTemperature(possibleTemp, "0x09_LIVE_PACKET");
+    }
+  }
+
+  // Exploratório: ajuda a localizar HRV/Stress/pressão comparando com o app.
+  if (len >= 10) {
+    Serial.print("[0x09 CANDIDATES] ");
+    for (size_t i = 0; i < len; i++) {
+      uint8_t v = data[i];
+      if (v >= 1 && v <= 220) {
+        Serial.print("i");
+        Serial.print(i);
+        Serial.print("=");
+        Serial.print(v);
+        Serial.print(" ");
+      }
+    }
+    Serial.println();
+  }
+}
+
+// ============================================================
+// NOTIFY
+// ============================================================
+
+void notifyCallback(
+  BLERemoteCharacteristic* c,
+  uint8_t* data,
+  size_t len,
+  bool notify) {
+
+  if (len == 0) return;
+
+  uint8_t type = data[0];
+  String rawStr = toHex(data, len);
+
+  if (type == 0x28) {
+    handleActivePacket028(data, len, rawStr);
+    return;
+  }
+
+  if (type == 0x2B) {
+    handleAutoConfigPacket(data, len, rawStr);
+    return;
+  }
+
+  if (type == 0x2A) {
+    Serial.print("[AUTO SET RESP] raw=");
+    Serial.println(rawStr);
+    return;
+  }
+
+  if (type == 0x09) {
+    handlePacket09(data, len, rawStr);
+    return;
+  }
+
+  if (type == 0x54 || type == 0x56 || type == 0x60 || type == 0x62 || type == 0x65 || type == 0x66) {
+    String packetType = packetTypeString(type);
+
+    Serial.print("[HIST] ");
+    Serial.print(packetType);
+    Serial.print(" len=");
+    Serial.print(len);
+    Serial.print(" rawLen=");
+    Serial.println(rawStr.length());
+
+    if (type == 0x56) {
+      Serial.print("[HIST RAW] ");
+      Serial.print(packetType);
+      Serial.print(" raw=");
+      Serial.println(rawStr);
+    }
+
+    if (captureHistoryEnabled) {
+      if (SAVE_HISTORY_RAW_DEBUG || READ_HISTORY_DEBUG) {
+        appendRawPacketToFile(packetType.c_str(), rawStr, millis());
+      }
+      handleHistoryPacket(type, data, len, rawStr);
+    }
+
+    return;
+  }
+
+  Serial.print("[BLE RX OUTRO] type=0x");
+  Serial.print(type, HEX);
+  Serial.print(" len=");
+  Serial.print(len);
+  Serial.print(" raw=");
+  Serial.println(rawStr);
+}
+
+// ============================================================
+// CONNECT / DISCONNECT BLE
+// ============================================================
+
+bool connectBle() {
+  Serial.println("[BLE] Iniciando...");
+  printHeap("antes BLE");
+
+  BLEDevice::init("ESP32_ACTIVE_FRESH");
+
+  client = BLEDevice::createClient();
+
+  BLEAddress addr(DEVICE_MAC);
+
+  Serial.println("[BLE] Conectando...");
+
+  bool ok = client->connect(addr, BLE_ADDR_TYPE_RANDOM);
+
+  if (!ok) {
+    Serial.println("[BLE] RANDOM falhou, tentando PUBLIC...");
+    ok = client->connect(addr, BLE_ADDR_TYPE_PUBLIC);
+  }
+
+  if (!ok) {
+    Serial.println("[BLE] Falha ao conectar.");
     return false;
   }
 
-  Serial.println("[BLE] Conectado. Procurando serviço FFF0...");
+  BLERemoteService* service = client->getService(SERVICE_UUID);
 
-  BLERemoteService* service = bleClient->getService(SERVICE_UUID);
   if (!service) {
     Serial.println("[BLE] Serviço FFF0 não encontrado.");
-    bleClient->disconnect();
-    delay(500);
-    bleConnected = false;
-    txChar = nullptr;
-    rxChar = nullptr;
     return false;
   }
 
@@ -620,494 +1307,633 @@ bool connectBracelet() {
   rxChar = service->getCharacteristic(RX_UUID);
 
   if (!txChar || !rxChar) {
-    Serial.println("[BLE] Características FFF6/FFF7 não encontradas.");
-    bleClient->disconnect();
-    delay(500);
-    bleConnected = false;
-    txChar = nullptr;
-    rxChar = nullptr;
+    Serial.println("[BLE] TX/RX não encontrados.");
     return false;
   }
 
-  if (rxChar->canNotify()) {
-    rxChar->registerForNotify(notifyCallback);
-    Serial.println("[BLE] Notify registrado em RX FFF7.");
-  } else {
-    Serial.println("[BLE] RX FFF7 não suporta notify.");
-  }
+  rxChar->registerForNotify(notifyCallback);
 
-  bleConnected = true;
+  bleReady = true;
 
-  Serial.println("[BLE] Pulseira pronta.");
+  Serial.println("[BLE] Pronto.");
+  printHeap("depois BLE");
 
   return true;
 }
- 
- bool ensureBraceletConnected() {
-   if (isBleReady()) return true;
- 
-   unsigned long now = millis();
- 
-   if (now - lastBleReconnectAttempt < 10000) {
-     return false;
-   }
- 
-   lastBleReconnectAttempt = now;
- 
-   Serial.println("[BLE] Não conectado. Tentando reconectar...");
-   return connectBracelet();
- }
- 
- // ===================== COMANDOS BLE =====================
- 
- void sendPacket16(uint8_t* pkt) {
-   if (!isBleReady()) {
-     Serial.println("[BLE TX] Não enviado: BLE não pronto.");
-     return;
-   }
- 
-   pkt[15] = calcCrc(pkt);
- 
- #if LOG_BLE_TX
-   char txHex[80];
-   rawToHex(pkt, 16, txHex, sizeof(txHex));
-   Serial.printf("[BLE TX] %s\n", txHex);
- #endif
- 
-   txChar->writeValue(pkt, 16, true);
- }
- 
- void sendCommand(uint8_t cmd, uint8_t p1 = 0x00, uint8_t p2 = 0x00, uint8_t p3 = 0x00) {
-   uint8_t pkt[16] = {
-     cmd, p1, p2, p3,
-     0, 0, 0, 0,
-     0, 0, 0, 0,
-     0, 0, 0, 0
-   };
- 
-   sendPacket16(pkt);
- }
- 
- // Saúde 0x28
- void startHealth(uint8_t type) {
-   sendCommand(0x28, type, 0x01);
- }
- 
- void stopHealth(uint8_t type) {
-   sendCommand(0x28, type, 0x00);
- }
- 
- void stopAllHealth() {
-   if (!isBleReady()) return;
- 
-   stopHealth(0x01);  // HRV
-   delay(50);
-   stopHealth(0x02);  // HR
-   delay(50);
-   stopHealth(0x03);  // SpO2
-   delay(50);
-   stopHealth(0x04);  // Temperatura
-   delay(50);
- }
- 
- // Tempo real 0x09
- void startRealtime() {
-   sendCommand(0x09, 0x01, 0x00);
- }
- 
- void stopRealtime() {
-   sendCommand(0x09, 0x00, 0x00);
- }
- 
- // Dispositivo
- void readBattery() {
-   sendCommand(0x13, 0x99);
- }
- 
- void readMacAddress() {
-   sendCommand(0x22);
- }
- 
- void readFirmware() {
-   sendCommand(0x27);
- }
- 
- void readDeviceTime() {
-   sendCommand(0x41);
- }
- 
- // Históricos
- void readHistorySleep() {
-   sendCommand(0x53, 0x00, 0x00, 0x00);
- }
- 
- void readHistoryHeartRate() {
-   sendCommand(0x54, 0x00, 0x00, 0x00);
- }
- 
- void readHistorySingleHeartRate() {
-   sendCommand(0x55, 0x00, 0x00, 0x00);
- }
- 
- void readHistoryHrv() {
-   sendCommand(0x56, 0x00, 0x00, 0x00);
- }
- 
- void readHistorySpo2Manual() {
-   sendCommand(0x60, 0x00, 0x00, 0x00);
- }
- 
- void readHistorySpo2Auto() {
-   sendCommand(0x66, 0x00, 0x00, 0x00);
- }
- 
- void readHistoryTemperatureManual() {
-   sendCommand(0x62, 0x01, 0x00, 0x00);
- }
- 
- void readHistoryTemperatureAuto() {
-   sendCommand(0x65, 0x01, 0x00, 0x00);
- }
- 
- // ===================== COMANDOS INICIAIS BLE =====================
- 
- void sendInitialBleCommands() {
-   if (!isBleReady()) return;
- 
-   Serial.println("[APP] Comandos iniciais BLE...");
- 
-   readBattery();
-   delay(300);
- 
-   readMacAddress();
-   delay(300);
- 
-   readFirmware();
-   delay(300);
- 
-   readDeviceTime();
-   delay(300);
- 
-  // startRealtime();
-  // delay(300);
- 
-   healthState = HEALTH_START_HR;
-   healthStateStartedAt = millis();
- }
- 
- // ===================== HEALTH SCHEDULER =====================
- 
- void processHealthScheduler() {
-   if (!isBleReady()) return;
- 
-   unsigned long now = millis();
- 
-   switch (healthState) {
-     case HEALTH_IDLE:
-       healthState = HEALTH_START_HR;
-       healthStateStartedAt = now;
-       break;
- 
-     case HEALTH_START_HR:
-       Serial.println("[APP] Start HR");
-       startHealth(0x02);
-       healthState = HEALTH_STOP_HR;
-       healthStateStartedAt = now;
-       break;
- 
-     case HEALTH_STOP_HR:
-       if (now - healthStateStartedAt >= HEALTH_MEASURE_WINDOW_MS) {
-         Serial.println("[APP] Stop HR");
-         stopHealth(0x02);
-         healthState = HEALTH_START_SPO2;
-         healthStateStartedAt = now;
-       }
-       break;
- 
-     case HEALTH_START_SPO2:
-       Serial.println("[APP] Start SpO2");
-       startHealth(0x03);
-       healthState = HEALTH_STOP_SPO2;
-       healthStateStartedAt = now;
-       break;
- 
-     case HEALTH_STOP_SPO2:
-       if (now - healthStateStartedAt >= HEALTH_MEASURE_WINDOW_MS) {
-         Serial.println("[APP] Stop SpO2");
-         stopHealth(0x03);
-         healthState = HEALTH_START_TEMP;
-         healthStateStartedAt = now;
-       }
-       break;
- 
-     case HEALTH_START_TEMP:
-       Serial.println("[APP] Start Temp");
-       startHealth(0x04);
-       healthState = HEALTH_STOP_TEMP;
-       healthStateStartedAt = now;
-       break;
- 
-     case HEALTH_STOP_TEMP:
-       if (now - healthStateStartedAt >= HEALTH_MEASURE_WINDOW_MS) {
-         Serial.println("[APP] Stop Temp");
-         stopHealth(0x04);
-         healthState = HEALTH_START_HRV;
-         healthStateStartedAt = now;
-       }
-       break;
- 
-     case HEALTH_START_HRV:
-       Serial.println("[APP] Start HRV");
-       startHealth(0x01);
-       healthState = HEALTH_STOP_HRV;
-       healthStateStartedAt = now;
-       break;
- 
-    case HEALTH_STOP_HRV:
-      if (now - healthStateStartedAt >= HEALTH_MEASURE_WINDOW_MS) {
-        Serial.println("[APP] Stop HRV");
-        stopHealth(0x01);
 
-        Serial.println("[APP] Ciclo de saúde finalizado.");
-        healthState = HEALTH_DONE;
-        healthStateStartedAt = now;
-      }
-      break;
+void bleOff() {
+  Serial.println("[BLE] Desligando seguro...");
 
-    case HEALTH_DONE:
-      break;
+  captureHistoryEnabled = false;
+  captureFreshActiveEnabled = false;
+
+  bleReady = false;
+  txChar = nullptr;
+  rxChar = nullptr;
+
+  if (client && client->isConnected()) {
+    Serial.println("[BLE] Disconnect client...");
+    client->disconnect();
+    delay(1000);
   }
+
+  // Não usar delete client nem BLEDevice::deinit(true): antes causava CORRUPT HEAP.
+  // O deep sleep limpa o estado do BLE no próximo boot.
+
+  Serial.println("[BLE] Desconectado. Não vou liberar heap manualmente.");
+  printHeap("depois BLE disconnect");
 }
- 
- // ===================== HISTÓRICOS =====================
- 
- void resetHistoryQuery() {
-   historyIndex = 0;
-   lastHistoryCommandAt = 0;
-   historyCommandsFinished = false;
- }
- 
- void processHistoryQuery() {
-   if (!isBleReady()) return;
- 
-   unsigned long now = millis();
- 
-   if (historyCommandsFinished) {
-     return;
-   }
- 
-   if (lastHistoryCommandAt != 0 && now - lastHistoryCommandAt < HISTORY_COMMAND_GAP_MS) {
-     return;
-   }
- 
-   lastHistoryCommandAt = now;
- 
-   Serial.printf("[APP] Consultando histórico index=%d\n", historyIndex);
- 
-   switch (historyIndex) {
-     case 0:
-       readHistorySleep();
-       break;
- 
-     case 1:
-       readHistoryHeartRate();
-       break;
- 
-     case 2:
-       readHistorySingleHeartRate();
-       break;
- 
-     case 3:
-       readHistoryHrv();
-       break;
- 
-     case 4:
-       readHistorySpo2Manual();
-       break;
- 
-     case 5:
-       readHistorySpo2Auto();
-       break;
- 
-     case 6:
-       readHistoryTemperatureManual();
-       break;
- 
-     case 7:
-       readHistoryTemperatureAuto();
-       break;
- 
-     default:
-       historyCommandsFinished = true;
-       Serial.println("[APP] Comandos de histórico finalizados. Aguardando respostas...");
-       break;
-   }
- 
-   historyIndex++;
- }
- 
- // ===================== SETUP =====================
- 
- void setup() {
-   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
- 
-   Serial.begin(115200);
-   delay(1000);
- 
-   Serial.println();
-   Serial.println("==========================================");
-   Serial.println("ESP32 2208A BLE COLLECT -> WIFI BATCH API");
-   Serial.println("==========================================");
- 
-   wifiOff();
- 
-   changeState(STATE_BLE_START);
- }
- 
- // ===================== LOOP =====================
- 
- void loop() {
-   unsigned long now = millis();
- 
-   switch (mainState) {
-    case STATE_BLE_START: {
-      static bool wifiAlreadyOffForBle = false;
 
-      if (!wifiAlreadyOffForBle) {
-        wifiOff();
-        wifiAlreadyOffForBle = true;
-        delay(800);
+// ============================================================
+// BOOT 0: INTERVALO / AUTO OPCIONAL
+// ============================================================
+
+void configureAutoThenSleep() {
+  Serial.println("[MODE] BOOT 0 - CONFIGURAR AUTOMÁTICO APP-LIKE");
+
+  if (!AUTO_CONFIG_ENABLED && !AUTO_DISABLE_ON_BOOT0) {
+    Serial.println("[AUTO] Ignorado. Indo direto para coleta.");
+    goToDeepSleep(SHORT_SLEEP_SECONDS, 1);
+  }
+
+  if (AUTO_CONFIG_ENABLED && autoAlreadyConfigured && !FORCE_AUTO_CONFIG_EVERY_BOOT0) {
+    Serial.println("[AUTO] Já configurado nesta sessão RTC. Não vou reconfigurar.");
+    Serial.println("[AUTO] Dormindo 30min para a pulseira gerar HR/SpO2/HRV/Temp automáticos.");
+    goToDeepSleep(COLLECT_SLEEP_SECONDS, 1);
+  }
+
+  if (!connectBle()) {
+    Serial.println("[MODE] Falha BLE no boot 0. Dormindo curto e tentando de novo.");
+    bleOff();
+    goToDeepSleep(SHORT_SLEEP_SECONDS, 0);
+  }
+
+  if (AUTO_DISABLE_ON_BOOT0) {
+    disableAutoConfigs();
+    autoAlreadyConfigured = false;
+  } else if (AUTO_CONFIG_ENABLED) {
+    ensureAutoConfigs();
+    autoAlreadyConfigured = true;
+    Serial.println("[AUTO] Configurado no padrão do app JC Vital:");
+    Serial.print("[AUTO] HR=");
+    Serial.print(AUTO_BPM_INTERVAL_MIN);
+    Serial.print("min | SpO2=");
+    Serial.print(AUTO_SPO2_INTERVAL_MIN);
+    Serial.print("min | HRV/Stress=");
+    Serial.print(AUTO_HRV_INTERVAL_MIN);
+    Serial.print("min | Temp=");
+    Serial.print(AUTO_TEMP_INTERVAL_MIN);
+    Serial.println("min");
+  }
+
+  bootStep = 1;
+  bleOff();
+
+  Serial.println("[AUTO] Dormindo 30min antes da primeira coleta app-like.");
+  goToDeepSleep(COLLECT_SLEEP_SECONDS, 1);
+}
+
+// ============================================================
+// BOOT 1: MEDIÇÃO ATIVA FRESCA
+// ============================================================
+
+bool activeModeTargetReached(uint8_t mode) {
+  if (mode == 0x02) {
+    // Pressão é oportunista: não seguramos o ciclo esperando BP.
+    return snapshot.bpmSamples >= MIN_BPM_SAMPLES;
+  }
+
+  if (mode == 0x03) {
+    return snapshot.spo2Samples >= MIN_SPO2_SAMPLES;
+  }
+
+  if (mode == 0x04) {
+    return snapshot.temperatureSamples >= MIN_TEMP_SAMPLES;
+  }
+
+  if (mode == 0x01) {
+    return snapshot.hrvSamples >= MIN_HRV_SAMPLES && snapshot.fatigueSamples >= MIN_FATIGUE_SAMPLES;
+  }
+
+  return false;
+}
+
+void collectActiveMode(uint8_t mode, const char* label, unsigned long durationMs) {
+  Serial.print("[FRESH] START modo=");
+  Serial.print(label);
+  Serial.print(" 0x");
+  Serial.print(mode, HEX);
+  Serial.print(" durationMs=");
+  Serial.println(durationMs);
+
+  currentActiveMode = mode;
+  currentActiveModeLabel = label;
+  currentActiveModeStartedAtMs = millis();
+  currentActiveModeAcceptAfterMs = currentActiveModeStartedAtMs + ACTIVE_WARMUP_MS;
+  captureFreshActiveEnabled = true;
+  lastPrint028 = 0;
+  lastSave028 = 0;
+
+  startActive028(mode);
+
+  unsigned long start = millis();
+  unsigned long targetReachedAt = 0;
+
+  while (millis() - start < durationMs) {
+    delay(500);
+
+    if (millis() >= currentActiveModeAcceptAfterMs && activeModeTargetReached(mode)) {
+      if (targetReachedAt == 0) {
+        targetReachedAt = millis();
+        Serial.print("[FRESH] Alvo encontrado em modo=");
+        Serial.print(label);
+        Serial.println(". Mantendo alguns segundos para estabilizar.");
       }
 
-      if (connectBracelet()) {
-        wifiAlreadyOffForBle = false;
+      if (millis() - targetReachedAt >= ACTIVE_STABLE_AFTER_TARGET_MS) {
+        Serial.print("[FRESH] Alvo estável. Encerrando modo=");
+        Serial.println(label);
+        break;
+      }
+    }
+  }
 
-        sendInitialBleCommands();
-        changeState(STATE_BLE_COLLECT);
-      } else {
-        Serial.println("[BLE] Falha no start. Tentando novamente em 10s...");
-        delay(10000);
+  stopActive028(mode);
+  delay(1000);
+
+  captureFreshActiveEnabled = false;
+
+  Serial.print("[FRESH] STOP modo=");
+  Serial.println(label);
+}
+
+
+void readHistoriesForSnapshot() {
+  Serial.println("[HIST] Lendo últimos registros automáticos/manuais para montar snapshot...");
+
+  captureHistoryEnabled = true;
+
+  // HR/BPM: histórico automático/manual de batimentos.
+  Serial.println("[HIST] BPM 0x54...");
+  readHistoryBpm();
+  delay(3500);
+
+  // HRV/Stress/Fadiga: caminho principal para HRV/fadiga.
+  // Testa todos os modos conhecidos de leitura para não precisar voltar no paciente.
+  Serial.println("[HIST] HRV/fadiga 0x56 latest AA=0...");
+  sendCmd(0x56, 0x00, 0x00, 0x00);
+  delay(4500);
+
+  Serial.println("[HIST] HRV/fadiga 0x56 position AA=1 pos=0...");
+  sendCmd(0x56, 0x01, 0x00, 0x00);
+  delay(4500);
+
+  Serial.println("[HIST] HRV/fadiga 0x56 position AA=1 pos=1...");
+  sendCmd(0x56, 0x01, 0x01, 0x00);
+  delay(4500);
+
+  Serial.println("[HIST] HRV/fadiga 0x56 next AA=2 #1...");
+  sendCmd(0x56, 0x02, 0x00, 0x00);
+  delay(3000);
+
+  Serial.println("[HIST] HRV/fadiga 0x56 next AA=2 #2...");
+  sendCmd(0x56, 0x02, 0x00, 0x00);
+  delay(3000);
+
+  Serial.println("[HIST] HRV/fadiga 0x56 next AA=2 #3...");
+  sendCmd(0x56, 0x02, 0x00, 0x00);
+  delay(3000);
+
+  // SpO2: tenta automático primeiro, depois manual.
+  Serial.println("[HIST] SpO2 automático 0x66...");
+  readHistorySpo2Auto();
+  delay(4500);
+
+  Serial.println("[HIST] SpO2 manual 0x60...");
+  readHistorySpo2Manual();
+  delay(3500);
+
+  // Temperatura: tenta automático primeiro, depois manual.
+  Serial.println("[HIST] Temperatura automática 0x65...");
+  readHistoryTempAuto();
+  delay(3500);
+
+  Serial.println("[HIST] Temperatura manual 0x62...");
+  readHistoryTempManual();
+  delay(3500);
+
+  captureHistoryEnabled = false;
+
+  Serial.println("[HIST] Leitura de históricos finalizada.");
+}
+
+void collectFreshActiveVitals() {
+  Serial.println("[MODE] BOOT 1 - SYNC APP-LIKE 2 POR HORA");
+
+  clearPacketsFile();
+  resetSnapshot();
+
+  measurementSessionId = bootCounter;
+  measurementSessionStartedAtMs = millis();
+
+  if (!connectBle()) {
+    Serial.println("[MODE] Falha BLE ao coletar snapshot.");
+    bleOff();
+    goToDeepSleep(SHORT_SLEEP_SECONDS, 1);
+  }
+
+  // 1) Principal: copiar a lógica do app, lendo o que a pulseira gravou automaticamente.
+  readHistoriesForSnapshot();
+
+  // 2) Complemento ativo curto: BPM fresco e pressão oportunista.
+  // Pressão não é obrigatória; se não vier, fica null.
+  if (USE_ACTIVE_HEART_BP_REFRESH) {
+    collectActiveMode(0x02, "HEART_BP_OPPORTUNISTIC", ACTIVE_HEART_BP_MS);
+    delay(GAP_BETWEEN_ACTIVE_MODES_MS);
+  }
+
+  // 3) Fallback ativo para SpO2 apenas se o histórico não entregou SpO2 suficiente.
+  if (USE_ACTIVE_SPO2_IF_MISSING && snapshot.spo2Samples < MIN_SPO2_SAMPLES) {
+    collectActiveMode(0x03, "SPO2_FALLBACK", ACTIVE_SPO2_MS);
+    delay(GAP_BETWEEN_ACTIVE_MODES_MS);
+  }
+
+  // 4) Fallback ativo para temperatura apenas se não veio histórico.
+  if (USE_ACTIVE_TEMP_IF_MISSING && !snapshot.hasTemperature) {
+    collectActiveMode(0x04, "TEMP_FALLBACK", ACTIVE_TEMP_MS);
+    delay(GAP_BETWEEN_ACTIVE_MODES_MS);
+  }
+
+  // 5) HRV ativo fica só para debug. A fonte principal é 0x56.
+  if (TRY_ACTIVE_HRV_DEBUG && (!snapshot.hasHrv || !snapshot.hasFatigue)) {
+    collectActiveMode(0x01, "HRV_FATIGUE_DEBUG", ACTIVE_HRV_MS);
+    delay(GAP_BETWEEN_ACTIVE_MODES_MS);
+  }
+
+  // 6) Segunda tentativa do 0x56 depois das medições ativas, caso a pulseira só tenha fechado o cálculo agora.
+  if (!snapshot.hasHrv || !snapshot.hasFatigue) {
+    captureHistoryEnabled = true;
+    Serial.println("[HIST] Segunda tentativa HRV/fadiga 0x56 AA=0...");
+    sendCmd(0x56, 0x00, 0x00, 0x00);
+    delay(4500);
+
+    Serial.println("[HIST] Segunda tentativa HRV/fadiga 0x56 AA=1 pos=0...");
+    sendCmd(0x56, 0x01, 0x00, 0x00);
+    delay(4500);
+
+    Serial.println("[HIST] Segunda tentativa HRV/fadiga 0x56 AA=1 pos=1...");
+    sendCmd(0x56, 0x01, 0x01, 0x00);
+    delay(4500);
+
+    Serial.println("[HIST] Segunda tentativa HRV/fadiga 0x56 AA=2...");
+    sendCmd(0x56, 0x02, 0x00, 0x00);
+    delay(3000);
+
+    captureHistoryEnabled = false;
+  }
+
+  printSnapshotDebug();
+  saveVitalsSnapshotToFile();
+  appendSnapshotToPacketsFile();
+
+  int lines = countPacketLines();
+  Serial.print("[FS] Total de pacotes salvos em arquivo=");
+  Serial.println(lines);
+
+  bleOff();
+
+  // Não liga Wi-Fi neste mesmo boot.
+  // Acorda em boot limpo só para HTTP.
+  goToDeepSleep(SHORT_SLEEP_SECONDS, 2);
+}
+
+// ============================================================
+// WIFI / HTTP
+// ============================================================
+
+bool connectWifi() {
+  Serial.println("[WIFI] Ligando...");
+  printHeap("antes WiFi");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long start = millis();
+
+  while (millis() - start < 20000) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("[WIFI] OK IP=");
+      Serial.println(WiFi.localIP());
+      printHeap("depois WiFi");
+      return true;
+    }
+
+    delay(500);
+  }
+
+  Serial.println("[WIFI] Falha.");
+  return false;
+}
+
+void wifiOff() {
+  Serial.println("[WIFI] Desligando...");
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  delay(1000);
+
+  printHeap("depois WiFi off");
+}
+
+bool pingHealth() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[HTTP] Sem WiFi.");
+    return false;
+  }
+
+  WiFiClientSecure secure;
+  secure.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(45000);
+  http.setReuse(false);
+
+  String url = String(API_BASE_URL) + "/health";
+
+  Serial.print("[HTTP] GET ");
+  Serial.println(url);
+
+  if (!http.begin(secure, url)) {
+    Serial.println("[HTTP] begin /health falhou.");
+    return false;
+  }
+
+  http.addHeader("Connection", "close");
+
+  int code = http.GET();
+
+  Serial.print("[HTTP] /health status=");
+  Serial.println(code);
+
+  if (code > 0) {
+    String res = http.getString();
+    Serial.print("[HTTP] /health body=");
+    Serial.println(res);
+  } else {
+    Serial.print("[HTTP] /health erro=");
+    Serial.println(http.errorToString(code));
+  }
+
+  http.end();
+
+  return code >= 200 && code < 300;
+}
+
+bool waitApiAwake() {
+  Serial.println("[HTTP] Acordando API do Render...");
+
+  for (int attempt = 1; attempt <= 6; attempt++) {
+    Serial.print("[HTTP] Wake attempt ");
+    Serial.print(attempt);
+    Serial.println("/6");
+
+    if (pingHealth()) {
+      Serial.println("[HTTP] API OK.");
+      return true;
+    }
+
+    delay(7000);
+  }
+
+  Serial.println("[HTTP] API não respondeu.");
+  return false;
+}
+
+bool postJsonBody(const String& body) {
+  WiFiClientSecure secure;
+  secure.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(45000);
+  http.setReuse(false);
+
+  String url = String(API_BASE_URL) + API_PATH;
+
+  Serial.print("[HTTP] POST ");
+  Serial.println(url);
+  Serial.print("[HTTP] Body size=");
+  Serial.println(body.length());
+
+  if (!http.begin(secure, url)) {
+    Serial.println("[HTTP] begin POST falhou.");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Connection", "close");
+
+  int code = http.POST(body);
+
+  Serial.print("[HTTP] Status=");
+  Serial.println(code);
+
+  if (code > 0) {
+    String res = http.getString();
+    Serial.print("[HTTP] Resposta=");
+    Serial.println(res);
+  } else {
+    Serial.print("[HTTP] Erro POST=");
+    Serial.println(http.errorToString(code));
+  }
+
+  http.end();
+
+  return code == 200 || code == 201 || code == 202;
+}
+
+bool sendPacketsFileToApi() {
+  int totalLines = countPacketLines();
+
+  Serial.print("[HTTP] Pacotes no arquivo=");
+  Serial.println(totalLines);
+
+  if (totalLines == 0) {
+    Serial.println("[HTTP] Nada para enviar.");
+    return true;
+  }
+
+  File f = SPIFFS.open(PACKETS_FILE, FILE_READ);
+  if (!f) {
+    Serial.println("[FS] Falha ao abrir arquivo para envio.");
+    return false;
+  }
+
+  // Na estratégia nova, normalmente só há 1 pacote: SNAPSHOT_VITALS.
+  const int LOCAL_BATCH_SIZE = 1;
+
+  int sent = 0;
+  int batchCount = 0;
+  bool firstPacket = true;
+
+  String body;
+  body.reserve(5000);
+
+  body = "{";
+  body += "\"deviceMac\":\"";
+  body += DEVICE_MAC;
+  body += "\",";
+  body += "\"source\":\"ESP32_APP_LIKE_2_PER_HOUR\",";
+  body += "\"packets\":[";
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+
+    if (line.length() == 0) {
+      continue;
+    }
+
+    if (!firstPacket) {
+      body += ",";
+    }
+
+    body += line;
+
+    firstPacket = false;
+    batchCount++;
+
+    if (batchCount >= LOCAL_BATCH_SIZE) {
+      body += "]}";
+
+      bool ok = postJsonBody(body);
+
+      if (!ok) {
+        Serial.println("[HTTP] Falha ao enviar batch.");
+        f.close();
+        return false;
       }
 
-      break;
-    }
- 
-     case STATE_BLE_COLLECT: {
-       ensureBraceletConnected();
- 
-       if (isBleReady()) {
-         processHealthScheduler();
-       }
- 
-       if (now - stateStartedAt >= BLE_COLLECT_WINDOW_MS) {
-         Serial.printf("[APP] Janela BLE finalizada. Fila=%d\n", queueCount);
-         resetHistoryQuery();
-         changeState(STATE_BLE_QUERY_HISTORY);
-       }
- 
-       break;
-     }
- 
-     case STATE_BLE_QUERY_HISTORY: {
-       ensureBraceletConnected();
- 
-       if (isBleReady()) {
-         processHistoryQuery();
-       }
- 
-       if (historyCommandsFinished && now - lastHistoryCommandAt >= HISTORY_RESPONSE_WAIT_MS) {
-         Serial.printf("[APP] Histórico coletado. Fila=%d\n", queueCount);
-         changeState(STATE_BLE_SHUTDOWN);
-       }
- 
-       break;
-     }
- 
-     case STATE_BLE_SHUTDOWN: {
-       if (isBleReady()) {
-         stopRealtime();
-         delay(150);
-         stopAllHealth();
-         delay(300);
-       }
- 
-      blePauseForWifi();
-      delay(800);
-      changeState(STATE_WIFI_START);
-      break;
-    }
+      sent += batchCount;
 
-    case STATE_WIFI_START: {
-       if (wifiStartOrEnsure()) {
-         changeState(STATE_RENDER_WAKE);
-       }
- 
-       break;
-     }
- 
-     case STATE_RENDER_WAKE: {
-       if (WiFi.status() != WL_CONNECTED) {
-         changeState(STATE_WIFI_START);
-         break;
-       }
- 
-       if (now - lastRenderPingAt >= RENDER_PING_INTERVAL_MS) {
-         lastRenderPingAt = now;
- 
-         bool ok = pingRenderHealth();
- 
-         if (ok) {
-           Serial.println("[HTTP] Render acordado.");
-           changeState(STATE_HTTP_SEND_BATCH);
-         } else {
-           Serial.println("[HTTP] Render ainda não respondeu. Tentando de novo...");
-         }
-       }
- 
-       break;
-     }
- 
-     case STATE_HTTP_SEND_BATCH: {
-       if (WiFi.status() != WL_CONNECTED) {
-         changeState(STATE_WIFI_START);
-         break;
-       }
- 
-       if (queueCount <= 0) {
-         Serial.println("[HTTP] Fila vazia. Finalizando envio.");
-         changeState(STATE_WIFI_SHUTDOWN);
-         break;
-       }
- 
-       if (now - lastHttpTryAt >= HTTP_RETRY_INTERVAL_MS) {
-         lastHttpTryAt = now;
- 
-         bool ok = postBatchToApi();
- 
-         if (!ok) {
-           Serial.println("[HTTP] Batch falhou. Voltando para wake Render.");
-           changeState(STATE_RENDER_WAKE);
-         }
-       }
- 
-       break;
-     }
- 
-    case STATE_WIFI_SHUTDOWN: {
-      wifiOff();
+      Serial.print("[HTTP] Enviados até agora=");
+      Serial.println(sent);
 
-      Serial.println("[APP] Ciclo completo. Voltando para BLE.");
       delay(1500);
 
-      healthState = HEALTH_IDLE;
-      lastBleReconnectAttempt = 0;
-      lastRenderPingAt = 0;
-      lastHttpTryAt = 0;
+      batchCount = 0;
+      firstPacket = true;
 
-      changeState(STATE_BLE_START);
-      break;
+      body = "{";
+      body += "\"deviceMac\":\"";
+      body += DEVICE_MAC;
+      body += "\",";
+      body += "\"source\":\"ESP32_APP_LIKE_2_PER_HOUR\",";
+      body += "\"packets\":[";
     }
-   }
- 
-   delay(20);
- }
+  }
+
+  f.close();
+
+  if (batchCount > 0) {
+    body += "]}";
+
+    bool ok = postJsonBody(body);
+
+    if (!ok) {
+      Serial.println("[HTTP] Falha ao enviar último batch.");
+      return false;
+    }
+
+    sent += batchCount;
+  }
+
+  Serial.print("[HTTP] Envio finalizado. Total enviado=");
+  Serial.println(sent);
+
+  return true;
+}
+
+void sendFileThenSleep() {
+  Serial.println("[MODE] BOOT 2 - ENVIAR API");
+
+  if (!connectWifi()) {
+    wifiOff();
+    goToDeepSleep(SHORT_SLEEP_SECONDS, 2);
+  }
+
+  bool apiOk = waitApiAwake();
+
+  if (!apiOk) {
+    Serial.println("[HTTP] API indisponível. Mantendo arquivo e tentando no próximo boot 2.");
+    wifiOff();
+    goToDeepSleep(SHORT_SLEEP_SECONDS, 2);
+  }
+
+  bool sentOk = sendPacketsFileToApi();
+
+  if (sentOk) {
+    Serial.println("[HTTP] Enviado com sucesso. Limpando arquivo.");
+    clearPacketsFile();
+  } else {
+    Serial.println("[HTTP] Envio falhou. Arquivo será mantido.");
+  }
+
+  wifiOff();
+
+  if (sentOk) {
+    Serial.println("[SLEEP] Envio OK. Voltando para BOOT 0 para iniciar próximo ciclo remoto.");
+    goToDeepSleep(SHORT_SLEEP_SECONDS, 0);
+  }
+
+  Serial.println("[SLEEP] Envio falhou. Tentando reenviar no BOOT 2.");
+  goToDeepSleep(SHORT_SLEEP_SECONDS, 2);
+}
+
+// ============================================================
+// SETUP / LOOP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  bootCounter++;
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("ESP32 PATIENT REMOTE WATCH - BLE/WIFI ISOLADOS");
+  Serial.println("BOOT 0=AUTO WAIT | BOOT 1=SYNC+DEBUG | BOOT 2=API");
+  Serial.print("[BOOT] bootCounter=");
+  Serial.println(bootCounter);
+  Serial.print("[BOOT] bootStep=");
+  Serial.println(bootStep);
+  Serial.println("========================================");
+
+  printHeap("inicio");
+
+  WiFi.mode(WIFI_OFF);
+
+  if (!initStorage()) {
+    Serial.println("[FATAL] SPIFFS falhou. Dormindo curto.");
+    goToDeepSleep(SHORT_SLEEP_SECONDS, bootStep);
+  }
+
+  if (bootStep == 0) {
+    configureAutoThenSleep();
+  } else if (bootStep == 1) {
+    collectFreshActiveVitals();
+  } else if (bootStep == 2) {
+    sendFileThenSleep();
+  } else {
+    Serial.println("[BOOT] bootStep inválido. Voltando para 0.");
+    bootStep = 0;
+    goToDeepSleep(SHORT_SLEEP_SECONDS, 0);
+  }
+}
+
+void loop() {
+  // Não usa loop.
+  // Tudo roda no setup e depois entra em deep sleep.
+}

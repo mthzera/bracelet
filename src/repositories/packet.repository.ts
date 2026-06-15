@@ -120,8 +120,12 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
   const bytesJson = input.bytes ? JSON.stringify(input.bytes) : null;
   const decodedJson = input.decoded ? JSON.stringify(input.decoded) : null;
 
+  // ESP32 sends millis() (uptime since boot), not a Unix timestamp.
+  // A valid Unix ms timestamp for 2020+ is > 1_577_836_800_000 (13 digits).
+  // Anything smaller is uptime — fall back to DB now().
+  const MIN_UNIX_MS = 1_577_836_800_000;
   const createdAt =
-    input.receivedAtMs !== undefined
+    input.receivedAtMs !== undefined && input.receivedAtMs >= MIN_UNIX_MS
       ? new Date(input.receivedAtMs).toISOString()
       : null;
 
