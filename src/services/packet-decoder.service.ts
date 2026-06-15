@@ -96,6 +96,8 @@ export type DecodedSnapshot = {
   fatigue: number | null;
   systolicPressure: number | null;
   diastolicPressure: number | null;
+  /** Campos idênticos ao snapshot anterior — firmware pode estar enviando leitura repetida. */
+  staleFields?: string[];
 };
 
 export type DecodedPacket =

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { ZodError } from "zod";
 import {
   getMergedHealthForDevice,
+  getLastSnapshotVitalsForDevice,
   listPackets,
   savePacket,
 } from "../repositories/packet.repository.js";
@@ -76,6 +77,7 @@ type PacketProcessResult =
       decoded: DecodedPacket;
       mergedHealth: DecodedHealth | null;
       savedAt: string;
+      staleFields?: string[];
     }
   | {
       ok: false;
@@ -86,11 +88,14 @@ type PacketProcessResult =
       savedAt: string;
     };
 
+const STALE_VITAL_KEYS = ["hrv", "fatigue", "systolicPressure", "diastolicPressure"] as const;
+
 async function processInboundPacket(
   payload: PacketPayload,
   item: PacketItem,
   log: FastifyBaseLogger,
   ingestionBatchId: string,
+  rawSnapshot?: unknown,
 ): Promise<PacketProcessResult> {
   const base = {
     packetType: item.packetType,
@@ -101,16 +106,33 @@ async function processInboundPacket(
   // `metrics`) como debug/histórico. Não passa pelo decoder de hex.
   if (item.packetType === SNAPSHOT_VITALS_TYPE) {
     const vitals = applySnapshotVitals({ packetType: item.packetType, metrics: item.metrics });
-    const decoded: DecodedPacket = { type: "snapshot", ...vitals };
+
+    // Detecta campos repetidos do snapshot anterior (firmware pode travar em leitura antiga).
+    const prevPacket = await getLastSnapshotVitalsForDevice(payload.deviceMac);
+    const prevDecoded = prevPacket?.decoded?.type === "snapshot" ? prevPacket.decoded : null;
+
+    let staleFields: string[] = [];
+    if (prevDecoded) {
+      const anyNonNull = STALE_VITAL_KEYS.some(
+        (k) => vitals[k] !== null || prevDecoded[k] !== null,
+      );
+      const allMatch = STALE_VITAL_KEYS.every((k) => vitals[k] === prevDecoded[k]);
+      if (anyNonNull && allMatch) {
+        staleFields = [...STALE_VITAL_KEYS];
+      }
+    }
+
+    const decoded: DecodedPacket = { type: "snapshot", ...vitals, staleFields };
     const saved = await savePacket({
       payload,
       crcValid: false,
       decoded,
       receivedAtMs: item.receivedAtMs,
       ingestionBatchId,
+      rawSnapshot,
     });
     log.info(
-      { id: saved.id, deviceMac: payload.deviceMac, vitals },
+      { id: saved.id, deviceMac: payload.deviceMac, vitals, staleFields },
       "SNAPSHOT_VITALS saved",
     );
     return {
@@ -122,6 +144,7 @@ async function processInboundPacket(
       decoded,
       mergedHealth: null,
       savedAt: saved.createdAt,
+      staleFields,
     };
   }
 
@@ -420,6 +443,8 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
 
     const results: PacketProcessResult[] = [];
 
+    const batchExtras = batch as Record<string, unknown>;
+
     for (const item of batch.packets) {
       const payload: PacketPayload = {
         deviceMac: batch.deviceMac,
@@ -429,7 +454,19 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
         metrics: item.metrics,
       };
 
-      results.push(await processInboundPacket(payload, item, request.log, ingestionBatchId));
+      // Para SNAPSHOT_VITALS, salva o payload bruto completo para auditoria.
+      const rawSnapshotPayload =
+        item.packetType === SNAPSHOT_VITALS_TYPE
+          ? {
+              ...(item as Record<string, unknown>),
+              bootCounter: batchExtras.bootCounter,
+              measurementSessionId: batchExtras.measurementSessionId,
+            }
+          : undefined;
+
+      results.push(
+        await processInboundPacket(payload, item, request.log, ingestionBatchId, rawSnapshotPayload),
+      );
     }
 
     const okCount = results.filter((result) => result.ok).length;
@@ -461,6 +498,13 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       results[0]?.savedAt ?? new Date().toISOString(),
     );
 
+    // Extrai staleFields do resultado do SNAPSHOT_VITALS, se presente neste batch.
+    const snapshotResult = results.find(
+      (r): r is Extract<PacketProcessResult, { ok: true }> =>
+        r.ok && r.packetType === SNAPSHOT_VITALS_TYPE,
+    );
+    const staleFields: string[] = snapshotResult?.staleFields ?? [];
+
     const snapshot = {
       deviceMac: batch.deviceMac,
       source: batch.source,
@@ -468,6 +512,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       vitals: consolidated.vitals,
       sources: consolidated.sources,
       quality: consolidated.quality,
+      staleFields,
       patient: resolvePatientForMac(batch.deviceMac),
     };
 
@@ -484,6 +529,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       ingestionBatchId,
       patient: resolvePatientForMac(batch.deviceMac),
       snapshot,
+      staleFields,
       usedSnapshotVitals: consolidated.usedSnapshotVitals,
       ignoredPartialSnapshots: consolidated.stats.ignoredPartialSnapshots,
       stats: {

@@ -17,6 +17,7 @@ export type SavePacketInput = {
   decodeError?: string;
   receivedAtMs?: number;
   ingestionBatchId?: string;
+  rawSnapshot?: unknown;
 };
 
 export type SavedPacket = {
@@ -32,6 +33,7 @@ export type SavedPacket = {
   decodeError: string | null;
   createdAt: string;
   ingestionBatchId?: string | null;
+  rawSnapshot?: unknown;
 };
 
 const HEALTH_MERGE_WINDOW_MS = 5 * 60 * 1000;
@@ -48,6 +50,7 @@ type PacketRow = {
   decode_error: string | null;
   created_at: Date;
   ingestion_batch_id: string | null;
+  raw_snapshot: unknown | null;
 };
 
 function isHealthDecoded(
@@ -115,6 +118,7 @@ function rowToSavedPacket(row: PacketRow): SavedPacket {
     decodeError: row.decode_error,
     createdAt: row.created_at.toISOString(),
     ingestionBatchId: row.ingestion_batch_id,
+    rawSnapshot: row.raw_snapshot ?? undefined,
   };
 }
 
@@ -123,6 +127,7 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
 
   const bytesJson = input.bytes ? JSON.stringify(input.bytes) : null;
   const decodedJson = input.decoded ? JSON.stringify(input.decoded) : null;
+  const rawSnapshotJson = input.rawSnapshot !== undefined ? JSON.stringify(input.rawSnapshot) : null;
 
   // ESP32 sends millis() (uptime since boot), not a Unix timestamp.
   // A valid Unix ms timestamp for 2020+ is > 1_577_836_800_000 (13 digits).
@@ -145,10 +150,11 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
         decoded,
         decode_error,
         created_at,
-        ingestion_batch_id
+        ingestion_batch_id,
+        raw_snapshot
       )
-      VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, COALESCE($9::timestamptz, now()), $10)
-      RETURNING id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at, ingestion_batch_id
+      VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, COALESCE($9::timestamptz, now()), $10, $11::jsonb)
+      RETURNING id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at, ingestion_batch_id, raw_snapshot
     `,
     [
       input.payload.deviceMac,
@@ -161,6 +167,7 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
       input.decodeError ?? null,
       createdAt,
       input.ingestionBatchId ?? null,
+      rawSnapshotJson,
     ],
   );
 
@@ -260,4 +267,24 @@ export async function getMergedHealthForDevice(
 
   if (decoded.length === 0) return null;
   return mergeHealthReadings(decoded);
+}
+
+/** Retorna o último pacote SNAPSHOT_VITALS salvo para o dispositivo, para comparação de staleness. */
+export async function getLastSnapshotVitalsForDevice(
+  deviceMac: string,
+): Promise<SavedPacket | null> {
+  const pool = getPool();
+  const { rows } = await pool.query<PacketRow>(
+    `
+      SELECT id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at, ingestion_batch_id, raw_snapshot
+      FROM packets
+      WHERE UPPER(device_mac) = $1
+        AND LOWER(packet_type) = 'snapshot_vitals'
+      ORDER BY id DESC
+      LIMIT 1
+    `,
+    [deviceMac.trim().toUpperCase()],
+  );
+  if (rows.length === 0) return null;
+  return rowToSavedPacket(rows[0] as PacketRow);
 }

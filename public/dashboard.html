@@ -207,6 +207,7 @@
     .badge-history  { background: #2a2a1e; color: #fbbf24; }
     .badge-error    { background: #3a1e1e; color: var(--danger); }
     .badge-unknown  { background: var(--surface2); color: var(--muted); }
+    .badge-stale    { background: #3a2a00; color: #ffb347; font-size: 10px; padding: 1px 6px; vertical-align: middle; }
 
     /* ── Battery bar ── */
     .battery-bar-wrap { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
@@ -532,7 +533,11 @@
 
   function isHealthPacket(p) {
     const t = field(p, 'packetType', 'packet_type');
-    return t === '0x28' || t === '0x56' || !!p.mergedHealth;
+    return t === '0x28' || t === '0x56' || t === 'SNAPSHOT_VITALS' || !!p.mergedHealth;
+  }
+
+  function isSnapshotPacket(p) {
+    return field(p, 'packetType', 'packet_type') === 'SNAPSHOT_VITALS';
   }
 
   function latestVital(getValue) {
@@ -666,20 +671,20 @@
 
     // Vitais
     const hr = latestVital(v => v.heartRate);
-    document.getElementById('sumHR').innerHTML = hr
+    document.getElementById('sumHR').innerHTML = (hr && hr.value != null)
       ? hr.value + '<span class="unit">bpm</span>'
-      : '—<span class="unit">bpm</span>';
+      : '--<span class="unit">bpm</span>';
     document.getElementById('sumHRTime').textContent = hr?.time ? relTime(hr.time) : '';
 
     const spo2 = latestVital(v => v.spo2);
-    document.getElementById('sumSpo2').innerHTML = spo2
+    document.getElementById('sumSpo2').innerHTML = (spo2 && spo2.value != null)
       ? spo2.value + '<span class="unit">%</span>'
-      : '—<span class="unit">%</span>';
+      : '--<span class="unit">%</span>';
 
     const temp = latestVital(v => v.temperature);
-    document.getElementById('sumTemp').innerHTML = temp
+    document.getElementById('sumTemp').innerHTML = (temp && temp.value != null)
       ? temp.value + '<span class="unit">°C</span>'
-      : '—<span class="unit">°C</span>';
+      : '--<span class="unit">°C</span>';
 
     // Blood Pressure
     const bpVital = latestVital(v => v.systolicPressure || v.diastolicPressure);
@@ -752,47 +757,69 @@
     renderSleepPanel();
   }
 
+  function fmtVal(val, color, stale) {
+    const display = (val === null || val === undefined || val === 0) ? '--' : val;
+    const isMissing = display === '--';
+    const colorStyle = isMissing ? 'color:var(--muted)' : (color ? `color:${color}` : '');
+    const staleBadge = !isMissing && stale ? ' <span class="badge badge-stale">repetido</span>' : '';
+    return `<span class="metric-val" style="${colorStyle}">${display}</span>${staleBadge}`;
+  }
+
   function renderHealthPanel() {
-    const h = packets.find(p => {
+    // Prefere SNAPSHOT_VITALS (leitura consolidada); cai para 0x28 como fallback.
+    const snap = packets.find(p => isSnapshotPacket(p) && p.decoded);
+    const h = snap || packets.find(p => {
       if (!isHealthPacket(p)) return false;
       const v = healthView(p);
       return v && (v.heartRate > 0 || v.spo2 > 0 || v.temperature > 0);
     });
     const el = document.getElementById('healthPanel');
     if (!h) { el.innerHTML = '<div class="no-data">Sem dados de saúde</div>'; return; }
-    const d = h.mergedHealth || h.decoded;
-    const bpStr = (d.systolicPressure > 0)
+
+    const d = h.decoded;
+    const stale = new Set(Array.isArray(d?.staleFields) ? d.staleFields : []);
+
+    const bpVal = (d.systolicPressure != null && d.systolicPressure > 0)
       ? `${d.systolicPressure}/${d.diastolicPressure}`
-      : '—';
+      : null;
+    const bpStale = stale.has('systolicPressure') || stale.has('diastolicPressure');
+    const bpDisplay = bpVal === null
+      ? '<span class="metric-val" style="color:var(--muted)">--</span>'
+      : `<span class="metric-val" style="color:#c084fc;font-size:16px">${bpVal}</span>${bpStale ? ' <span class="badge badge-stale">repetido</span>' : ''}`;
+
+    const modeStr = d.measurementMode || null;
+    const source = isSnapshotPacket(h) ? 'SNAPSHOT_VITALS' : (d.type || '0x28');
+
     el.innerHTML = `
       <div class="metric-row">
         <span class="metric-name">&#x2764;&#xFE0F; Heart Rate</span>
-        <span><span class="metric-val" style="color:#ff6b8a">${d.heartRate || '—'}</span><span class="metric-unit">bpm</span></span>
+        <span>${fmtVal(d.heartRate, '#ff6b8a', false)}<span class="metric-unit">bpm</span></span>
       </div>
       <div class="metric-row">
         <span class="metric-name">&#x1F4A8; SpO2</span>
-        <span><span class="metric-val" style="color:var(--accent2)">${d.spo2 || '—'}</span><span class="metric-unit">%</span></span>
+        <span>${fmtVal(d.spo2, 'var(--accent2)', false)}<span class="metric-unit">%</span></span>
       </div>
       <div class="metric-row">
         <span class="metric-name">&#x1F321;&#xFE0F; Temperature</span>
-        <span><span class="metric-val" style="color:var(--warn)">${d.temperature || '—'}</span><span class="metric-unit">°C</span></span>
+        <span>${fmtVal(d.temperature, 'var(--warn)', false)}<span class="metric-unit">°C</span></span>
       </div>
       <div class="metric-row">
         <span class="metric-name">&#x1FA78; Blood Pressure</span>
-        <span><span class="metric-val" style="color:#c084fc;font-size:16px">${bpStr}</span><span class="metric-unit">mmHg</span></span>
+        <span>${bpDisplay}<span class="metric-unit">mmHg</span></span>
       </div>
       <div class="metric-row">
         <span class="metric-name">&#x1F9E0; HRV</span>
-        <span><span class="metric-val" style="color:#38bdf8">${d.hrv || '—'}</span><span class="metric-unit">ms</span></span>
+        <span>${fmtVal(d.hrv, '#38bdf8', stale.has('hrv'))}<span class="metric-unit">ms</span></span>
       </div>
       <div class="metric-row">
         <span class="metric-name">&#x26A1; Fadiga</span>
-        <span><span class="metric-val">${d.fatigue || '—'}</span></span>
+        <span>${fmtVal(d.fatigue, null, stale.has('fatigue'))}</span>
       </div>
       <div class="metric-row">
-        <span class="metric-name">Modo</span>
-        <span class="badge badge-health">${d.measurementMode || '—'}</span>
+        <span class="metric-name">Fonte</span>
+        <span class="badge badge-health">${source}</span>
       </div>
+      ${modeStr ? `<div class="metric-row"><span class="metric-name">Modo</span><span class="badge badge-health">${modeStr}</span></div>` : ''}
       <div class="panel-ts">${relTime(field(h, 'createdAt', 'created_at'))}</div>
     `;
   }

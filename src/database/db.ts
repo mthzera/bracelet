@@ -33,6 +33,12 @@ async function migrate(client: PoolClient): Promise<void> {
     ADD COLUMN IF NOT EXISTS ingestion_batch_id TEXT;
   `);
 
+  // Payload bruto do SNAPSHOT_VITALS para auditoria (metrics, sources, sampleCounts, etc.).
+  await client.query(`
+    ALTER TABLE packets
+    ADD COLUMN IF NOT EXISTS raw_snapshot JSONB;
+  `);
+
   await client.query(`CREATE INDEX IF NOT EXISTS idx_packets_device_mac ON packets(device_mac);`);
   await client.query(`CREATE INDEX IF NOT EXISTS idx_packets_created_at ON packets(created_at);`);
   await client.query(
