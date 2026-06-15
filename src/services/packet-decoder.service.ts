@@ -86,6 +86,18 @@ export type DecodedRaw = {
   bytesReceived: number;
 };
 
+/** Vitais consolidados enviados pelo ESP32 como SNAPSHOT_VITALS. */
+export type DecodedSnapshot = {
+  type: "snapshot";
+  heartRate: number | null;
+  spo2: number | null;
+  temperature: number | null;
+  hrv: number | null;
+  fatigue: number | null;
+  systolicPressure: number | null;
+  diastolicPressure: number | null;
+};
+
 export type DecodedPacket =
   | DecodedBattery
   | DecodedMac
@@ -95,6 +107,7 @@ export type DecodedPacket =
   | DecodedRealtime
   | DecodedSleep
   | DecodedSport
+  | DecodedSnapshot
   | DecodedRaw;
 
 export type HealthMeasurementKind = "hrv" | "heartRate" | "spo2" | "temperature";
@@ -486,6 +499,28 @@ function decodeRealtime(bytes: number[]): DecodedRealtime {
     spo2: bytes.length >= 25 ? (bytes[24] ?? 0) : 0,
   };
 }
+
+export function normalizePacketType(type: string): string {
+  const trimmed = type.trim();
+  if (trimmed.toLowerCase().startsWith("0x")) return trimmed.toLowerCase();
+  return trimmed.toUpperCase();
+}
+
+export function crcApplies(packetType: string): boolean {
+  try {
+    return !skipsCrcValidation(parsePacketType(packetType));
+  } catch {
+    return false;
+  }
+}
+
+export function isValidHeartRate(v: number): boolean { return v >= 35 && v <= 220; }
+export function isValidSpo2(v: number): boolean { return v >= 50 && v <= 100; }
+export function isValidTemperature(v: number): boolean { return v >= 30 && v <= 43; }
+export function isValidHrv(v: number): boolean { return v >= 1 && v <= 200; }
+export function isValidFatigue(v: number): boolean { return v >= 1 && v <= 100; }
+export function isValidSystolic(v: number): boolean { return v >= 70 && v <= 220; }
+export function isValidDiastolic(v: number): boolean { return v >= 40 && v <= 140; }
 
 export function decodePacket(packetType: string, rawHex: string): {
   bytes: number[];

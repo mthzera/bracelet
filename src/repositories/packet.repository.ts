@@ -16,6 +16,7 @@ export type SavePacketInput = {
   decoded?: DecodedPacket;
   decodeError?: string;
   receivedAtMs?: number;
+  ingestionBatchId?: string;
 };
 
 export type SavedPacket = {
@@ -30,6 +31,7 @@ export type SavedPacket = {
   mergedHealth?: DecodedHealth | null;
   decodeError: string | null;
   createdAt: string;
+  ingestionBatchId?: string | null;
 };
 
 const HEALTH_MERGE_WINDOW_MS = 5 * 60 * 1000;
@@ -45,6 +47,7 @@ type PacketRow = {
   decoded: DecodedPacket | null;
   decode_error: string | null;
   created_at: Date;
+  ingestion_batch_id: string | null;
 };
 
 function isHealthDecoded(
@@ -111,6 +114,7 @@ function rowToSavedPacket(row: PacketRow): SavedPacket {
     decoded: row.decoded,
     decodeError: row.decode_error,
     createdAt: row.created_at.toISOString(),
+    ingestionBatchId: row.ingestion_batch_id,
   };
 }
 
@@ -140,10 +144,11 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
         crc_valid,
         decoded,
         decode_error,
-        created_at
+        created_at,
+        ingestion_batch_id
       )
-      VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, COALESCE($9::timestamptz, now()))
-      RETURNING id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at
+      VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, COALESCE($9::timestamptz, now()), $10)
+      RETURNING id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at, ingestion_batch_id
     `,
     [
       input.payload.deviceMac,
@@ -155,6 +160,7 @@ export async function savePacket(input: SavePacketInput): Promise<SavedPacket> {
       decodedJson,
       input.decodeError ?? null,
       createdAt,
+      input.ingestionBatchId ?? null,
     ],
   );
 
