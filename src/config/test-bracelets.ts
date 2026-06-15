@@ -7,6 +7,7 @@ export type PatientInfo = {
   patientName: string;
   age: number;
   email: string;
+  leito?: string;
 };
 
 export type TestBracelet = {
@@ -17,10 +18,10 @@ export type TestBracelet = {
 
 /** Nomes para dropdown no Swagger (GET /bracelets/reports/vitals). */
 export const REPORT_PATIENT_NAMES = [
-  "Ana Clara",
-  "Carlos",
-  "Bárbara Mascarenhas",
-  "Daniela",
+  "Matheus dev",
+  "Jurandir",
+  "Anderson",
+  "Luciene",
 ] as const;
 
 export function findBraceletByPatientName(name: string): TestBracelet | undefined {
@@ -34,9 +35,10 @@ export const TEST_BRACELETS: TestBracelet[] = [
     label: "Bracelet 1",
     patient: {
       patientId: "P001",
-      patientName: "Ana Clara",
+      patientName: "Matheus dev",
       age: 22,
       email: "Ana.trindade@anery.com.br",
+      leito: "Leito 0",
     },
   },
   {
@@ -44,9 +46,10 @@ export const TEST_BRACELETS: TestBracelet[] = [
     label: "Bracelet 2",
     patient: {
       patientId: "P002",
-      patientName: "Carlos",
+      patientName: "Jurandir",
       age: 40,
       email: "carlos.mozer@pcpsaude.com.br",
+      leito: "Leito 215",
     },
   },
   {
@@ -54,9 +57,10 @@ export const TEST_BRACELETS: TestBracelet[] = [
     label: "Bracelet 3",
     patient: {
       patientId: "P003",
-      patientName: "Bárbara Mascarenhas",
+      patientName: "Anderson",
       age: 24,
       email: "Escala@anery.com.br",
+      leito: "Leito 101",
     },
   },
   {
@@ -64,9 +68,10 @@ export const TEST_BRACELETS: TestBracelet[] = [
     label: "Bracelet 4",
     patient: {
       patientId: "P004",
-      patientName: "Daniela",
+      patientName: "Luciene",
       age: 20,
       email: "Daniela.silva@anery.com.br",
+      leito: "Leito 214",
     },
   },
 ];

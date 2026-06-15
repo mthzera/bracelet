@@ -6,6 +6,7 @@ const patientInfoSchema = {
     patientName: { type: "string", example: "Ana Clara" },
     age: { type: "integer", example: 22 },
     email: { type: "string", example: "Ana.trindade@anery.com.br" },
+    leito: { type: "string", example: "Leito 101", nullable: true },
   },
 } as const;
 
