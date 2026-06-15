@@ -1,24 +1,36 @@
 import { z } from "zod";
+import { normalizePacketType } from "../services/packet-decoder.service.js";
 
 const macAddressRegex = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
 
-const packetTypeRegex = /^0x[0-9A-Fa-f]{1,2}$/i;
+// Aceita prefixo "0x" ou "0X" (normalizado depois via transform) OU o snapshot
+// consolidado gerado pelo ESP32 ("SNAPSHOT_VITALS"), que vem só com `metrics`.
+const packetTypeRegex = /^(0[xX][0-9A-Fa-f]{1,2}|SNAPSHOT_VITALS)$/;
 
 const rawHexRegex = /^([0-9A-Fa-f]{2}\s*)+$/;
 
+/** SNAPSHOT_VITALS não tem rawHex; carrega a leitura consolidada em `metrics`. */
+function isSnapshotVitalsType(packetType: string): boolean {
+  return packetType.trim() === "SNAPSHOT_VITALS";
+}
+
+/**
+ * Métricas opcionais já interpretadas pelo ESP32 (espelham o rawHex do 0x28).
+ * São SEMPRE opcionais: históricos (0x54/0x56/0x60/0x62/0x65/0x66) vêm sem metrics.
+ * A API decodifica o rawHex de qualquer jeito; metrics só complementa/preenche lacunas.
+ * `passthrough` mantém campos extras e tolera firmwares com nomes legados.
+ */
 export const metricsSchema = z
   .object({
-    mode: z.string().min(1),
-    type: z.string().min(1),
-    modo_solicitado: z.string().min(1),
-    heartRate: z.number().int().nonnegative(),
-    spO2: z.number().int().nonnegative(),
-    hrv: z.number().int().nonnegative(),
-    fatigue: z.number().int().nonnegative(),
-    bloodPressure: z.string().min(1),
-    temperature: z.number().nonnegative(),
+    measurementMode: z.number().int().optional(),
+    bpm: z.number().int().optional(),
+    spo2: z.number().int().optional(),
+    temperature: z.number().optional(),
+    hrv: z.number().int().optional(),
+    fatigue: z.number().int().optional(),
+    bloodPressureSystolic: z.number().int().optional(),
+    bloodPressureDiastolic: z.number().int().optional(),
   })
-  .partial()
   .passthrough()
   .optional();
 
@@ -28,48 +40,52 @@ const packetItemSchema = z
   .object({
     packetType: z
       .string()
-      .regex(packetTypeRegex, 'packetType must be a hex literal (e.g. "0x28")'),
+      .regex(packetTypeRegex, 'packetType must be a hex literal (e.g. "0x28") or "SNAPSHOT_VITALS"')
+      .transform(normalizePacketType),
+    // Opcional só para SNAPSHOT_VITALS (que vem em `metrics`); obrigatório p/ raws.
     rawHex: z
       .string()
-      .min(1)
-      .regex(rawHexRegex, "rawHex must be space-separated hex byte pairs"),
+      .regex(rawHexRegex, "rawHex must be space-separated hex byte pairs")
+      .optional(),
     receivedAtMs: z.number().int().nonnegative(),
     metrics: metricsSchema,
   })
-  .superRefine((data, ctx) => {
-    if (data.packetType.toLowerCase() !== "0x28" || !data.metrics) return;
-
-    const { heartRate, spO2, temperature } = data.metrics;
-    if (heartRate === undefined || heartRate < 1) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "metrics.heartRate (bpm) is required and must be >= 1",
-        path: ["metrics", "heartRate"],
-      });
+  .passthrough()
+  .superRefine((item, ctx) => {
+    if (isSnapshotVitalsType(item.packetType)) {
+      if (!item.metrics) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["metrics"],
+          message: "SNAPSHOT_VITALS requires a metrics object",
+        });
+      }
+      return;
     }
-    if (spO2 === undefined || spO2 < 1) {
+    if (!item.rawHex || item.rawHex.length === 0) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "metrics.spO2 (%) is required and must be >= 1",
-        path: ["metrics", "spO2"],
-      });
-    }
-    if (temperature === undefined || temperature <= 0) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "metrics.temperature (°C) is required and must be > 0",
-        path: ["metrics", "temperature"],
+        path: ["rawHex"],
+        message: "rawHex is required for raw packets",
       });
     }
   });
 
-export const packetBatchPayloadSchema = z.object({
-  deviceMac: z
-    .string()
-    .regex(macAddressRegex, "deviceMac must be a valid MAC address (AA:BB:CC:DD:EE:FF)"),
-  source: z.string().min(1),
-  packets: z.array(packetItemSchema).min(1).max(50),
-});
+export const packetBatchPayloadSchema = z
+  .object({
+    deviceMac: z
+      .string()
+      .regex(macAddressRegex, "deviceMac must be a valid MAC address (AA:BB:CC:DD:EE:FF)"),
+    source: z.string().min(1).optional().default("ESP32"),
+    /**
+     * Identificador do ciclo de coleta. Opcional: se ausente, a API gera um no POST
+     * e o aplica a todos os pacotes do mesmo batch. Aceita ingestionBatchId ou cycleId.
+     */
+    ingestionBatchId: z.string().min(1).max(128).optional(),
+    cycleId: z.string().min(1).max(128).optional(),
+    packets: z.array(packetItemSchema).min(1).max(50),
+  })
+  .passthrough();
 
 export type PacketBatchPayload = z.infer<typeof packetBatchPayloadSchema>;
 export type PacketItem = z.infer<typeof packetItemSchema>;

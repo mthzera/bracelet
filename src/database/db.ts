@@ -26,8 +26,18 @@ async function migrate(client: PoolClient): Promise<void> {
     );
   `);
 
+  // Identificador de ciclo/ingestão: todos os pacotes de um mesmo POST batch o compartilham.
+  // Registros antigos ficam NULL e são agrupados por janela de tempo no consolidador.
+  await client.query(`
+    ALTER TABLE packets
+    ADD COLUMN IF NOT EXISTS ingestion_batch_id TEXT;
+  `);
+
   await client.query(`CREATE INDEX IF NOT EXISTS idx_packets_device_mac ON packets(device_mac);`);
   await client.query(`CREATE INDEX IF NOT EXISTS idx_packets_created_at ON packets(created_at);`);
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_packets_ingestion_batch_id ON packets(ingestion_batch_id);`,
+  );
 
   await client.query(`
     CREATE TABLE IF NOT EXISTS vital_assessments (

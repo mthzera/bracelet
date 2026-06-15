@@ -10,6 +10,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "verify:render": "npm ci && npm run build"
   },
   "keywords": [

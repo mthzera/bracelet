@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyBaseLogger } from "fastify";
+import { randomUUID } from "node:crypto";
 import { ZodError } from "zod";
 import {
   getMergedHealthForDevice,
@@ -17,6 +18,7 @@ import {
 } from "../schemas/report.swagger.js";
 import {
   getPacketRouteSchema,
+  getPacketSummaryRouteSchema,
   postPacketRouteSchema,
 } from "../schemas/packet.swagger.js";
 import {
@@ -27,7 +29,7 @@ import {
 } from "../services/device-registry.service.js";
 import {
   processClinicalAlertsFromDecoded,
-  processClinicalAlertsAfterHealthPacket,
+  processClinicalAlertsFromRecentPackets,
 } from "../services/clinical-alerts.processor.js";
 import {
   decodePacket,
@@ -36,12 +38,9 @@ import {
   type DecodedHealth,
   type DecodedPacket,
 } from "../services/packet-decoder.service.js";
-import { vitalsFromDecodedHealth } from "../services/clinical-alerts.service.js";
 import {
   enrichDecodedHealthFromMetrics,
-  hasMandatoryVitals,
-  mandatoryVitalsFromDecoded,
-  MANDATORY_VITALS_ERROR,
+  hasAnyHealthReading,
 } from "../services/vitals-validation.service.js";
 import { DEFAULT_VITALS_REPORT_WINDOW_MINUTES } from "../config/teams-report.config.js";
 import {
@@ -49,6 +48,16 @@ import {
   buildVitalsReportPngByPatientName,
   buildVitalsReportByPatientName,
 } from "../services/teams-report.service.js";
+import {
+  buildCycleSummaries,
+  buildSnapshotsFromPackets,
+} from "../services/measurement-snapshot.service.js";
+import {
+  applySnapshotVitals,
+  buildConsolidatedSnapshot,
+  SNAPSHOT_VITALS_TYPE,
+  type InboundPacket,
+} from "../services/vitals-consolidation.service.js";
 
 function resolveReportWindowMinutes(value: number | undefined): number {
   return typeof value === "number" && Number.isFinite(value)
@@ -81,23 +90,54 @@ async function processInboundPacket(
   payload: PacketPayload,
   item: PacketItem,
   log: FastifyBaseLogger,
+  ingestionBatchId: string,
 ): Promise<PacketProcessResult> {
   const base = {
     packetType: item.packetType,
     receivedAtMs: item.receivedAtMs,
   };
 
-  try {
-    let { bytes, decoded, crcValid } = decodePacket(item.packetType, item.rawHex);
+  // SNAPSHOT_VITALS não tem rawHex: persiste a leitura consolidada (vinda em
+  // `metrics`) como debug/histórico. Não passa pelo decoder de hex.
+  if (item.packetType === SNAPSHOT_VITALS_TYPE) {
+    const vitals = applySnapshotVitals({ packetType: item.packetType, metrics: item.metrics });
+    const decoded: DecodedPacket = { type: "snapshot", ...vitals };
+    const saved = await savePacket({
+      payload,
+      crcValid: false,
+      decoded,
+      receivedAtMs: item.receivedAtMs,
+      ingestionBatchId,
+    });
+    log.info(
+      { id: saved.id, deviceMac: payload.deviceMac, vitals },
+      "SNAPSHOT_VITALS saved",
+    );
+    return {
+      ok: true,
+      id: saved.id,
+      ...base,
+      bytes: [],
+      crcValid: false,
+      decoded,
+      mergedHealth: null,
+      savedAt: saved.createdAt,
+    };
+  }
 
+  try {
+    let { bytes, decoded, crcValid } = decodePacket(item.packetType, item.rawHex ?? "");
+
+    // 0x28 é o "active measurement packet": nunca descartamos por vir com campos
+    // zerados — o raw é sempre persistido (rule 1). Só registramos se há alguma
+    // leitura útil para decidir se vale acionar a avaliação clínica.
+    let healthHasReading = false;
     if (decoded.type === "0x28") {
       let healthDecoded = decoded;
       if (item.metrics) {
         healthDecoded = enrichDecodedHealthFromMetrics(healthDecoded, item.metrics);
       }
-      if (!hasMandatoryVitals(mandatoryVitalsFromDecoded(healthDecoded))) {
-        throw new PacketDecoderError(MANDATORY_VITALS_ERROR);
-      }
+      healthHasReading = hasAnyHealthReading(healthDecoded);
       decoded = healthDecoded;
     }
 
@@ -107,6 +147,7 @@ async function processInboundPacket(
       crcValid,
       decoded,
       receivedAtMs: item.receivedAtMs,
+      ingestionBatchId,
     });
 
     const isHealthPacket = decoded.type === "0x28" || decoded.type === "0x56";
@@ -114,26 +155,49 @@ async function processInboundPacket(
       ? await getMergedHealthForDevice(payload.deviceMac)
       : null;
 
-    log.info(
-      {
-        id: saved.id,
-        deviceMac: payload.deviceMac,
-        packetType: item.packetType,
-        crcValid,
-        decoded,
-      },
-      "Bracelet packet decoded and saved",
-    );
+    if (decoded.type === "0x28") {
+      log.info(
+        {
+          id: saved.id,
+          deviceMac: payload.deviceMac,
+          mode: decoded.measurementMode,
+          heartRate: decoded.heartRate,
+          spo2: decoded.spo2,
+          hrv: decoded.hrv,
+          temperature: decoded.temperature,
+        },
+        "0x28 vital saved",
+      );
+    } else if (decoded.type === "0x56") {
+      log.info(
+        {
+          id: saved.id,
+          deviceMac: payload.deviceMac,
+          hrv: decoded.hrv,
+          fatigue: decoded.fatigue,
+        },
+        "0x56 HRV saved",
+      );
+    } else if (decoded.type === "0x53") {
+      log.info(
+        {
+          id: saved.id,
+          deviceMac: payload.deviceMac,
+          date: decoded.date,
+          sleepMinutes: decoded.sleepMinutes,
+        },
+        "0x53 sleep saved",
+      );
+    }
 
     try {
-      if (decoded.type === "0x28") {
-        await processClinicalAlertsAfterHealthPacket({
-          deviceMac: payload.deviceMac,
-          source: payload.source,
-          packetId: saved.id,
-          measuredAt: saved.createdAt,
-          vitals: vitalsFromDecodedHealth(decoded),
-        });
+      if (decoded.type === "0x28" && healthHasReading) {
+        await processClinicalAlertsFromRecentPackets(
+          payload.deviceMac,
+          payload.source,
+          saved.id,
+          saved.createdAt,
+        );
       } else if (decoded.type === "0x56") {
         await processClinicalAlertsFromDecoded(
           payload.deviceMac,
@@ -172,7 +236,7 @@ async function processInboundPacket(
 
       let bytes: number[] | undefined;
       try {
-        bytes = rawHexToBytes(item.rawHex);
+        bytes = rawHexToBytes(item.rawHex ?? "");
       } catch {
         bytes = undefined;
       }
@@ -183,17 +247,8 @@ async function processInboundPacket(
         crcValid: false,
         decodeError: err.message,
         receivedAtMs: item.receivedAtMs,
+        ingestionBatchId,
       });
-
-      log.info(
-        {
-          id: saved.id,
-          deviceMac: payload.deviceMac,
-          packetType: item.packetType,
-          error: err.message,
-        },
-        "Bracelet packet saved with decode error",
-      );
 
       return {
         ok: false,
@@ -280,19 +335,67 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
+  async function buildConsolidatedCycles(limit: number, deviceMac?: string) {
+    // Cada ciclo agrega muitos pacotes crus; busca um múltiplo do limite pedido.
+    const rawLimit = Math.min(Math.max(limit * 80, 400), 2000);
+    const packets = await listPackets(rawLimit, deviceMac);
+    return buildCycleSummaries(packets, limit).map((cycle) => ({
+      ...cycle,
+      patient: resolvePatientForMac(cycle.deviceMac),
+    }));
+  }
+
   app.get("/bracelets/packets", { schema: getPacketRouteSchema }, async (request, reply) => {
-    const query = request.query as { limit?: number; deviceMac?: string };
-    const limit = typeof query.limit === "number" && Number.isFinite(query.limit) ? query.limit : 50;
+    const query = request.query as {
+      limit?: number;
+      deviceMac?: string;
+      view?: string;
+      group?: string | boolean;
+    };
+    const view = query.view === "raw" ? "raw" : "snapshots";
+    const grouped = query.group === true || query.group === "true";
+    const limit =
+      typeof query.limit === "number" && Number.isFinite(query.limit)
+        ? query.limit
+        : view === "snapshots"
+          ? 30
+          : 50;
     const deviceMac = typeof query.deviceMac === "string" ? query.deviceMac : undefined;
 
-    request.log.info({ limit, deviceMac }, "Listing bracelet packets");
+    if (view === "raw") {
+      const packets = (await listPackets(limit, deviceMac)).map(enrichWithPatient);
+      return reply.status(200).send({ view: "raw", packets });
+    }
 
-    const packets = (await listPackets(limit, deviceMac)).map(enrichWithPatient);
+    // group=true devolve o formato consolidado (items) no mesmo endpoint.
+    if (grouped) {
+      const items = await buildConsolidatedCycles(limit, deviceMac);
+      return reply.status(200).send({ view: "consolidated", items });
+    }
 
-    request.log.info({ limit, deviceMac, count: packets.length }, "Listed bracelet packets");
+    const rawLimit = Math.min(Math.max(limit * 80, 400), 2000);
+    const packets = await listPackets(rawLimit, deviceMac);
+    const snapshots = buildSnapshotsFromPackets(packets, limit).map((snapshot) => ({
+      ...snapshot,
+      patient: resolvePatientForMac(snapshot.deviceMac),
+    }));
 
-    return reply.status(200).send({ packets });
+    return reply.status(200).send({ view: "snapshots", snapshots });
   });
+
+  app.get(
+    "/bracelets/packets/summary",
+    { schema: getPacketSummaryRouteSchema },
+    async (request, reply) => {
+      const query = request.query as { limit?: number; deviceMac?: string };
+      const limit =
+        typeof query.limit === "number" && Number.isFinite(query.limit) ? query.limit : 30;
+      const deviceMac = typeof query.deviceMac === "string" ? query.deviceMac : undefined;
+
+      const items = await buildConsolidatedCycles(limit, deviceMac);
+      return reply.status(200).send({ items });
+    },
+  );
 
   app.post("/bracelets/packets", { schema: postPacketRouteSchema }, async (request, reply) => {
     let batch;
@@ -310,14 +413,10 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       throw err;
     }
 
-    request.log.info(
-      {
-        deviceMac: batch.deviceMac,
-        source: batch.source,
-        count: batch.packets.length,
-      },
-      "Received bracelet packet batch",
-    );
+    // Identificador de ciclo: usa o do body se enviado, senão gera um por request.
+    // Todos os pacotes deste batch compartilham o mesmo ingestionBatchId.
+    const ingestionBatchId =
+      batch.ingestionBatchId?.trim() || batch.cycleId?.trim() || randomUUID();
 
     const results: PacketProcessResult[] = [];
 
@@ -326,29 +425,75 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
         deviceMac: batch.deviceMac,
         source: batch.source,
         packetType: item.packetType,
-        rawHex: item.rawHex,
+        rawHex: item.rawHex ?? "",
         metrics: item.metrics,
       };
 
-      results.push(await processInboundPacket(payload, item, request.log));
+      results.push(await processInboundPacket(payload, item, request.log, ingestionBatchId));
     }
 
     const okCount = results.filter((result) => result.ok).length;
-    request.log.info(
-      {
-        deviceMac: batch.deviceMac,
-        total: results.length,
-        ok: okCount,
-        failed: results.length - okCount,
-      },
-      "Bracelet packet batch processed",
+    const failedCount = results.length - okCount;
+    if (failedCount > 0 || okCount > 0) {
+      request.log.info(
+        {
+          deviceMac: batch.deviceMac,
+          total: results.length,
+          ok: okCount,
+          failed: failedCount,
+        },
+        failedCount > 0 ? "Batch from ESP32 (with errors)" : "Batch from ESP32",
+      );
+    }
+
+    // Consolida o body INTEIRO em UMA leitura principal confiável (rules 1, 2, 8):
+    // SNAPSHOT_VITALS é principal quando presente; senão funde os raws com
+    // prioridade de fonte; zero/inválido nunca sobrescreve valor válido.
+    const inbound: InboundPacket[] = batch.packets.map((item) => ({
+      packetType: item.packetType,
+      rawHex: item.rawHex,
+      metrics: item.metrics,
+    }));
+    const consolidated = buildConsolidatedSnapshot(inbound);
+
+    const measuredAt = results.reduce(
+      (latest, result) => (result.savedAt > latest ? result.savedAt : latest),
+      results[0]?.savedAt ?? new Date().toISOString(),
     );
+
+    const snapshot = {
+      deviceMac: batch.deviceMac,
+      source: batch.source,
+      measuredAt,
+      vitals: consolidated.vitals,
+      sources: consolidated.sources,
+      quality: consolidated.quality,
+      patient: resolvePatientForMac(batch.deviceMac),
+    };
+
+    if (!consolidated.quality.snapshotComplete) {
+      request.log.warn(
+        { deviceMac: batch.deviceMac, vitals: consolidated.vitals, sources: consolidated.sources },
+        "Consolidated snapshot incomplete",
+      );
+    }
 
     return reply.status(200).send({
       deviceMac: batch.deviceMac,
       source: batch.source,
+      ingestionBatchId,
       patient: resolvePatientForMac(batch.deviceMac),
-      results,
+      snapshot,
+      usedSnapshotVitals: consolidated.usedSnapshotVitals,
+      ignoredPartialSnapshots: consolidated.stats.ignoredPartialSnapshots,
+      stats: {
+        total: results.length,
+        ok: okCount,
+        failed: failedCount,
+        rawSaved: okCount,
+        invalidIgnored: consolidated.stats.invalidIgnored,
+        snapshotComplete: consolidated.quality.snapshotComplete,
+      },
     });
   });
 }
