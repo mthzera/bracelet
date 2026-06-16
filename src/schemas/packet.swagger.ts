@@ -317,7 +317,6 @@ export const getPacketSummaryRouteSchema = {
 
 const listPacketsResponseSchema = {
   type: "object",
-  required: ["view"],
   properties: {
     view: { type: "string", enum: ["snapshots", "raw", "consolidated"] },
     snapshots: {
@@ -333,6 +332,7 @@ const listPacketsResponseSchema = {
       items: savedPacketSchema,
     },
   },
+  // Legacy default: { packets } only. view is present for snapshots/raw/consolidated.
 };
 
 export const validationErrorResponseSchema = {

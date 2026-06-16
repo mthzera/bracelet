@@ -9,6 +9,8 @@
 #include <BLEAddress.h>
 
 #include "esp_sleep.h"
+#include <esp_system.h>
+#include "soc/rtc_cntl_reg.h"
 
 // ============================================================
 // CONFIG
@@ -51,6 +53,7 @@ RTC_DATA_ATTR uint8_t lastAcceptedDiastolic = 0;
 RTC_DATA_ATTR bool hasLastAcceptedHrv = false;
 RTC_DATA_ATTR bool hasLastAcceptedFatigue = false;
 RTC_DATA_ATTR bool hasLastAcceptedBp = false;
+RTC_DATA_ATTR uint8_t brownoutSkipBoot0Count = 0;
 
 // ============================================================
 // MODO RÁPIDO PARA TESTE
@@ -59,6 +62,9 @@ RTC_DATA_ATTR bool hasLastAcceptedBp = false;
 // false = produção (~15 min entre coletas, lógica app-like 2x/hora)
 
 const bool FAST_TEST_MODE = true;
+
+// Em teste rápido, boot 0 não liga BLE (só dorme e vai para coleta).
+const bool FAST_TEST_SKIP_BOOT0_BLE = FAST_TEST_MODE;
 
 // Intervalo entre snapshots enviados para a API.
 const uint64_t COLLECT_SLEEP_SECONDS = FAST_TEST_MODE ? 180ULL : 900ULL;
@@ -1517,11 +1523,23 @@ void notifyCallback(
 // CONNECT / DISCONNECT BLE
 // ============================================================
 
+void prepareForBleRadio() {
+  WiFi.mode(WIFI_OFF);
+  setCpuFrequencyMhz(80);
+  delay(800);
+  // Pico de corrente do rádio BLE derruba VCC em cabos USB fracos — desliga BOD durante BLE.
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  Serial.println("[PWR] CPU 80MHz, brownout off, aguardando estabilizar...");
+}
+
 bool connectBle() {
   Serial.println("[BLE] Iniciando...");
   printHeap("antes BLE");
 
+  prepareForBleRadio();
+
   BLEDevice::init("ESP32_ACTIVE_FRESH");
+  BLEDevice::setPower(ESP_PWR_LVL_N9);
 
   client = BLEDevice::createClient();
 
@@ -1595,6 +1613,16 @@ void bleOff() {
 
 void configureAutoThenSleep() {
   Serial.println("[MODE] BOOT 0 - CONFIGURAR AUTOMÁTICO APP-LIKE");
+
+  if (FAST_TEST_SKIP_BOOT0_BLE) {
+    Serial.println("[MODE] FAST TEST: boot 0 sem BLE (pulseira já configurada pelo app).");
+    autoAlreadyConfigured = true;
+    Serial.print("[AUTO] Dormindo ");
+    Serial.print(BOOT0_FIRST_WAIT_SECONDS);
+    Serial.println("s e indo direto para coleta (boot 1).");
+    goToDeepSleep(BOOT0_FIRST_WAIT_SECONDS, 1);
+    return;
+  }
 
   if (!AUTO_CONFIG_ENABLED && !AUTO_DISABLE_ON_BOOT0) {
     Serial.println("[AUTO] Ignorado. Indo direto para coleta.");
@@ -2162,7 +2190,15 @@ void sendFileThenSleep() {
 
   if (sentOk) {
     Serial.println("[SLEEP] Envio OK. Voltando para BOOT 0 para iniciar próximo ciclo remoto.");
-    goToDeepSleep(SHORT_SLEEP_SECONDS, 0);
+    if (FAST_TEST_SKIP_BOOT0_BLE) {
+      // Em teste rápido, pula boot 0 e vai direto para a próxima coleta após intervalo.
+      Serial.print("[SLEEP] FAST TEST: dormindo ");
+      Serial.print(COLLECT_SLEEP_SECONDS);
+      Serial.println("s e indo para boot 1.");
+      goToDeepSleep(COLLECT_SLEEP_SECONDS, 1);
+    } else {
+      goToDeepSleep(SHORT_SLEEP_SECONDS, 0);
+    }
   }
 
   Serial.println("[SLEEP] Envio falhou. Tentando reenviar no BOOT 2.");
@@ -2178,6 +2214,16 @@ void setup() {
   delay(1000);
 
   bootCounter++;
+
+  esp_reset_reason_t resetReason = esp_reset_reason();
+  if (resetReason == ESP_RST_BROWNOUT) {
+    brownoutSkipBoot0Count++;
+    Serial.print("[BOD] Brownout detectado (#");
+    Serial.print(brownoutSkipBoot0Count);
+    Serial.println("). Verifique cabo USB/fonte 5V ≥500mA.");
+  } else if (resetReason != ESP_RST_DEEPSLEEP) {
+    brownoutSkipBoot0Count = 0;
+  }
 
   Serial.println();
   Serial.println("========================================");
@@ -2198,6 +2244,14 @@ void setup() {
   if (!initStorage()) {
     Serial.println("[FATAL] SPIFFS falhou. Dormindo curto.");
     goToDeepSleep(SHORT_SLEEP_SECONDS, bootStep);
+  }
+
+  // Se brownout repetiu no boot 0, pula config BLE e vai coletar.
+  if (bootStep == 0 && brownoutSkipBoot0Count >= 2) {
+    Serial.println("[BOD] Boot 0 pulado após brownouts — indo para boot 1.");
+    autoAlreadyConfigured = true;
+    brownoutSkipBoot0Count = 0;
+    goToDeepSleep(SHORT_SLEEP_SECONDS, 1);
   }
 
   if (bootStep == 0) {
