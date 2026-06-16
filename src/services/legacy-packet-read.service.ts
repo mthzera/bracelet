@@ -46,6 +46,11 @@ function syntheticSleepPacket(
     date: snapshot.sleepDate ?? "",
     time: snapshot.sleepTime ?? "",
     sleepMinutes: snapshot.sleepMinutes,
+    endTime: snapshot.sleepEndTime ?? undefined,
+    inBedMinutes: snapshot.sleepInBedMinutes ?? undefined,
+    quality: snapshot.sleepQuality ?? undefined,
+    segments: snapshot.sleepSegments,
+    totals: snapshot.sleepTotals,
   };
 
   return {

@@ -6,17 +6,42 @@ import {
   type DecodedPacket,
   type DecodedSnapshot,
 } from "./packet-decoder.service.js";
+import { sleepDetailFromMetrics } from "./sleep-parser.service.js";
 
-export function sleepFieldsFromMetrics(
-  metrics: PacketMetrics | undefined,
-): Pick<DecodedSnapshot, "sleepMinutes" | "sleepDate" | "sleepTime" | "sleepRecordId"> {
+export type SleepSnapshotFields = Pick<
+  DecodedSnapshot,
+  | "sleepMinutes"
+  | "sleepDate"
+  | "sleepTime"
+  | "sleepRecordId"
+  | "sleepEndTime"
+  | "sleepInBedMinutes"
+  | "sleepQuality"
+  | "sleepSegments"
+  | "sleepTotals"
+>;
+
+export function sleepFieldsFromMetrics(metrics: PacketMetrics | undefined): SleepSnapshotFields {
   if (!metrics) return {};
-  const out: Pick<DecodedSnapshot, "sleepMinutes" | "sleepDate" | "sleepTime" | "sleepRecordId"> =
-    {};
+  const out: SleepSnapshotFields = {};
   if (typeof metrics.sleepMinutes === "number") out.sleepMinutes = metrics.sleepMinutes;
   if (typeof metrics.sleepDate === "string") out.sleepDate = metrics.sleepDate;
   if (typeof metrics.sleepTime === "string") out.sleepTime = metrics.sleepTime;
   if (typeof metrics.sleepRecordId === "number") out.sleepRecordId = metrics.sleepRecordId;
+
+  const detail = sleepDetailFromMetrics(metrics as Record<string, unknown>);
+  if (detail) {
+    out.sleepMinutes = detail.sleepMinutes;
+    out.sleepDate = detail.date;
+    out.sleepTime = detail.startTime;
+    out.sleepRecordId = detail.recordId;
+    out.sleepEndTime = detail.endTime;
+    out.sleepInBedMinutes = detail.inBedMinutes;
+    out.sleepQuality = detail.quality;
+    out.sleepSegments = detail.segments;
+    out.sleepTotals = detail.totals;
+  }
+
   return out;
 }
 

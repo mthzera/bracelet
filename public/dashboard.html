@@ -202,6 +202,65 @@
     .badge-mac      { background: #2a1e3a; color: #c084fc; }
     .badge-firmware { background: #1e3a30; color: var(--firmware); }
     .badge-sleep    { background: #22203a; color: var(--sleep); }
+
+    /* ── Sleep (JC Vital style) ── */
+    .sleep-summary {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .sleep-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+    }
+    .sleep-card-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }
+    .sleep-card-value { font-size: 20px; font-weight: 700; color: var(--sleep); margin-top: 4px; }
+    .sleep-window { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+    .sleep-timeline {
+      display: flex;
+      height: 44px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      margin-bottom: 14px;
+    }
+    .sleep-seg { height: 100%; min-width: 2px; }
+    .sleep-seg.awake   { background: #e2e8f0; }
+    .sleep-seg.rem     { background: #c4b5fd; }
+    .sleep-seg.light   { background: #8b5cf6; }
+    .sleep-seg.deep    { background: #5b21b6; }
+    .sleep-seg.nap     { background: #7dd3fc; }
+    .sleep-seg.unknown { background: #475569; }
+    .sleep-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 14px;
+    }
+    .sleep-legend span { display: inline-flex; align-items: center; gap: 5px; }
+    .sleep-legend i {
+      width: 10px; height: 10px; border-radius: 2px; display: inline-block;
+    }
+    .sleep-stage-row { margin-bottom: 10px; }
+    .sleep-stage-head {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      margin-bottom: 4px;
+      color: var(--muted);
+    }
+    .sleep-stage-bar {
+      height: 8px;
+      background: var(--surface2);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .sleep-stage-fill { height: 100%; border-radius: 4px; }
     .badge-sport    { background: #3a1e2e; color: var(--sport); }
     .badge-hrv      { background: #1e2f3a; color: #38bdf8; }
     .badge-history  { background: #2a2a1e; color: #fbbf24; }
@@ -736,11 +795,11 @@
       : '—';
 
     // Sleep
-    const sleepPacket = packets.find(p => p.decoded?.type === '0x53');
+    const sleepPacket = pickSleepPacket();
     const sl = sleepPacket?.decoded;
     if (sl) {
-      document.getElementById('sumSleep').textContent = sl.sleepMinutes + ' min';
-      document.getElementById('sumSleepDate').textContent = sl.date || '';
+      document.getElementById('sumSleep').textContent = fmtSleepDuration(sl.sleepMinutes);
+      document.getElementById('sumSleepDate').textContent = sl.date ? `${sl.date} ${sl.time || ''}` : '';
     } else {
       document.getElementById('sumSleep').textContent = '—';
       document.getElementById('sumSleepDate').textContent = '';
@@ -890,32 +949,84 @@
     `;
   }
 
+  function fmtSleepDuration(min) {
+    const m = min || 0;
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    return `${String(h).padStart(2, '0')}h ${String(mm).padStart(2, '0')}m`;
+  }
+
+  function pickSleepPacket() {
+    const rows = packets.filter(p => p.decoded?.type === '0x53' && (p.decoded.sleepMinutes || 0) > 0);
+    if (!rows.length) return null;
+    return rows.sort((a, b) => (b.decoded.sleepMinutes || 0) - (a.decoded.sleepMinutes || 0))[0];
+  }
+
+  function sleepStageColor(stage) {
+    return ({
+      awake: '#e2e8f0', rem: '#c4b5fd', light: '#8b5cf6', deep: '#5b21b6', nap: '#7dd3fc', unknown: '#475569',
+    })[stage] || '#475569';
+  }
+
   function renderSleepPanel() {
-    const s = packets.find(p => p.decoded?.type === '0x53');
+    const s = pickSleepPacket();
     const el = document.getElementById('sleepPanel');
     if (!s) { el.innerHTML = '<div class="no-data">Sem dados de sono</div>'; return; }
     const d = s.decoded;
-    const hh = Math.floor((d.sleepMinutes || 0) / 60);
-    const mm = (d.sleepMinutes || 0) % 60;
+    const inBed = d.inBedMinutes || d.sleepMinutes || 0;
+    const segments = Array.isArray(d.segments) && d.segments.length
+      ? d.segments
+      : (d.totals
+        ? Object.entries(d.totals).filter(([, v]) => v > 0).map(([stage, minutes]) => ({ stage, minutes }))
+        : []);
+    const totalSegMin = segments.reduce((acc, seg) => acc + (seg.minutes || 0), 0) || inBed || 1;
+    const timeline = segments.map(seg => {
+      const pct = ((seg.minutes || 0) / totalSegMin) * 100;
+      return `<div class="sleep-seg ${seg.stage || 'unknown'}" style="width:${pct}%" title="${seg.stage}: ${seg.minutes} min"></div>`;
+    }).join('');
+    const stageOrder = ['awake', 'rem', 'light', 'deep', 'nap'];
+    const totals = d.totals || {};
+    const stageRows = stageOrder
+      .filter(stage => (totals[stage] || 0) > 0 || segments.some(seg => seg.stage === stage))
+      .map(stage => {
+        const minutes = totals[stage] || segments.filter(seg => seg.stage === stage).reduce((a, seg) => a + (seg.minutes || 0), 0);
+        const pct = inBed > 0 ? Math.round((minutes / inBed) * 100) : 0;
+        const barPct = Math.min(100, pct);
+        return `
+          <div class="sleep-stage-row">
+            <div class="sleep-stage-head">
+              <span>${stage.toUpperCase()}</span>
+              <span>${pct}% · ${fmtSleepDuration(minutes)}</span>
+            </div>
+            <div class="sleep-stage-bar">
+              <div class="sleep-stage-fill" style="width:${barPct}%;background:${sleepStageColor(stage)}"></div>
+            </div>
+          </div>`;
+      }).join('');
+    const endTime = d.endTime || '—';
     el.innerHTML = `
-      <div class="metric-row">
-        <span class="metric-name">&#x1F4C5; Data</span>
-        <span class="metric-val" style="font-size:15px;color:var(--sleep)">${d.date || '—'}</span>
+      <div class="sleep-summary">
+        <div class="sleep-card">
+          <div class="sleep-card-label">Sono total</div>
+          <div class="sleep-card-value">${fmtSleepDuration(d.sleepMinutes)}</div>
+        </div>
+        <div class="sleep-card">
+          <div class="sleep-card-label">Na cama</div>
+          <div class="sleep-card-value">${fmtSleepDuration(inBed)}</div>
+        </div>
       </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x1F552; Início</span>
-        <span class="metric-val" style="font-size:15px">${d.time || '—'}</span>
+      <div class="sleep-window">${d.date || '—'} · ${d.time || '—'} → ${endTime}</div>
+      ${segments.length ? `<div class="sleep-timeline">${timeline}</div>` : ''}
+      <div class="sleep-legend">
+        <span><i style="background:#7dd3fc"></i>Nap</span>
+        <span><i style="background:#e2e8f0"></i>Acordado</span>
+        <span><i style="background:#c4b5fd"></i>REM</span>
+        <span><i style="background:#8b5cf6"></i>Leve</span>
+        <span><i style="background:#5b21b6"></i>Profundo</span>
       </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x1F4A4; Duração</span>
-        <span>
-          <span class="metric-val" style="color:var(--sleep)">${d.sleepMinutes || 0}</span>
-          <span class="metric-unit">min</span>
-          <span style="color:var(--muted);font-size:12px;margin-left:6px">(${hh}h ${mm}m)</span>
-        </span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x1F4CB; Record ID</span>
+      ${stageRows || '<div class="no-data">Sem estágios detalhados</div>'}
+      <div class="metric-row" style="margin-top:8px">
+        <span class="metric-name">Record ID</span>
         <span class="metric-val" style="font-size:15px">${d.recordId ?? '—'}</span>
       </div>
       <div class="panel-ts">${relTime(field(s, 'createdAt', 'created_at'))}</div>
@@ -999,9 +1110,11 @@
       case '0x18':
         return `HR: <b>${d.heartRate} bpm</b> &nbsp; Passos: <b>${(d.steps || 0).toLocaleString('pt-BR')}</b> &nbsp; Tempo: <b>${d.exerciseTime}s</b>`;
       case '0x53': {
-        const hh = Math.floor((d.sleepMinutes || 0) / 60);
-        const mm = (d.sleepMinutes || 0) % 60;
-        return `Sono: <b>${d.sleepMinutes} min</b> (${hh}h${mm}m) &nbsp; ${d.date || ''}`;
+        const inBed = d.inBedMinutes || d.sleepMinutes || 0;
+        const stages = d.totals
+          ? ` REM ${d.totals.rem || 0}m · Leve ${d.totals.light || 0}m · Prof ${d.totals.deep || 0}m`
+          : '';
+        return `Sono: <b>${fmtSleepDuration(d.sleepMinutes)}</b> · Cama: ${fmtSleepDuration(inBed)}${stages}`;
       }
       case 'snapshot': {
         const hr = (d.heartRate != null && d.heartRate > 0) ? d.heartRate + ' bpm' : '—';

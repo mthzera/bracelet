@@ -57,6 +57,11 @@ export type DecodedRealtime = {
   spo2: number;
 };
 
+import type { SleepDetail, SleepSegment, SleepStageTotals } from "./sleep-parser.service.js";
+import { parseBestSleepPacket } from "./sleep-parser.service.js";
+
+export type { SleepDetail, SleepSegment, SleepStageTotals };
+
 /** Pacote 0x53 — sono (histórico). */
 export type DecodedSleep = {
   type: "0x53";
@@ -64,6 +69,11 @@ export type DecodedSleep = {
   date: string;
   time: string;
   sleepMinutes: number;
+  endTime?: string;
+  inBedMinutes?: number;
+  quality?: number | null;
+  segments?: SleepSegment[];
+  totals?: SleepStageTotals;
 };
 
 /** Pacote 0x18 — esporte em tempo real. */
@@ -100,6 +110,11 @@ export type DecodedSnapshot = {
   sleepDate?: string | null;
   sleepTime?: string | null;
   sleepRecordId?: number | null;
+  sleepEndTime?: string | null;
+  sleepInBedMinutes?: number | null;
+  sleepQuality?: number | null;
+  sleepSegments?: SleepSegment[];
+  sleepTotals?: SleepStageTotals;
   /** Campos idênticos ao snapshot anterior — firmware pode estar enviando leitura repetida. */
   staleFields?: string[];
 };
@@ -259,7 +274,25 @@ function bcd(b: number): number {
   return ((b >> 4) * 10) + (b & 0x0f);
 }
 
+function sleepDetailToDecoded(detail: SleepDetail): DecodedSleep {
+  return {
+    type: "0x53",
+    recordId: detail.recordId,
+    date: detail.date,
+    time: detail.startTime,
+    sleepMinutes: detail.sleepMinutes,
+    endTime: detail.endTime,
+    inBedMinutes: detail.inBedMinutes,
+    quality: detail.quality,
+    segments: detail.segments,
+    totals: detail.totals,
+  };
+}
+
 function decodeSleep(bytes: number[]): DecodedSleep {
+  const detail = parseBestSleepPacket(bytes);
+  if (detail) return sleepDetailToDecoded(detail);
+
   const recordId = (bytes[1] ?? 0) | ((bytes[2] ?? 0) << 8);
   const yy = bcd(bytes[3] ?? 0);
   const mo = bcd(bytes[4] ?? 0);
