@@ -485,7 +485,8 @@
   // ── Tipos que não têm CRC validado (espelha skipsCrcValidation do backend) ──
   const NO_CRC_TYPES = new Set([
     '0x13','0x09','0x27','0x53','0x18',
-    '0x51','0x52','0x54','0x55','0x5C','0x60','0x62','0x65','0x66','raw'
+    '0x51','0x52','0x54','0x55','0x5C','0x60','0x62','0x65','0x66','raw',
+    'SNAPSHOT_VITALS'
   ]);
 
   function normalizeMac(mac) { return (mac || '').trim().toUpperCase(); }
@@ -567,6 +568,7 @@
     '0x22': 'badge-mac',
     '0x27': 'badge-firmware',
     '0x53': 'badge-sleep',
+    'SNAPSHOT_VITALS': 'badge-health',
     '0x51': 'badge-history',
     '0x52': 'badge-history',
     '0x54': 'badge-history',
@@ -1000,6 +1002,18 @@
         const hh = Math.floor((d.sleepMinutes || 0) / 60);
         const mm = (d.sleepMinutes || 0) % 60;
         return `Sono: <b>${d.sleepMinutes} min</b> (${hh}h${mm}m) &nbsp; ${d.date || ''}`;
+      }
+      case 'snapshot': {
+        const hr = (d.heartRate != null && d.heartRate > 0) ? d.heartRate + ' bpm' : '—';
+        const spo2 = (d.spo2 != null && d.spo2 > 0) ? d.spo2 + '%' : '—';
+        const temp = (d.temperature != null && d.temperature > 0) ? d.temperature + '°C' : '—';
+        const bp = (d.systolicPressure != null && d.systolicPressure > 0)
+          ? ` &nbsp; PA: <b>${d.systolicPressure}/${d.diastolicPressure}</b>`
+          : '';
+        const sleep = (d.sleepMinutes != null && d.sleepMinutes > 0)
+          ? ` &nbsp; Sono: <b>${d.sleepMinutes} min</b>`
+          : '';
+        return `HR: <b>${hr}</b> &nbsp; SpO2: <b>${spo2}</b> &nbsp; Temp: <b>${temp}</b>${bp}${sleep}`;
       }
       case 'raw':
         return `<span style="color:var(--muted)">Tipo: <b>${d.originalType}</b> &nbsp; Bytes: ${d.bytesReceived}</span>`;
