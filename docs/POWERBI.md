@@ -110,6 +110,26 @@ O conteúdo de `decoded` depende do tipo de pacote:
 **`0x13` — Bateria:** `battery` (% de carga)
 **`0x22` — MAC:** `mac` (endereço da pulseira)
 
+**`0x53` — Sono:**
+
+| Campo | Descrição |
+|-------|-----------|
+| `date` | Data do registro (`YYYY-MM-DD`) |
+| `time` | Hora do registro (`HH:MM:SS`) |
+| `sleepMinutes` | Minutos dormidos (cada unidade do byte = 5 min) |
+| `recordId` | ID do registro na pulseira |
+
+**`SNAPSHOT_VITALS` — Leitura consolidada do ESP32:**
+
+Quando a pulseira envia só o snapshot (sem pacotes `0x28` crus), cada item em `packets` terá `packetType: "SNAPSHOT_VITALS"` e `decoded` com os vitais. A API também gera automaticamente uma linha `0x53` com os dados de sono do snapshot, para o painel de sono continuar funcionando sem mudanças no Power BI.
+
+| Campo em `decoded` | Descrição |
+|--------------------|-----------|
+| `heartRate`, `spo2`, `temperature` | Vitais principais |
+| `hrv`, `fatigue` | HRV e fadiga (podem vir `null` se repetidos) |
+| `systolicPressure`, `diastolicPressure` | Pressão arterial |
+| `sleepMinutes`, `sleepDate`, `sleepTime` | Sono (também exposto como pacote `0x53`) |
+
 > Como cada tipo tem campos diferentes, ao expandir `decoded` no Power BI algumas
 > colunas ficarão vazias (`null`) nas linhas de outro tipo. Isso é normal — basta
 > filtrar por `packetType` no visual.
@@ -194,8 +214,8 @@ Clique em **Página Inicial → Fechar e Aplicar**. Os dados entram no modelo do
 | **Segmentação (slicer)** | `packetType` ou `measurementMode` | Filtrar por tipo de medição |
 | **Tabela** | Todos os campos | Listagem bruta dos pacotes |
 
-**Dica de filtro:** Para painéis de saúde, filtre `packetType = "0x28"` (ou `0x09`)
-para evitar linhas com métricas vazias dos pacotes de bateria/MAC.
+**Dica de filtro:** Para painéis de saúde, filtre `packetType = "0x28"` ou `"SNAPSHOT_VITALS"` (ou `0x09`)
+para evitar linhas com métricas vazias dos pacotes de bateria/MAC. Para sono, filtre `packetType = "0x53"`.
 
 ---
 

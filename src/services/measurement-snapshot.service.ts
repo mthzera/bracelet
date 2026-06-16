@@ -92,6 +92,42 @@ function emptyVitals(): SnapshotVitals {
   };
 }
 
+function sleepFromSnapshot(snapshot: DecodedSnapshot | null): SnapshotSleep | null {
+  if (!snapshot?.sleepMinutes || snapshot.sleepMinutes <= 0) return null;
+  return {
+    date: snapshot.sleepDate ?? "",
+    time: snapshot.sleepTime ?? "",
+    sleepMinutes: snapshot.sleepMinutes,
+    recordId: snapshot.sleepRecordId ?? 0,
+  };
+}
+
+function vitalsFromSnapshot(snapshot: DecodedSnapshot): SnapshotVitals {
+  return {
+    heartRate: snapshot.heartRate ?? 0,
+    spo2: snapshot.spo2 ?? 0,
+    temperature: snapshot.temperature ?? 0,
+    hrv: snapshot.hrv ?? 0,
+    fatigue: snapshot.fatigue ?? 0,
+    systolicPressure: snapshot.systolicPressure ?? 0,
+    diastolicPressure: snapshot.diastolicPressure ?? 0,
+  };
+}
+
+function latestSnapshotVitals(packets: SavedPacket[]): DecodedSnapshot | null {
+  const ordered = [...packets].sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+  );
+
+  for (const packet of ordered) {
+    if (packet.packetType.toUpperCase() !== "SNAPSHOT_VITALS") continue;
+    const decoded = freshDecoded(packet);
+    if (decoded?.type === "snapshot") return decoded;
+  }
+
+  return null;
+}
+
 function vitalsFromMerged(merged: DecodedHealth): SnapshotVitals {
   return {
     heartRate: merged.heartRate,
@@ -163,12 +199,25 @@ export function buildSnapshotFromPackets(packets: SavedPacket[]): MeasurementSna
     .map((packet) => freshDecoded(packet))
     .filter(isMergeableHealth);
 
-  const vitals =
+  let vitals =
     healthDecoded.length > 0
       ? vitalsFromMerged(mergeHealthReadings(healthDecoded))
       : emptyVitals();
 
+  const snapshotVitals = latestSnapshotVitals(packets);
+  if (snapshotVitals) vitals = vitalsFromSnapshot(snapshotVitals);
+
   const sleepDecoded = latestPacketByType(packets, "0x53") as DecodedSleep | null;
+  const sleep =
+    sleepFromSnapshot(snapshotVitals) ??
+    (sleepDecoded
+      ? {
+          date: sleepDecoded.date,
+          time: sleepDecoded.time,
+          sleepMinutes: sleepDecoded.sleepMinutes,
+          recordId: sleepDecoded.recordId,
+        }
+      : null);
   const batteryDecoded = latestPacketByType(packets, "0x13") as DecodedBattery | null;
   const firmwareDecoded = latestPacketByType(packets, "0x27") as DecodedFirmware | null;
   const macDecoded = latestPacketByType(packets, "0x22") as DecodedMac | null;
@@ -186,14 +235,7 @@ export function buildSnapshotFromPackets(packets: SavedPacket[]): MeasurementSna
     vitals,
     complete: hasCompleteVitals(vitals),
     missing,
-    sleep: sleepDecoded
-      ? {
-          date: sleepDecoded.date,
-          time: sleepDecoded.time,
-          sleepMinutes: sleepDecoded.sleepMinutes,
-          recordId: sleepDecoded.recordId,
-        }
-      : null,
+    sleep,
     battery: batteryDecoded?.battery ?? null,
     firmware: firmwareDecoded
       ? `V${firmwareDecoded.major}.${firmwareDecoded.minor}.${firmwareDecoded.patch}`
@@ -494,6 +536,15 @@ function buildCycleSummary(group: SavedPacket[]): CycleSummary | null {
   const spo2 = snapshotVitals?.spo2 ?? avgRound(spo2Values);
   const systolic = snapshotVitals?.systolicPressure ?? avgRound(systolicValues);
   const diastolic = snapshotVitals?.diastolicPressure ?? avgRound(diastolicValues);
+
+  if (snapshotVitals?.sleepMinutes && snapshotVitals.sleepMinutes > 0) {
+    sleep = {
+      date: snapshotVitals.sleepDate ?? "",
+      time: snapshotVitals.sleepTime ?? "",
+      sleepMinutes: snapshotVitals.sleepMinutes,
+      recordId: snapshotVitals.sleepRecordId ?? 0,
+    };
+  }
 
   const summary: CycleSummaryData = {
     heartRate,

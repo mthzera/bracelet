@@ -57,8 +57,11 @@ import {
   applySnapshotVitals,
   buildConsolidatedSnapshot,
   SNAPSHOT_VITALS_TYPE,
+  sleepFieldsFromMetrics,
+  type ConsolidatedVitals,
   type InboundPacket,
 } from "../services/vitals-consolidation.service.js";
+import { expandPacketsForLegacyRead } from "../services/legacy-packet-read.service.js";
 
 function resolveReportWindowMinutes(value: number | undefined): number {
   return typeof value === "number" && Number.isFinite(value)
@@ -90,6 +93,44 @@ type PacketProcessResult =
 
 const STALE_VITAL_KEYS = ["hrv", "fatigue", "systolicPressure", "diastolicPressure"] as const;
 
+type SnapshotExtras = {
+  sources?: Record<string, string>;
+};
+
+function staleSourceKey(vital: (typeof STALE_VITAL_KEYS)[number]): string {
+  if (vital === "systolicPressure" || vital === "diastolicPressure") return "bloodPressure";
+  return vital;
+}
+
+function detectAndClearStaleVitals(
+  vitals: ConsolidatedVitals,
+  prevDecoded: { hrv: number | null; fatigue: number | null; systolicPressure: number | null; diastolicPressure: number | null } | null,
+  extras?: SnapshotExtras,
+): string[] {
+  const staleFields: string[] = [];
+
+  for (const key of STALE_VITAL_KEYS) {
+    const source = extras?.sources?.[staleSourceKey(key)];
+    if (source?.startsWith("stale_duplicate_")) {
+      vitals[key] = null;
+      staleFields.push(key);
+      continue;
+    }
+
+    if (
+      prevDecoded &&
+      vitals[key] !== null &&
+      prevDecoded[key] !== null &&
+      vitals[key] === prevDecoded[key]
+    ) {
+      vitals[key] = null;
+      staleFields.push(key);
+    }
+  }
+
+  return staleFields;
+}
+
 async function processInboundPacket(
   payload: PacketPayload,
   item: PacketItem,
@@ -107,22 +148,19 @@ async function processInboundPacket(
   if (item.packetType === SNAPSHOT_VITALS_TYPE) {
     const vitals = applySnapshotVitals({ packetType: item.packetType, metrics: item.metrics });
 
-    // Detecta campos repetidos do snapshot anterior (firmware pode travar em leitura antiga).
     const prevPacket = await getLastSnapshotVitalsForDevice(payload.deviceMac);
     const prevDecoded = prevPacket?.decoded?.type === "snapshot" ? prevPacket.decoded : null;
+    const extras = rawSnapshot as SnapshotExtras | undefined;
+    const isTestMode =
+      item.metrics?.testMode === true ||
+      payload.source === "ESP32_FAST_TEST" ||
+      extras?.sources?.bpm?.includes("FAST_TEST") === true;
+    const staleFields = isTestMode
+      ? []
+      : detectAndClearStaleVitals(vitals, prevDecoded, extras);
+    const sleepFields = sleepFieldsFromMetrics(item.metrics);
 
-    let staleFields: string[] = [];
-    if (prevDecoded) {
-      const anyNonNull = STALE_VITAL_KEYS.some(
-        (k) => vitals[k] !== null || prevDecoded[k] !== null,
-      );
-      const allMatch = STALE_VITAL_KEYS.every((k) => vitals[k] === prevDecoded[k]);
-      if (anyNonNull && allMatch) {
-        staleFields = [...STALE_VITAL_KEYS];
-      }
-    }
-
-    const decoded: DecodedPacket = { type: "snapshot", ...vitals, staleFields };
+    const decoded: DecodedPacket = { type: "snapshot", ...vitals, ...sleepFields, staleFields };
     const saved = await savePacket({
       payload,
       crcValid: false,
@@ -375,35 +413,42 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       view?: string;
       group?: string | boolean;
     };
-    const view = query.view === "raw" ? "raw" : "snapshots";
     const grouped = query.group === true || query.group === "true";
+    const viewParam = typeof query.view === "string" ? query.view : undefined;
+    const wantSnapshots = viewParam === "snapshots";
+    const wantRawExplicit = viewParam === "raw";
     const limit =
       typeof query.limit === "number" && Number.isFinite(query.limit)
         ? query.limit
-        : view === "snapshots"
+        : wantSnapshots
           ? 30
           : 50;
     const deviceMac = typeof query.deviceMac === "string" ? query.deviceMac : undefined;
 
-    if (view === "raw") {
-      const packets = (await listPackets(limit, deviceMac)).map(enrichWithPatient);
-      return reply.status(200).send({ view: "raw", packets });
-    }
-
-    // group=true devolve o formato consolidado (items) no mesmo endpoint.
     if (grouped) {
       const items = await buildConsolidatedCycles(limit, deviceMac);
       return reply.status(200).send({ view: "consolidated", items });
     }
 
-    const rawLimit = Math.min(Math.max(limit * 80, 400), 2000);
-    const packets = await listPackets(rawLimit, deviceMac);
-    const snapshots = buildSnapshotsFromPackets(packets, limit).map((snapshot) => ({
-      ...snapshot,
-      patient: resolvePatientForMac(snapshot.deviceMac),
-    }));
+    if (wantSnapshots) {
+      const rawLimit = Math.min(Math.max(limit * 80, 400), 2000);
+      const packets = await listPackets(rawLimit, deviceMac);
+      const snapshots = buildSnapshotsFromPackets(packets, limit).map((snapshot) => ({
+        ...snapshot,
+        patient: resolvePatientForMac(snapshot.deviceMac),
+      }));
+      return reply.status(200).send({ view: "snapshots", snapshots });
+    }
 
-    return reply.status(200).send({ view: "snapshots", snapshots });
+    const packets = expandPacketsForLegacyRead(
+      (await listPackets(limit, deviceMac)).map(enrichWithPatient),
+    );
+
+    if (wantRawExplicit) {
+      return reply.status(200).send({ view: "raw", packets });
+    }
+
+    return reply.status(200).send({ packets });
   });
 
   app.get(

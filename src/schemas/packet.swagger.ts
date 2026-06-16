@@ -345,16 +345,16 @@ export const validationErrorResponseSchema = {
 
 export const getPacketRouteSchema = {
   tags: ["bracelets"],
-  summary: "List measurement cycles",
+  summary: "List bracelet packets",
   description:
-    "Default view=snapshots returns one consolidated row per ESP32 cycle (vitals + sleep + battery). Use view=raw for individual BLE packets.",
+    "Default (no view) returns { packets } for dashboard/Power BI compatibility. Use view=snapshots for consolidated cycles or view=raw for explicit raw listing.",
   querystring: {
     type: "object",
     properties: {
       view: {
         type: "string",
         enum: ["snapshots", "raw"],
-        default: "snapshots",
+        description: "Omit for legacy { packets }. snapshots = one row per cycle; raw = explicit raw packets.",
       },
       group: {
         type: "boolean",
@@ -365,8 +365,8 @@ export const getPacketRouteSchema = {
         type: "integer",
         minimum: 1,
         maximum: 200,
-        default: 30,
-        description: "Max snapshots/cycles (default) or raw packets when view=raw",
+        default: 50,
+        description: "Max packets (default) or snapshots when view=snapshots",
       },
       deviceMac: {
         type: "string",

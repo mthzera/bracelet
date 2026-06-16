@@ -30,6 +30,11 @@ export const metricsSchema = z
     fatigue: z.number().int().optional(),
     bloodPressureSystolic: z.number().int().optional(),
     bloodPressureDiastolic: z.number().int().optional(),
+    sleepMinutes: z.number().int().optional(),
+    sleepDate: z.string().optional(),
+    sleepTime: z.string().optional(),
+    sleepRecordId: z.number().int().optional(),
+    testMode: z.boolean().optional(),
   })
   .passthrough()
   .optional();

@@ -20,7 +20,7 @@ const char* WIFI_PASS = "altana@iot";
 const char* API_BASE_URL = "https://bracelet-pn7r.onrender.com";
 const char* API_PATH = "/bracelets/packets";
 
-const char* DEVICE_MAC = "db:31:0d:30:7b:f8";
+const char* DEVICE_MAC = "e6:64:0d:30:d3:f9";
 
 static BLEUUID SERVICE_UUID((uint16_t)0xFFF0);
 static BLEUUID TX_UUID((uint16_t)0xFFF6); // ESP32 -> pulseira
@@ -48,13 +48,29 @@ RTC_DATA_ATTR uint8_t lastAcceptedHrv = 0;
 RTC_DATA_ATTR uint8_t lastAcceptedFatigue = 0;
 RTC_DATA_ATTR uint8_t lastAcceptedSystolic = 0;
 RTC_DATA_ATTR uint8_t lastAcceptedDiastolic = 0;
-RTC_DATA_ATTR bool hasLastAcceptedHrvFatigue = false;
+RTC_DATA_ATTR bool hasLastAcceptedHrv = false;
+RTC_DATA_ATTR bool hasLastAcceptedFatigue = false;
 RTC_DATA_ATTR bool hasLastAcceptedBp = false;
 
+// ============================================================
+// MODO RÁPIDO PARA TESTE
+// ============================================================
+// true  = ciclo ~3–4 min, medições ativas sempre, sem suprimir repetidos
+// false = produção (~15 min entre coletas, lógica app-like 2x/hora)
+
+const bool FAST_TEST_MODE = true;
+
 // Intervalo entre snapshots enviados para a API.
-// 1800s = 30 minutos = 2 envios por hora.
-const uint64_t COLLECT_SLEEP_SECONDS = 900;   // TESTE: 15 min entre ciclos (HRV/Stress também está em 15 min)
-const uint64_t SHORT_SLEEP_SECONDS = 5;
+const uint64_t COLLECT_SLEEP_SECONDS = FAST_TEST_MODE ? 180ULL : 900ULL;
+const uint64_t BOOT0_FIRST_WAIT_SECONDS = FAST_TEST_MODE ? 90ULL : COLLECT_SLEEP_SECONDS;
+const uint64_t SHORT_SLEEP_SECONDS = FAST_TEST_MODE ? 3ULL : 5ULL;
+
+// Delays de leitura de histórico BLE (cada comando 0x54/0x56/…)
+const unsigned long HIST_DELAY_MS = FAST_TEST_MODE ? 1800UL : 3500UL;
+const unsigned long HIST_DELAY_LONG_MS = FAST_TEST_MODE ? 2200UL : 4500UL;
+const unsigned long HIST_DELAY_SHORT_MS = FAST_TEST_MODE ? 1400UL : 3000UL;
+const unsigned long STOP_ACTIVE_DELAY_MS = FAST_TEST_MODE ? 400UL : 1000UL;
+const unsigned long GAP_BETWEEN_ACTIVE_MODES_MS = FAST_TEST_MODE ? 600UL : 1200UL;
 
 // ============================================================
 // ESTRATÉGIA DE MEDIÇÃO
@@ -95,20 +111,18 @@ const uint16_t AUTO_TEMP_INTERVAL_MIN = 15;
 const uint16_t AUTO_HRV_INTERVAL_MIN = 15;
 
 // Tempos das medições ativas.
-// Se quiser mais estabilidade, aumente HR/BP, SpO2 e HRV para 45s.
-const unsigned long ACTIVE_WARMUP_MS = 5000UL;
-const unsigned long ACTIVE_HEART_BP_MS = 30000UL;   // TESTE: BPM ativo + pressão oportunista
-const unsigned long ACTIVE_SPO2_MS = 90000UL;        // TESTE: SpO2 ainda pode demorar, mas reduzido para agilizar
-const unsigned long ACTIVE_TEMP_MS = 15000UL;        // TESTE: temperatura costuma vir rápido
-const unsigned long ACTIVE_HRV_MS = 60000UL;         // TESTE: HRV ativo/debug reduzido para agilizar
-const unsigned long GAP_BETWEEN_ACTIVE_MODES_MS = 1200UL;
+const unsigned long ACTIVE_WARMUP_MS = FAST_TEST_MODE ? 2000UL : 5000UL;
+const unsigned long ACTIVE_HEART_BP_MS = FAST_TEST_MODE ? 18000UL : 30000UL;
+const unsigned long ACTIVE_SPO2_MS = FAST_TEST_MODE ? 35000UL : 90000UL;
+const unsigned long ACTIVE_TEMP_MS = FAST_TEST_MODE ? 10000UL : 15000UL;
+const unsigned long ACTIVE_HRV_MS = FAST_TEST_MODE ? 25000UL : 60000UL;
 
 // Para não parar no primeiro pacote válido isolado.
-const unsigned long ACTIVE_STABLE_AFTER_TARGET_MS = 5000UL;
-const uint8_t MIN_BPM_SAMPLES = 2;
-const uint8_t MIN_BP_SAMPLES = 2;
-const uint8_t MIN_SPO2_SAMPLES = 2;
-const uint8_t MIN_TEMP_SAMPLES = 2;
+const unsigned long ACTIVE_STABLE_AFTER_TARGET_MS = FAST_TEST_MODE ? 2000UL : 5000UL;
+const uint8_t MIN_BPM_SAMPLES = FAST_TEST_MODE ? 1 : 2;
+const uint8_t MIN_BP_SAMPLES = FAST_TEST_MODE ? 1 : 2;
+const uint8_t MIN_SPO2_SAMPLES = FAST_TEST_MODE ? 1 : 2;
+const uint8_t MIN_TEMP_SAMPLES = FAST_TEST_MODE ? 1 : 2;
 const uint8_t MIN_HRV_SAMPLES = 1;
 const uint8_t MIN_FATIGUE_SAMPLES = 1;
 
@@ -161,6 +175,14 @@ struct VitalsSnapshot {
   const char* bpQuality;
   uint32_t bpAtMs;
   uint16_t bpSamples;
+
+  bool hasSleep;
+  uint16_t sleepRecordId;
+  char sleepDate[11];
+  char sleepTime[9];
+  uint16_t sleepMinutes;
+  const char* sleepSource;
+  uint16_t sleepSamples;
 
   uint32_t createdAtMs;
 };
@@ -268,6 +290,14 @@ const char* activeModeSource(uint8_t mode) {
   if (mode == 0x03) return "0x28_ACTIVE_FRESH_SPO2";
   if (mode == 0x04) return "0x28_ACTIVE_FRESH_TEMP";
   return "0x28_ACTIVE_FRESH";
+}
+
+const char* measurementStrategyLabel() {
+  return FAST_TEST_MODE ? "FAST_TEST_FULL" : "APP_LIKE_DEBUG_15MIN";
+}
+
+const char* apiSourceLabel() {
+  return FAST_TEST_MODE ? "ESP32_FAST_TEST" : "ESP32_APP_LIKE_DEBUG_15MIN";
 }
 
 // ============================================================
@@ -469,6 +499,14 @@ void resetSnapshot() {
   snapshot.bpAtMs = 0;
   snapshot.bpSamples = 0;
 
+  snapshot.hasSleep = false;
+  snapshot.sleepRecordId = 0;
+  snapshot.sleepDate[0] = '\0';
+  snapshot.sleepTime[0] = '\0';
+  snapshot.sleepMinutes = 0;
+  snapshot.sleepSource = "missing";
+  snapshot.sleepSamples = 0;
+
   snapshot.createdAtMs = millis();
 
   selectedHrvRawHash = 0;
@@ -502,6 +540,14 @@ bool validBloodPressure(uint8_t sys, uint8_t dia) {
   if (sys <= dia) return false;
   if ((sys - dia) < 15) return false;
   return true;
+}
+
+bool validSleepMinutes(uint16_t minutes) {
+  return minutes >= 5 && minutes <= 24 * 60;
+}
+
+uint8_t bcdToDec(uint8_t b) {
+  return ((b >> 4) * 10) + (b & 0x0F);
 }
 
 float parseTempLittleEndian(uint8_t low, uint8_t high) {
@@ -571,6 +617,20 @@ void updateSnapshotBloodPressure(uint8_t sys, uint8_t dia, const char* source, c
   snapshot.bpSamples++;
 }
 
+void updateSnapshotSleep(uint16_t recordId, const char* date, const char* time, uint16_t sleepMinutes, const char* source) {
+  if (!validSleepMinutes(sleepMinutes)) return;
+
+  snapshot.hasSleep = true;
+  snapshot.sleepRecordId = recordId;
+  strncpy(snapshot.sleepDate, date, sizeof(snapshot.sleepDate) - 1);
+  snapshot.sleepDate[sizeof(snapshot.sleepDate) - 1] = '\0';
+  strncpy(snapshot.sleepTime, time, sizeof(snapshot.sleepTime) - 1);
+  snapshot.sleepTime[sizeof(snapshot.sleepTime) - 1] = '\0';
+  snapshot.sleepMinutes = sleepMinutes;
+  snapshot.sleepSource = source;
+  snapshot.sleepSamples++;
+}
+
 bool snapshotComplete() {
   return snapshot.hasBpm &&
          snapshot.hasSpo2 &&
@@ -581,31 +641,60 @@ bool snapshotComplete() {
 }
 
 void finalizeSnapshotFreshness() {
+  // Em teste rápido, envia todos os valores coletados (sem nullar repetidos).
+  if (FAST_TEST_MODE) {
+    if (snapshot.hasHrv) {
+      if (selectedHrvRawHash != 0) lastAcceptedHrvRawHash = selectedHrvRawHash;
+      lastAcceptedHrv = snapshot.hrv;
+      hasLastAcceptedHrv = true;
+    }
+    if (snapshot.hasFatigue) {
+      lastAcceptedFatigue = snapshot.fatigue;
+      hasLastAcceptedFatigue = true;
+    }
+    if (snapshot.hasBloodPressure) {
+      if (selectedBpRawHash != 0) lastAcceptedBpRawHash = selectedBpRawHash;
+      lastAcceptedSystolic = snapshot.systolic;
+      lastAcceptedDiastolic = snapshot.diastolic;
+      hasLastAcceptedBp = true;
+    }
+    return;
+  }
+
   // Evita transformar valor cacheado/repetido em nova medição.
   // A API também deve fazer essa checagem, mas o INO já envia null quando detectar repetição clara.
 
-  if (snapshot.hasHrv && snapshot.hasFatigue) {
+  if (snapshot.hasHrv) {
     bool sameRaw = selectedHrvRawHash != 0 && selectedHrvRawHash == lastAcceptedHrvRawHash;
-    bool sameValue = hasLastAcceptedHrvFatigue &&
-                     snapshot.hrv == lastAcceptedHrv &&
-                     snapshot.fatigue == lastAcceptedFatigue;
+    bool sameValue = hasLastAcceptedHrv && snapshot.hrv == lastAcceptedHrv;
 
     if (sameRaw || sameValue) {
-      Serial.println("[STALE] HRV/fadiga repetidos. Enviando como null neste snapshot.");
+      Serial.println("[STALE] HRV repetido. Enviando como null neste snapshot.");
       snapshot.hasHrv = false;
       snapshot.hrv = 0;
       snapshot.hrvSource = sameRaw ? "stale_duplicate_raw" : "stale_duplicate_value";
       snapshot.hrvSamples = 0;
+    } else {
+      if (selectedHrvRawHash != 0) lastAcceptedHrvRawHash = selectedHrvRawHash;
+      lastAcceptedHrv = snapshot.hrv;
+      hasLastAcceptedHrv = true;
+    }
+  }
 
+  if (snapshot.hasFatigue) {
+    bool sameRaw = selectedHrvRawHash != 0 && selectedHrvRawHash == lastAcceptedHrvRawHash;
+    bool sameValue = hasLastAcceptedFatigue && snapshot.fatigue == lastAcceptedFatigue;
+
+    if (sameRaw || sameValue) {
+      Serial.println("[STALE] Fadiga repetida. Enviando como null neste snapshot.");
       snapshot.hasFatigue = false;
       snapshot.fatigue = 0;
       snapshot.fatigueSource = sameRaw ? "stale_duplicate_raw" : "stale_duplicate_value";
       snapshot.fatigueSamples = 0;
     } else {
-      lastAcceptedHrvRawHash = selectedHrvRawHash;
-      lastAcceptedHrv = snapshot.hrv;
+      if (selectedHrvRawHash != 0) lastAcceptedHrvRawHash = selectedHrvRawHash;
       lastAcceptedFatigue = snapshot.fatigue;
-      hasLastAcceptedHrvFatigue = true;
+      hasLastAcceptedFatigue = true;
     }
   }
 
@@ -636,7 +725,9 @@ void printSnapshotDebug() {
   Serial.println("========== SNAPSHOT DEBUG ==========");
   Serial.print("sessionId=");
   Serial.println(measurementSessionId);
-  Serial.print("strategy=APP_LIKE_AUTO_HISTORY_2_PER_HOUR freshOnly=false complete=");
+  Serial.print("strategy=");
+  Serial.print(measurementStrategyLabel());
+  Serial.print(" freshOnly=false complete=");
   Serial.println(snapshotComplete() ? "true" : "false");
 
   Serial.print("bpm=");
@@ -684,8 +775,21 @@ void printSnapshotDebug() {
   }
   Serial.print(" source=");
   Serial.print(snapshot.bpSource);
-  Serial.print(" samples=");
+  Serial.print(" bp samples=");
   Serial.println(snapshot.bpSamples);
+
+  Serial.print("sleep=");
+  if (snapshot.hasSleep) {
+    Serial.print(snapshot.sleepMinutes);
+    Serial.print("min ");
+    Serial.print(snapshot.sleepDate);
+    Serial.print(" ");
+    Serial.print(snapshot.sleepTime);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(" source=");
+  Serial.println(snapshot.sleepSource);
 
   Serial.print("rawHash.hrvFatigue=");
   Serial.println(selectedHrvRawHash);
@@ -723,8 +827,12 @@ void saveVitalsSnapshotToFile() {
   f.print(measurementSessionStartedAtMs);
   f.print(",");
 
-  f.print("\"measurementStrategy\":\"APP_LIKE_DEBUG_15MIN\",");
-  f.print("\"freshOnly\":false,");
+  f.print("\"measurementStrategy\":\"");
+  f.print(measurementStrategyLabel());
+  f.print("\",");
+  f.print("\"testMode\":");
+  f.print(FAST_TEST_MODE ? "true" : "false");
+  f.print(",\"freshOnly\":false,");
 
   f.print("\"autoConfig\":{");
   f.print("\"heartRateMin\":"); f.print(AUTO_BPM_INTERVAL_MIN);
@@ -756,6 +864,18 @@ void saveVitalsSnapshotToFile() {
   f.print(",\"bloodPressureDiastolic\":");
   if (snapshot.hasBloodPressure) f.print(snapshot.diastolic); else f.print("null");
 
+  f.print(",\"sleepMinutes\":");
+  if (snapshot.hasSleep) f.print(snapshot.sleepMinutes); else f.print("null");
+
+  f.print(",\"sleepDate\":");
+  if (snapshot.hasSleep) { f.print("\""); f.print(snapshot.sleepDate); f.print("\""); } else f.print("null");
+
+  f.print(",\"sleepTime\":");
+  if (snapshot.hasSleep) { f.print("\""); f.print(snapshot.sleepTime); f.print("\""); } else f.print("null");
+
+  f.print(",\"sleepRecordId\":");
+  if (snapshot.hasSleep) f.print(snapshot.sleepRecordId); else f.print("null");
+
   f.print("},");
 
   f.print("\"sources\":{");
@@ -776,6 +896,9 @@ void saveVitalsSnapshotToFile() {
   f.print("\",");
   f.print("\"bloodPressure\":\"");
   f.print(snapshot.bpSource);
+  f.print("\",");
+  f.print("\"sleep\":\"");
+  f.print(snapshot.sleepSource);
   f.print("\"");
   f.print("},");
 
@@ -792,6 +915,8 @@ void saveVitalsSnapshotToFile() {
   f.print(snapshot.fatigueSamples);
   f.print(",\"bloodPressure\":");
   f.print(snapshot.bpSamples);
+  f.print(",\"sleep\":");
+  f.print(snapshot.sleepSamples);
   f.print("},");
 
   f.print("\"selectedRawHashes\":{");
@@ -912,6 +1037,10 @@ void readHistoryTempManual() {
 
 void readHistoryTempAuto() {
   sendCmd(0x65, 0x00, 0x00, 0x00);
+}
+
+void readHistorySleep() {
+  sendCmd(0x53, 0x00, 0x00, 0x00);
 }
 
 // ============================================================
@@ -1127,6 +1256,7 @@ void handleActivePacket028(uint8_t* data, size_t len, String raw) {
     updateSnapshotTemperature(temp, source);
   } else if (currentActiveMode == 0x01) {
     // HRV/fadiga ativo
+    selectedHrvRawHash = fnv1aHashString(raw);
     updateSnapshotHrv(hrv, source);
     updateSnapshotFatigue(fadiga, source);
   }
@@ -1242,6 +1372,17 @@ void handleHistoryPacket(uint8_t type, uint8_t* data, size_t len, String raw) {
     }
     return;
   }
+
+  if (type == 0x53 && !snapshot.hasSleep) {
+    uint16_t recordId = (uint16_t)data[1] | ((uint16_t)data[2] << 8);
+    char date[11];
+    snprintf(date, sizeof(date), "20%02u-%02u-%02u", bcdToDec(data[3]), bcdToDec(data[4]), bcdToDec(data[5]));
+    char time[9];
+    snprintf(time, sizeof(time), "%02u:%02u:%02u", bcdToDec(data[6]), bcdToDec(data[7]), bcdToDec(data[8]));
+    uint16_t sleepMinutes = (uint16_t)data[9] * 5;
+    updateSnapshotSleep(recordId, date, time, sleepMinutes, "0x53_SLEEP_HISTORY");
+    return;
+  }
 }
 
 // ============================================================
@@ -1337,7 +1478,7 @@ void notifyCallback(
     return;
   }
 
-  if (type == 0x54 || type == 0x56 || type == 0x60 || type == 0x62 || type == 0x65 || type == 0x66) {
+  if (type == 0x54 || type == 0x53 || type == 0x56 || type == 0x60 || type == 0x62 || type == 0x65 || type == 0x66) {
     String packetType = packetTypeString(type);
 
     Serial.print("[HIST] ");
@@ -1462,7 +1603,9 @@ void configureAutoThenSleep() {
 
   if (AUTO_CONFIG_ENABLED && autoAlreadyConfigured && !FORCE_AUTO_CONFIG_EVERY_BOOT0) {
     Serial.println("[AUTO] Já configurado nesta sessão RTC. Não vou reconfigurar.");
-    Serial.println("[AUTO] Dormindo 30min para a pulseira gerar HR/SpO2/HRV/Temp automáticos.");
+    Serial.print("[AUTO] Dormindo ");
+    Serial.print(COLLECT_SLEEP_SECONDS);
+    Serial.println("s antes da próxima coleta.");
     goToDeepSleep(COLLECT_SLEEP_SECONDS, 1);
   }
 
@@ -1493,8 +1636,10 @@ void configureAutoThenSleep() {
   bootStep = 1;
   bleOff();
 
-  Serial.println("[AUTO] Dormindo 30min antes da primeira coleta app-like.");
-  goToDeepSleep(COLLECT_SLEEP_SECONDS, 1);
+  Serial.print("[AUTO] Dormindo ");
+  Serial.print(BOOT0_FIRST_WAIT_SECONDS);
+  Serial.println("s antes da primeira coleta.");
+  goToDeepSleep(BOOT0_FIRST_WAIT_SECONDS, 1);
 }
 
 // ============================================================
@@ -1563,7 +1708,7 @@ void collectActiveMode(uint8_t mode, const char* label, unsigned long durationMs
   }
 
   stopActive028(mode);
-  delay(1000);
+  delay(STOP_ACTIVE_DELAY_MS);
 
   captureFreshActiveEnabled = false;
 
@@ -1577,54 +1722,65 @@ void readHistoriesForSnapshot() {
 
   captureHistoryEnabled = true;
 
-  // HR/BPM: histórico automático/manual de batimentos.
   Serial.println("[HIST] BPM 0x54...");
   readHistoryBpm();
-  delay(3500);
+  delay(HIST_DELAY_MS);
 
-  // HRV/Stress/Fadiga: caminho principal para HRV/fadiga.
-  // Testa todos os modos conhecidos de leitura para não precisar voltar no paciente.
   Serial.println("[HIST] HRV/fadiga 0x56 latest AA=0...");
   sendCmd(0x56, 0x00, 0x00, 0x00);
-  delay(4500);
+  delay(HIST_DELAY_LONG_MS);
 
-  Serial.println("[HIST] HRV/fadiga 0x56 position AA=1 pos=0...");
-  sendCmd(0x56, 0x01, 0x00, 0x00);
-  delay(4500);
+  if (FAST_TEST_MODE) {
+    if (!snapshot.hasHrv || !snapshot.hasFatigue) {
+      Serial.println("[HIST] HRV/fadiga 0x56 position AA=1 pos=0...");
+      sendCmd(0x56, 0x01, 0x00, 0x00);
+      delay(HIST_DELAY_MS);
+    }
+  } else {
+    Serial.println("[HIST] HRV/fadiga 0x56 position AA=1 pos=0...");
+    sendCmd(0x56, 0x01, 0x00, 0x00);
+    delay(HIST_DELAY_LONG_MS);
 
-  Serial.println("[HIST] HRV/fadiga 0x56 position AA=1 pos=1...");
-  sendCmd(0x56, 0x01, 0x01, 0x00);
-  delay(4500);
+    Serial.println("[HIST] HRV/fadiga 0x56 position AA=1 pos=1...");
+    sendCmd(0x56, 0x01, 0x01, 0x00);
+    delay(HIST_DELAY_LONG_MS);
 
-  Serial.println("[HIST] HRV/fadiga 0x56 next AA=2 #1...");
-  sendCmd(0x56, 0x02, 0x00, 0x00);
-  delay(3000);
+    Serial.println("[HIST] HRV/fadiga 0x56 next AA=2 #1...");
+    sendCmd(0x56, 0x02, 0x00, 0x00);
+    delay(HIST_DELAY_SHORT_MS);
 
-  Serial.println("[HIST] HRV/fadiga 0x56 next AA=2 #2...");
-  sendCmd(0x56, 0x02, 0x00, 0x00);
-  delay(3000);
+    Serial.println("[HIST] HRV/fadiga 0x56 next AA=2 #2...");
+    sendCmd(0x56, 0x02, 0x00, 0x00);
+    delay(HIST_DELAY_SHORT_MS);
 
-  Serial.println("[HIST] HRV/fadiga 0x56 next AA=2 #3...");
-  sendCmd(0x56, 0x02, 0x00, 0x00);
-  delay(3000);
+    Serial.println("[HIST] HRV/fadiga 0x56 next AA=2 #3...");
+    sendCmd(0x56, 0x02, 0x00, 0x00);
+    delay(HIST_DELAY_SHORT_MS);
+  }
 
-  // SpO2: tenta automático primeiro, depois manual.
   Serial.println("[HIST] SpO2 automático 0x66...");
   readHistorySpo2Auto();
-  delay(4500);
+  delay(HIST_DELAY_LONG_MS);
 
-  Serial.println("[HIST] SpO2 manual 0x60...");
-  readHistorySpo2Manual();
-  delay(3500);
+  if (!FAST_TEST_MODE || !snapshot.hasSpo2) {
+    Serial.println("[HIST] SpO2 manual 0x60...");
+    readHistorySpo2Manual();
+    delay(HIST_DELAY_MS);
+  }
 
-  // Temperatura: tenta automático primeiro, depois manual.
   Serial.println("[HIST] Temperatura automática 0x65...");
   readHistoryTempAuto();
-  delay(3500);
+  delay(HIST_DELAY_MS);
 
-  Serial.println("[HIST] Temperatura manual 0x62...");
-  readHistoryTempManual();
-  delay(3500);
+  if (!FAST_TEST_MODE || !snapshot.hasTemperature) {
+    Serial.println("[HIST] Temperatura manual 0x62...");
+    readHistoryTempManual();
+    delay(HIST_DELAY_MS);
+  }
+
+  Serial.println("[HIST] Sono 0x53...");
+  readHistorySleep();
+  delay(HIST_DELAY_MS);
 
   captureHistoryEnabled = false;
 
@@ -1632,7 +1788,9 @@ void readHistoriesForSnapshot() {
 }
 
 void collectFreshActiveVitals() {
-  Serial.println("[MODE] BOOT 1 - SYNC APP-LIKE 2 POR HORA");
+  Serial.println(FAST_TEST_MODE
+    ? "[MODE] BOOT 1 - TESTE RÁPIDO (histórico + ativo completo)"
+    : "[MODE] BOOT 1 - SYNC APP-LIKE 2 POR HORA");
 
   clearPacketsFile();
   resetSnapshot();
@@ -1646,53 +1804,60 @@ void collectFreshActiveVitals() {
     goToDeepSleep(SHORT_SLEEP_SECONDS, 1);
   }
 
-  // 1) Principal: copiar a lógica do app, lendo o que a pulseira gravou automaticamente.
+  // 1) Históricos: BPM, HRV, SpO2, temp, sono.
   readHistoriesForSnapshot();
 
-  // 2) Complemento ativo curto: BPM fresco e pressão oportunista.
-  // Pressão não é obrigatória; se não vier, fica null.
-  if (USE_ACTIVE_HEART_BP_REFRESH) {
+  // 2) Medições ativas — em teste rápido sempre roda tudo para dados frescos.
+  if (USE_ACTIVE_HEART_BP_REFRESH || FAST_TEST_MODE) {
     collectActiveMode(0x02, "HEART_BP_OPPORTUNISTIC", ACTIVE_HEART_BP_MS);
     delay(GAP_BETWEEN_ACTIVE_MODES_MS);
   }
 
-  // 3) Fallback ativo para SpO2 apenas se o histórico não entregou SpO2 suficiente.
-  if (USE_ACTIVE_SPO2_IF_MISSING && snapshot.spo2Samples < MIN_SPO2_SAMPLES) {
-    collectActiveMode(0x03, "SPO2_FALLBACK", ACTIVE_SPO2_MS);
+  if (FAST_TEST_MODE || (USE_ACTIVE_SPO2_IF_MISSING && snapshot.spo2Samples < MIN_SPO2_SAMPLES)) {
+    collectActiveMode(0x03, FAST_TEST_MODE ? "SPO2_ACTIVE" : "SPO2_FALLBACK", ACTIVE_SPO2_MS);
     delay(GAP_BETWEEN_ACTIVE_MODES_MS);
   }
 
-  // 4) Fallback ativo para temperatura apenas se não veio histórico.
-  if (USE_ACTIVE_TEMP_IF_MISSING && !snapshot.hasTemperature) {
-    collectActiveMode(0x04, "TEMP_FALLBACK", ACTIVE_TEMP_MS);
+  if (FAST_TEST_MODE || (USE_ACTIVE_TEMP_IF_MISSING && !snapshot.hasTemperature)) {
+    collectActiveMode(0x04, FAST_TEST_MODE ? "TEMP_ACTIVE" : "TEMP_FALLBACK", ACTIVE_TEMP_MS);
     delay(GAP_BETWEEN_ACTIVE_MODES_MS);
   }
 
-  // 5) HRV ativo fica só para debug. A fonte principal é 0x56.
-  if (TRY_ACTIVE_HRV_DEBUG && (!snapshot.hasHrv || !snapshot.hasFatigue)) {
-    collectActiveMode(0x01, "HRV_FATIGUE_DEBUG", ACTIVE_HRV_MS);
+  if (FAST_TEST_MODE || (TRY_ACTIVE_HRV_DEBUG && (!snapshot.hasHrv || !snapshot.hasFatigue))) {
+    collectActiveMode(0x01, FAST_TEST_MODE ? "HRV_FATIGUE_ACTIVE" : "HRV_FATIGUE_DEBUG", ACTIVE_HRV_MS);
     delay(GAP_BETWEEN_ACTIVE_MODES_MS);
   }
 
-  // 6) Segunda tentativa do 0x56 depois das medições ativas, caso a pulseira só tenha fechado o cálculo agora.
+  // Segunda tentativa do 0x56 se HRV/fadiga ainda faltando.
   if (!snapshot.hasHrv || !snapshot.hasFatigue) {
     captureHistoryEnabled = true;
     Serial.println("[HIST] Segunda tentativa HRV/fadiga 0x56 AA=0...");
     sendCmd(0x56, 0x00, 0x00, 0x00);
-    delay(4500);
+    delay(HIST_DELAY_LONG_MS);
 
-    Serial.println("[HIST] Segunda tentativa HRV/fadiga 0x56 AA=1 pos=0...");
-    sendCmd(0x56, 0x01, 0x00, 0x00);
-    delay(4500);
+    if (!FAST_TEST_MODE) {
+      Serial.println("[HIST] Segunda tentativa HRV/fadiga 0x56 AA=1 pos=0...");
+      sendCmd(0x56, 0x01, 0x00, 0x00);
+      delay(HIST_DELAY_LONG_MS);
 
-    Serial.println("[HIST] Segunda tentativa HRV/fadiga 0x56 AA=1 pos=1...");
-    sendCmd(0x56, 0x01, 0x01, 0x00);
-    delay(4500);
+      Serial.println("[HIST] Segunda tentativa HRV/fadiga 0x56 AA=1 pos=1...");
+      sendCmd(0x56, 0x01, 0x01, 0x00);
+      delay(HIST_DELAY_LONG_MS);
 
-    Serial.println("[HIST] Segunda tentativa HRV/fadiga 0x56 AA=2...");
-    sendCmd(0x56, 0x02, 0x00, 0x00);
-    delay(3000);
+      Serial.println("[HIST] Segunda tentativa HRV/fadiga 0x56 AA=2...");
+      sendCmd(0x56, 0x02, 0x00, 0x00);
+      delay(HIST_DELAY_SHORT_MS);
+    }
 
+    captureHistoryEnabled = false;
+  }
+
+  // Sono: segunda leitura se ainda não veio no histórico.
+  if (!snapshot.hasSleep) {
+    captureHistoryEnabled = true;
+    Serial.println("[HIST] Segunda tentativa sono 0x53...");
+    readHistorySleep();
+    delay(HIST_DELAY_MS);
     captureHistoryEnabled = false;
   }
 
@@ -1799,17 +1964,21 @@ bool pingHealth() {
 bool waitApiAwake() {
   Serial.println("[HTTP] Acordando API do Render...");
 
-  for (int attempt = 1; attempt <= 6; attempt++) {
+  const int maxAttempts = FAST_TEST_MODE ? 4 : 6;
+  const unsigned long retryDelayMs = FAST_TEST_MODE ? 4000UL : 7000UL;
+
+  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
     Serial.print("[HTTP] Wake attempt ");
     Serial.print(attempt);
-    Serial.println("/6");
+    Serial.print("/");
+    Serial.println(maxAttempts);
 
     if (pingHealth()) {
       Serial.println("[HTTP] API OK.");
       return true;
     }
 
-    delay(7000);
+    delay(retryDelayMs);
   }
 
   Serial.println("[HTTP] API não respondeu.");
@@ -1889,7 +2058,9 @@ bool sendPacketsFileToApi() {
   body += "\"deviceMac\":\"";
   body += DEVICE_MAC;
   body += "\",";
-  body += "\"source\":\"ESP32_APP_LIKE_DEBUG_15MIN\",";
+  body += "\"source\":\"";
+  body += apiSourceLabel();
+  body += "\",";
   body += "\"packets\":[";
 
   while (f.available()) {
@@ -1934,7 +2105,9 @@ bool sendPacketsFileToApi() {
       body += "\"deviceMac\":\"";
       body += DEVICE_MAC;
       body += "\",";
-      body += "\"source\":\"ESP32_APP_LIKE_DEBUG_15MIN\",";
+      body += "\"source\":\"";
+  body += apiSourceLabel();
+  body += "\",";
       body += "\"packets\":[";
     }
   }
@@ -2008,7 +2181,9 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println("ESP32 TESTE APP-LIKE 15MIN - BLE/WIFI ISOLADOS");
+  Serial.println(FAST_TEST_MODE
+    ? "ESP32 FAST TEST - ciclo ~3-4 min | BOOT 0=AUTO | 1=COLETA | 2=API"
+    : "ESP32 APP-LIKE 15MIN - BLE/WIFI ISOLADOS");
   Serial.println("BOOT 0=AUTO WAIT | BOOT 1=SYNC+DEBUG | BOOT 2=API");
   Serial.print("[BOOT] bootCounter=");
   Serial.println(bootCounter);

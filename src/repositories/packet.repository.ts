@@ -254,12 +254,36 @@ export async function getRecentHealthPackets(
   return attachMergedHealth(rows.map(rowToSavedPacket));
 }
 
+function snapshotToMergedHealth(snapshot: DecodedPacket & { type: "snapshot" }): DecodedHealth {
+  return {
+    type: "0x28",
+    measurementType: 0,
+    heartRate: snapshot.heartRate ?? 0,
+    spo2: snapshot.spo2 ?? 0,
+    temperature: snapshot.temperature ?? 0,
+    hrv: snapshot.hrv ?? 0,
+    fatigue: snapshot.fatigue ?? 0,
+    systolicPressure: snapshot.systolicPressure ?? 0,
+    diastolicPressure: snapshot.diastolicPressure ?? 0,
+    measurementMode: "unknown",
+  };
+}
+
 export async function getMergedHealthForDevice(
   deviceMac: string,
   windowMinutes = 5,
 ): Promise<DecodedHealth | null> {
-  const recent = await getRecentHealthPackets(deviceMac, 12);
   const cutoff = Date.now() - windowMinutes * 60 * 1000;
+  const snapshotPacket = await getLastSnapshotVitalsForDevice(deviceMac);
+  if (
+    snapshotPacket &&
+    new Date(snapshotPacket.createdAt).getTime() >= cutoff &&
+    snapshotPacket.decoded?.type === "snapshot"
+  ) {
+    return snapshotToMergedHealth(snapshotPacket.decoded);
+  }
+
+  const recent = await getRecentHealthPackets(deviceMac, 12);
   const decoded = recent
     .filter((packet) => new Date(packet.createdAt).getTime() >= cutoff)
     .map((packet) => freshDecoded(packet))

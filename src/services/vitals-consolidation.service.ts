@@ -4,7 +4,21 @@ import {
   normalizePacketType,
   PacketDecoderError,
   type DecodedPacket,
+  type DecodedSnapshot,
 } from "./packet-decoder.service.js";
+
+export function sleepFieldsFromMetrics(
+  metrics: PacketMetrics | undefined,
+): Pick<DecodedSnapshot, "sleepMinutes" | "sleepDate" | "sleepTime" | "sleepRecordId"> {
+  if (!metrics) return {};
+  const out: Pick<DecodedSnapshot, "sleepMinutes" | "sleepDate" | "sleepTime" | "sleepRecordId"> =
+    {};
+  if (typeof metrics.sleepMinutes === "number") out.sleepMinutes = metrics.sleepMinutes;
+  if (typeof metrics.sleepDate === "string") out.sleepDate = metrics.sleepDate;
+  if (typeof metrics.sleepTime === "string") out.sleepTime = metrics.sleepTime;
+  if (typeof metrics.sleepRecordId === "number") out.sleepRecordId = metrics.sleepRecordId;
+  return out;
+}
 
 /**
  * Consolidação de vitais para a leitura principal exposta à tela.

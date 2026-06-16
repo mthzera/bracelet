@@ -96,6 +96,10 @@ export type DecodedSnapshot = {
   fatigue: number | null;
   systolicPressure: number | null;
   diastolicPressure: number | null;
+  sleepMinutes?: number | null;
+  sleepDate?: string | null;
+  sleepTime?: string | null;
+  sleepRecordId?: number | null;
   /** Campos idênticos ao snapshot anterior — firmware pode estar enviando leitura repetida. */
   staleFields?: string[];
 };
