@@ -1,6 +1,6 @@
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { packetBatchPayloadSchema } from "./packet.schema.js";
-import { patientFieldSchema } from "./device.swagger.js";
+import { patientFieldSchema, idAtendimentoFieldSchema } from "./device.swagger.js";
 
 function flattenZodJsonSchema(schema: typeof packetBatchPayloadSchema): Record<string, unknown> {
   const json = zodToJsonSchema(schema, {
@@ -89,6 +89,7 @@ const measurementSnapshotSchema = {
     deviceMacReported: { type: "string", nullable: true },
     packetCount: { type: "integer", example: 15 },
     failedCount: { type: "integer", example: 0 },
+    idatendimento: idAtendimentoFieldSchema,
     patient: patientFieldSchema,
   },
 } as const;
@@ -125,6 +126,7 @@ const consolidatedSnapshotSchema = {
   required: ["deviceMac", "source", "measuredAt", "vitals", "sources", "quality"],
   properties: {
     deviceMac: { type: "string" },
+    idatendimento: idAtendimentoFieldSchema,
     source: { type: "string", example: "ESP32" },
     measuredAt: { type: "string", format: "date-time" },
     vitals: consolidatedVitalsSchema,
@@ -145,6 +147,7 @@ export const packetBatchSuccessResponseSchema = {
   required: ["deviceMac", "source", "snapshot", "stats"],
   properties: {
     deviceMac: { type: "string", example: "E6:64:0D:30:D3:F9" },
+    idatendimento: idAtendimentoFieldSchema,
     source: { type: "string", example: "ESP32" },
     ingestionBatchId: { type: "string", description: "Cycle id applied to every packet in this batch" },
     patient: patientFieldSchema,
@@ -176,6 +179,7 @@ const savedPacketSchema = {
   properties: {
     id: { type: "integer" },
     deviceMac: { type: "string" },
+    idatendimento: idAtendimentoFieldSchema,
     packetType: { type: "string" },
     rawHex: { type: "string" },
     source: { type: "string" },
@@ -199,6 +203,7 @@ const cycleSummaryItemSchema = {
   properties: {
     cycleId: { type: "string", description: "ingestionBatchId, ou win-<minId>-<maxId> p/ registros antigos" },
     deviceMac: { type: "string", example: "ef:7a:0d:30:b3:fa" },
+    idatendimento: idAtendimentoFieldSchema,
     patient: patientFieldSchema,
     source: { type: "string", example: "ESP32" },
     startedAt: { type: "string", format: "date-time" },

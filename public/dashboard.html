@@ -408,15 +408,17 @@
     <div class="summary-card">
       <div class="label">SpO2</div>
       <div class="value" id="sumSpo2" style="color:var(--accent2)">—<span class="unit">%</span></div>
+      <div class="sub" id="sumSpo2Time"></div>
     </div>
     <div class="summary-card">
       <div class="label">Temperature</div>
       <div class="value" id="sumTemp" style="color:var(--warn)">—<span class="unit">°C</span></div>
+      <div class="sub" id="sumTempTime"></div>
     </div>
     <div class="summary-card">
       <div class="label">Blood Pressure</div>
       <div class="value" id="sumBP" style="color:#c084fc;font-size:20px">—</div>
-      <div class="sub">mmHg</div>
+      <div class="sub" id="sumBPTime">mmHg</div>
     </div>
     <div class="summary-card">
       <div class="label">Steps</div>
@@ -425,6 +427,7 @@
     <div class="summary-card">
       <div class="label">Battery</div>
       <div class="value" id="sumBatVal">—<span class="unit">%</span></div>
+      <div class="sub" id="sumBatTime"></div>
       <div class="battery-bar-wrap">
         <div class="battery-bar"><div class="battery-fill" id="sumBatBar" style="width:0%;background:var(--accent2)"></div></div>
       </div>
@@ -600,6 +603,31 @@
     return field(p, 'packetType', 'packet_type') === 'SNAPSHOT_VITALS';
   }
 
+  function latestSnapshotPacket() {
+    return packets.find(p => isSnapshotPacket(p) && p.decoded?.type === 'snapshot') || null;
+  }
+
+  function vitalMeasuredAtMap() {
+    const snap = latestSnapshotPacket();
+    return snap?.decoded?.vitalMeasuredAt || {};
+  }
+
+  function formatVitalCard(ts) {
+    if (!ts) return '';
+    const d = new Date(ts);
+    const time = d.toLocaleTimeString('pt-BR', { hour12: false });
+    const date = d.toLocaleDateString('pt-BR', { day: 'numeric', month: 'long' });
+    return `${time} ${date}`;
+  }
+
+  function metricRow(name, valueHtml, measuredAt) {
+    const ts = measuredAt ? `<div class="sub" style="margin-top:2px;font-size:11px">${formatVitalCard(measuredAt)}</div>` : '';
+    return `<div class="metric-row">
+      <span class="metric-name">${name}</span>
+      <span style="text-align:right">${valueHtml}${ts}</span>
+    </div>`;
+  }
+
   function latestVital(getValue) {
     const mac = selectedDeviceMac();
     const device = mac ? devices.find(d => normalizeMac(d.deviceMac) === normalizeMac(mac)) : null;
@@ -731,24 +759,29 @@
     }
 
     // Vitais
+    const vTimes = vitalMeasuredAtMap();
     const hr = latestVital(v => v.heartRate);
     document.getElementById('sumHR').innerHTML = (hr && hr.value != null)
       ? hr.value + '<span class="unit">bpm</span>'
       : '--<span class="unit">bpm</span>';
-    document.getElementById('sumHRTime').textContent = hr?.time ? relTime(hr.time) : '';
+    document.getElementById('sumHRTime').textContent =
+      formatVitalCard(vTimes.heartRate) || (hr?.time ? relTime(hr.time) : '');
 
     const spo2 = latestVital(v => v.spo2);
     document.getElementById('sumSpo2').innerHTML = (spo2 && spo2.value != null)
       ? spo2.value + '<span class="unit">%</span>'
       : '--<span class="unit">%</span>';
+    document.getElementById('sumSpo2Time').textContent = formatVitalCard(vTimes.spo2);
 
     const temp = latestVital(v => v.temperature);
     document.getElementById('sumTemp').innerHTML = (temp && temp.value != null)
       ? temp.value + '<span class="unit">°C</span>'
       : '--<span class="unit">°C</span>';
+    document.getElementById('sumTempTime').textContent = formatVitalCard(vTimes.temperature);
 
     // Blood Pressure
     const bpVital = latestVital(v => v.systolicPressure || v.diastolicPressure);
+    const bpTimeEl = document.getElementById('sumBPTime');
     if (bpVital) {
       const view = (() => {
         for (const p of packets) {
@@ -761,11 +794,14 @@
       if (view && view.systolicPressure > 0) {
         document.getElementById('sumBP').innerHTML =
           `${view.systolicPressure}/<span style="font-size:18px">${view.diastolicPressure}</span>`;
+        bpTimeEl.textContent = formatVitalCard(vTimes.bloodPressure) || 'mmHg';
       } else {
         document.getElementById('sumBP').textContent = '—';
+        bpTimeEl.textContent = 'mmHg';
       }
     } else {
       document.getElementById('sumBP').textContent = '—';
+      bpTimeEl.textContent = 'mmHg';
     }
 
     // Steps (realtime 0x09)
@@ -775,8 +811,11 @@
       : '—';
 
     // Battery
+    const snapDecoded = latestSnapshotPacket()?.decoded;
     const batPacket = packets.find(p => p.decoded?.type === '0x13');
-    const batPct = device?.battery ?? batPacket?.decoded?.battery ?? null;
+    const batPct = device?.battery ?? snapDecoded?.battery ?? batPacket?.decoded?.battery ?? null;
+    const batTime = formatVitalCard(vTimes.battery);
+    document.getElementById('sumBatTime').textContent = batTime;
     if (batPct != null) {
       const color = batPct > 50 ? 'var(--accent2)' : batPct > 20 ? 'var(--warn)' : 'var(--danger)';
       document.getElementById('sumBatVal').innerHTML = batPct + '<span class="unit">%</span>';
@@ -839,6 +878,7 @@
 
     const d = h.decoded;
     const stale = new Set(Array.isArray(d?.staleFields) ? d.staleFields : []);
+    const vTimes = d?.vitalMeasuredAt || {};
 
     const bpVal = (d.systolicPressure != null && d.systolicPressure > 0)
       ? `${d.systolicPressure}/${d.diastolicPressure}`
@@ -852,30 +892,13 @@
     const source = isSnapshotPacket(h) ? 'SNAPSHOT_VITALS' : (d.type || '0x28');
 
     el.innerHTML = `
-      <div class="metric-row">
-        <span class="metric-name">&#x2764;&#xFE0F; Heart Rate</span>
-        <span>${fmtVal(d.heartRate, '#ff6b8a', false)}<span class="metric-unit">bpm</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x1F4A8; SpO2</span>
-        <span>${fmtVal(d.spo2, 'var(--accent2)', false)}<span class="metric-unit">%</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x1F321;&#xFE0F; Temperature</span>
-        <span>${fmtVal(d.temperature, 'var(--warn)', false)}<span class="metric-unit">°C</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x1FA78; Blood Pressure</span>
-        <span>${bpDisplay}<span class="metric-unit">mmHg</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x1F9E0; HRV</span>
-        <span>${fmtVal(d.hrv, '#38bdf8', stale.has('hrv'))}<span class="metric-unit">ms</span></span>
-      </div>
-      <div class="metric-row">
-        <span class="metric-name">&#x26A1; Fadiga</span>
-        <span>${fmtVal(d.fatigue, null, stale.has('fatigue'))}</span>
-      </div>
+      ${metricRow('&#x2764;&#xFE0F; Heart Rate', `${fmtVal(d.heartRate, '#ff6b8a', false)}<span class="metric-unit">bpm</span>`, vTimes.heartRate)}
+      ${metricRow('&#x1F4A8; SpO2', `${fmtVal(d.spo2, 'var(--accent2)', false)}<span class="metric-unit">%</span>`, vTimes.spo2)}
+      ${metricRow('&#x1F321;&#xFE0F; Temperature', `${fmtVal(d.temperature, 'var(--warn)', false)}<span class="metric-unit">°C</span>`, vTimes.temperature)}
+      ${metricRow('&#x1FA78; Blood Pressure', `${bpDisplay}<span class="metric-unit">mmHg</span>`, vTimes.bloodPressure)}
+      ${metricRow('&#x1F9E0; HRV', `${fmtVal(d.hrv, '#38bdf8', stale.has('hrv'))}<span class="metric-unit">ms</span>`, vTimes.hrv)}
+      ${metricRow('&#x26A1; Fadiga', `${fmtVal(d.fatigue, null, stale.has('fatigue'))}`, vTimes.fatigue)}
+      ${typeof d.battery === 'number' ? metricRow('&#x1F50B; Bateria', `<span class="metric-val" style="color:var(--warn)">${d.battery}</span><span class="metric-unit">%</span>`, vTimes.battery) : ''}
       <div class="metric-row">
         <span class="metric-name">Fonte</span>
         <span class="badge badge-health">${source}</span>

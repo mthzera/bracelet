@@ -43,24 +43,35 @@ export function resolvePatientForMac(mac: string): ResolvedPatient | null {
   };
 }
 
+export function resolveIdAtendimentoForMac(mac: string): number | null {
+  return resolvePatientForMac(mac)?.idatendimento ?? null;
+}
+
 export function enrichWithPatient<T extends { deviceMac: string }>(
   item: T,
-): T & { patient: ResolvedPatient | null } {
+): T & { patient: ResolvedPatient | null; idatendimento: number | null } {
+  const patient = resolvePatientForMac(item.deviceMac);
   return {
     ...item,
-    patient: resolvePatientForMac(item.deviceMac),
+    patient,
+    idatendimento: patient?.idatendimento ?? null,
   };
 }
 
 function batteryFromPacket(packet: SavedPacket | null): number | null {
-  if (!packet?.decoded || packet.decoded.type !== "0x13") return null;
-  return packet.decoded.battery;
+  if (!packet?.decoded) return null;
+  if (packet.decoded.type === "0x13") return packet.decoded.battery;
+  if (packet.decoded.type === "snapshot" && typeof packet.decoded.battery === "number") {
+    return packet.decoded.battery;
+  }
+  return null;
 }
 
 export async function buildDeviceOverview(bracelet: TestBracelet): Promise<DeviceOverview> {
-  const [mergedHealth, batteryPacket, lastPacket] = await Promise.all([
+  const [mergedHealth, batteryPacket, snapshotPacket, lastPacket] = await Promise.all([
     getMergedHealthForDevice(bracelet.deviceMac),
     getLatestPacketForDevice(bracelet.deviceMac, "0x13"),
+    getLatestPacketForDevice(bracelet.deviceMac, "SNAPSHOT_VITALS"),
     getLatestPacketForDevice(bracelet.deviceMac),
   ]);
 
@@ -75,7 +86,7 @@ export async function buildDeviceOverview(bracelet: TestBracelet): Promise<Devic
     patient: bracelet.patient,
     online,
     lastSeenAt,
-    battery: batteryFromPacket(batteryPacket),
+    battery: batteryFromPacket(batteryPacket) ?? batteryFromPacket(snapshotPacket),
     mergedHealth,
   };
 }

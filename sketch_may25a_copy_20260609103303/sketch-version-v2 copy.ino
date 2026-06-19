@@ -52,7 +52,6 @@ RTC_DATA_ATTR bool hasLastAcceptedHrv = false;
 RTC_DATA_ATTR bool hasLastAcceptedFatigue = false;
 RTC_DATA_ATTR bool hasLastAcceptedBp = false;
 RTC_DATA_ATTR uint8_t brownoutSkipBoot0Count = 0;
-RTC_DATA_ATTR uint8_t spo2FailStreak = 0;
 
 // ============================================================
 // MODO RÁPIDO PARA TESTE
@@ -66,10 +65,9 @@ const bool FAST_TEST_MODE = true;
 const uint64_t COLLECT_SLEEP_SECONDS = FAST_TEST_MODE ? 5ULL : 900ULL;
 const uint64_t SHORT_SLEEP_SECONDS = FAST_TEST_MODE ? 3ULL : 5ULL;
 
-// Timeouts da sequência de teste — espera até o dado chegar (não corta cedo).
-const unsigned long TEST_HRV_FATIGUE_BP_MS = 300000UL;  // 5 min
-const unsigned long TEST_SPO2_MS = 300000UL;            // 5 min
-const unsigned long TEST_BPM_TEMP_MS = 180000UL;          // 3 min fallback 0x02
+// Timeouts da sequência de teste: HRV+PA → SpO2 (BPM/temp só verifica, sem ligar 0x02).
+const unsigned long TEST_HRV_FATIGUE_BP_MS = 180000UL;
+const unsigned long TEST_SPO2_MS = 180000UL;
 
 // Delays de leitura de histórico BLE (cada comando 0x54/0x56/…)
 const unsigned long HIST_DELAY_MS = FAST_TEST_MODE ? 1800UL : 3500UL;
@@ -77,10 +75,6 @@ const unsigned long HIST_DELAY_LONG_MS = FAST_TEST_MODE ? 2200UL : 4500UL;
 const unsigned long HIST_DELAY_SHORT_MS = FAST_TEST_MODE ? 1400UL : 3000UL;
 const unsigned long STOP_ACTIVE_DELAY_MS = FAST_TEST_MODE ? 400UL : 1000UL;
 const unsigned long GAP_BETWEEN_ACTIVE_MODES_MS = FAST_TEST_MODE ? 600UL : 1200UL;
-const unsigned long GAP_BEFORE_SPO2_MS = FAST_TEST_MODE ? 4000UL : 2000UL;
-const unsigned long ACTIVE_PROGRESS_LOG_MS = 30000UL;
-const unsigned long SPO2_SENSOR_KICK_MS = 90000UL;
-const uint64_t SPO2_RETRY_SLEEP_SECONDS = 12ULL;
 
 // ============================================================
 // ESTRATÉGIA DE MEDIÇÃO
@@ -144,17 +138,6 @@ const unsigned long SAVE_028_EVERY_MS = 5000UL;
 
 unsigned long lastPrint028 = 0;
 unsigned long lastSave028 = 0;
-
-#define MAX_PENDING_TIMING_LOGS 6
-
-struct PendingTimingEntry {
-  char label[12];
-  char detail[32];
-};
-
-volatile uint8_t pendingTimingCount = 0;
-PendingTimingEntry pendingTimingQueue[MAX_PENDING_TIMING_LOGS];
-volatile uint32_t ble028ReceivedCount = 0;
 
 // ============================================================
 // SNAPSHOT
@@ -400,9 +383,13 @@ bool initStorage() {
   return true;
 }
 
-void clearPacketsFileOnly() {
+void clearPacketsFile() {
   if (SPIFFS.exists(PACKETS_FILE)) {
     SPIFFS.remove(PACKETS_FILE);
+  }
+
+  if (SPIFFS.exists(VITALS_SNAPSHOT_FILE)) {
+    SPIFFS.remove(VITALS_SNAPSHOT_FILE);
   }
 
   File f = SPIFFS.open(PACKETS_FILE, FILE_WRITE);
@@ -412,20 +399,7 @@ void clearPacketsFileOnly() {
   }
 
   f.close();
-}
-
-void clearCollectionForNewCycle() {
-  clearPacketsFileOnly();
-
-  if (SPIFFS.exists(VITALS_SNAPSHOT_FILE)) {
-    SPIFFS.remove(VITALS_SNAPSHOT_FILE);
-  }
-
-  Serial.println("[FS] Arquivos de coleta limpos (novo ciclo).");
-}
-
-void clearPacketsFile() {
-  clearCollectionForNewCycle();
+  Serial.println("[FS] Arquivo de pacotes limpo.");
 }
 
 void appendRawPacketToFile(const char* packetType, const String& rawHex, uint32_t receivedAtMs) {
@@ -662,36 +636,6 @@ void logVitalFirstFound(const char* label, const char* detail) {
   Serial.println();
 }
 
-void queueVitalFirstFound(const char* label, const char* detail) {
-  if (pendingTimingCount >= MAX_PENDING_TIMING_LOGS) return;
-
-  PendingTimingEntry* entry = &pendingTimingQueue[pendingTimingCount++];
-  strncpy(entry->label, label, sizeof(entry->label) - 1);
-  entry->label[sizeof(entry->label) - 1] = '\0';
-  strncpy(entry->detail, detail, sizeof(entry->detail) - 1);
-  entry->detail[sizeof(entry->detail) - 1] = '\0';
-}
-
-void flushPendingTimingLogs() {
-  while (pendingTimingCount > 0) {
-    PendingTimingEntry entry = pendingTimingQueue[0];
-    for (uint8_t i = 1; i < pendingTimingCount; i++) {
-      pendingTimingQueue[i - 1] = pendingTimingQueue[i];
-    }
-    pendingTimingCount--;
-    logVitalFirstFound(entry.label, entry.detail);
-  }
-}
-
-bool onlySpo2Missing() {
-  return !snapshot.hasSpo2 &&
-         snapshot.hasHrv &&
-         snapshot.hasFatigue &&
-         snapshot.hasBloodPressure &&
-         snapshot.hasBpm &&
-         snapshot.hasTemperature;
-}
-
 void updateSnapshotBpm(uint8_t bpm, const char* source) {
   if (!validBpm(bpm)) return;
 
@@ -704,7 +648,7 @@ void updateSnapshotBpm(uint8_t bpm, const char* source) {
   if (first) {
     char buf[24];
     snprintf(buf, sizeof(buf), "bpm=%u", bpm);
-    queueVitalFirstFound("BPM", buf);
+    logVitalFirstFound("BPM", buf);
   }
 }
 
@@ -720,7 +664,7 @@ void updateSnapshotSpo2(uint8_t spo2, const char* source) {
   if (first) {
     char buf[24];
     snprintf(buf, sizeof(buf), "spo2=%u%%", spo2);
-    queueVitalFirstFound("SpO2", buf);
+    logVitalFirstFound("SpO2", buf);
   }
 }
 
@@ -736,7 +680,7 @@ void updateSnapshotTemperature(float temp, const char* source) {
   if (first) {
     char buf[24];
     snprintf(buf, sizeof(buf), "temp=%.1fC", temp);
-    queueVitalFirstFound("TEMP", buf);
+    logVitalFirstFound("TEMP", buf);
   }
 }
 
@@ -752,7 +696,7 @@ void updateSnapshotHrv(uint8_t hrv, const char* source) {
   if (first) {
     char buf[24];
     snprintf(buf, sizeof(buf), "hrv=%u", hrv);
-    queueVitalFirstFound("HRV", buf);
+    logVitalFirstFound("HRV", buf);
   }
 }
 
@@ -768,7 +712,7 @@ void updateSnapshotFatigue(uint8_t fatigue, const char* source) {
   if (first) {
     char buf[24];
     snprintf(buf, sizeof(buf), "fadiga=%u", fatigue);
-    queueVitalFirstFound("FADIGA", buf);
+    logVitalFirstFound("FADIGA", buf);
   }
 }
 
@@ -786,7 +730,7 @@ void updateSnapshotBloodPressure(uint8_t sys, uint8_t dia, const char* source, c
   if (first) {
     char buf[32];
     snprintf(buf, sizeof(buf), "pa=%u/%u", sys, dia);
-    queueVitalFirstFound("PRESSAO", buf);
+    logVitalFirstFound("PRESSAO", buf);
   }
 }
 
@@ -820,146 +764,6 @@ void printSnapshotMissing() {
   if (!snapshot.hasSpo2) Serial.println("  - SpO2");
   if (!snapshot.hasBpm) Serial.println("  - BPM");
   if (!snapshot.hasTemperature) Serial.println("  - temperatura");
-}
-
-bool jsonMetricIsNull(const String& json, const char* key) {
-  String needle = String("\"") + key + "\":null";
-  return json.indexOf(needle) >= 0;
-}
-
-bool jsonParseIntAfterKey(const String& json, const char* key, int& out) {
-  if (jsonMetricIsNull(json, key)) return false;
-
-  String needle = String("\"") + key + "\":";
-  int idx = json.indexOf(needle);
-  if (idx < 0) return false;
-
-  idx += needle.length();
-  out = json.substring(idx).toInt();
-  return true;
-}
-
-bool jsonParseFloatAfterKey(const String& json, const char* key, float& out) {
-  if (jsonMetricIsNull(json, key)) return false;
-
-  String needle = String("\"") + key + "\":";
-  int idx = json.indexOf(needle);
-  if (idx < 0) return false;
-
-  idx += needle.length();
-  int end = idx;
-  while (end < (int)json.length() &&
-         (isdigit(json[end]) || json[end] == '.' || json[end] == '-')) {
-    end++;
-  }
-
-  out = json.substring(idx, end).toFloat();
-  return true;
-}
-
-uint16_t jsonParseSampleCount(const String& json, const char* key) {
-  int section = json.indexOf("\"sampleCounts\":{");
-  if (section < 0) return 0;
-
-  String sub = json.substring(section);
-  String needle = String("\"") + key + "\":";
-  int idx = sub.indexOf(needle);
-  if (idx < 0) return 0;
-
-  idx += needle.length();
-  return (uint16_t)sub.substring(idx).toInt();
-}
-
-uint32_t jsonParseRawHash(const String& json, const char* key) {
-  int section = json.indexOf("\"selectedRawHashes\":{");
-  if (section < 0) return 0;
-
-  String sub = json.substring(section);
-  String needle = String("\"") + key + "\":";
-  int idx = sub.indexOf(needle);
-  if (idx < 0) return 0;
-
-  idx += needle.length();
-  return (uint32_t)sub.substring(idx).toInt();
-}
-
-bool tryLoadPartialSnapshot() {
-  if (!SPIFFS.exists(VITALS_SNAPSHOT_FILE)) return false;
-
-  File f = SPIFFS.open(VITALS_SNAPSHOT_FILE, FILE_READ);
-  if (!f) return false;
-
-  String json = f.readString();
-  f.close();
-
-  if (json.length() == 0) return false;
-  if (json.indexOf("\"snapshotComplete\":true") >= 0) return false;
-  if (json.indexOf("\"snapshotComplete\":false") < 0) return false;
-
-  resetSnapshot();
-
-  int v = 0;
-  float temp = 0;
-
-  if (jsonParseIntAfterKey(json, "hrv", v) && validHrv((uint8_t)v)) {
-    snapshot.hasHrv = true;
-    snapshot.hrv = (uint8_t)v;
-    snapshot.hrvSource = "partial_resume";
-    snapshot.hrvSamples = jsonParseSampleCount(json, "hrv");
-  }
-
-  if (jsonParseIntAfterKey(json, "fatigue", v) && validFatigue((uint8_t)v)) {
-    snapshot.hasFatigue = true;
-    snapshot.fatigue = (uint8_t)v;
-    snapshot.fatigueSource = "partial_resume";
-    snapshot.fatigueSamples = jsonParseSampleCount(json, "fatigue");
-  }
-
-  if (jsonParseIntAfterKey(json, "bloodPressureSystolic", v)) {
-    int dia = 0;
-    if (jsonParseIntAfterKey(json, "bloodPressureDiastolic", dia) &&
-        validBloodPressure((uint8_t)v, (uint8_t)dia)) {
-      snapshot.hasBloodPressure = true;
-      snapshot.systolic = (uint8_t)v;
-      snapshot.diastolic = (uint8_t)dia;
-      snapshot.bpSource = "partial_resume";
-      snapshot.bpQuality = "partial_resume";
-      snapshot.bpSamples = jsonParseSampleCount(json, "bloodPressure");
-    }
-  }
-
-  if (jsonParseIntAfterKey(json, "spo2", v) && validSpo2((uint8_t)v)) {
-    snapshot.hasSpo2 = true;
-    snapshot.spo2 = (uint8_t)v;
-    snapshot.spo2Source = "partial_resume";
-    snapshot.spo2Samples = jsonParseSampleCount(json, "spo2");
-  }
-
-  if (jsonParseIntAfterKey(json, "bpm", v) && validBpm((uint8_t)v)) {
-    snapshot.hasBpm = true;
-    snapshot.bpm = (uint8_t)v;
-    snapshot.bpmSource = "partial_resume";
-    snapshot.bpmSamples = jsonParseSampleCount(json, "bpm");
-  }
-
-  if (jsonParseFloatAfterKey(json, "temperature", temp) && validTemperature(temp)) {
-    snapshot.hasTemperature = true;
-    snapshot.temperature = temp;
-    snapshot.temperatureSource = "partial_resume";
-    snapshot.temperatureSamples = jsonParseSampleCount(json, "temperature");
-  }
-
-  jsonParseIntAfterKey(json, "measurementSessionId", v);
-  if (v > 0) measurementSessionId = (uint32_t)v;
-
-  selectedHrvRawHash = jsonParseRawHash(json, "hrvFatigue");
-  selectedBpRawHash = jsonParseRawHash(json, "bloodPressure");
-  selectedPacket09RawHash = jsonParseRawHash(json, "packet09");
-
-  if (snapshotComplete()) return false;
-
-  Serial.println("[SNAPSHOT] Checkpoint parcial carregado do SPIFFS.");
-  return true;
 }
 
 void finalizeSnapshotFreshness() {
@@ -1524,14 +1328,13 @@ void disableAutoConfigs() {
 
 void handleActivePacket028(uint8_t* data, size_t len) {
   if (len < 10) {
+    Serial.println("[0x28] Pacote curto, ignorado.");
     return;
   }
 
   if (!captureFreshActiveEnabled) {
     return;
   }
-
-  ble028ReceivedCount++;
 
   unsigned long now = millis();
 
@@ -1549,11 +1352,9 @@ void handleActivePacket028(uint8_t* data, size_t len) {
   uint8_t pressaoBaixa = data[7];
   float temp = parseTempLittleEndian(data[8], data[9]);
 
-  // Durante SpO2, aceita spo2 válido mesmo se packetMode vier errado (pulseira às vezes manda 0x01).
+  // Evita aceitar notificação atrasada de outro modo.
+  // Ex.: iniciou SpO2, mas ainda chegou um 0x28 do modo HR/BP anterior.
   if (packetMode != currentActiveMode) {
-    if (currentActiveMode == 0x03 && !snapshot.hasSpo2 && validSpo2(spo2)) {
-      updateSnapshotSpo2(spo2, "0x28_SPO2_RELAXED");
-    }
     if (VERBOSE_BLE_LOGS) {
       Serial.print("[0x28 ACTIVE] Ignorado por modo diferente. collecting=0x");
       Serial.print(currentActiveMode, HEX);
@@ -1783,8 +1584,9 @@ void notifyCallback(
     return;
   }
 
+  // Flood de 0x09 durante SpO2/HRV esgota heap — só processa se ainda faltar BPM/temp.
   if (type == 0x09) {
-    if (snapshot.hasBpm && snapshot.hasTemperature) {
+    if (captureFreshActiveEnabled && snapshot.hasBpm && snapshot.hasTemperature) {
       return;
     }
     handlePacket09(data, len);
@@ -1921,58 +1723,19 @@ uint16_t tempSamplesAtModeStart = 0;
 uint16_t hrvSamplesAtModeStart = 0;
 uint16_t fatigueSamplesAtModeStart = 0;
 uint16_t bpSamplesAtModeStart = 0;
-bool hadHrvAtModeStart = false;
-bool hadFatigueAtModeStart = false;
-bool hadBpAtModeStart = false;
-bool hadBpmAtModeStart = false;
-bool hadTempAtModeStart = false;
 
 bool fastTestHrvFatigueBpTargetReached() {
-  if (hadHrvAtModeStart) {
-    if (!snapshot.hasHrv) return false;
-  } else if (!snapshot.hasHrv ||
-             (snapshot.hrvSamples - hrvSamplesAtModeStart) < MIN_HRV_SAMPLES) {
-    return false;
-  }
-
-  if (hadFatigueAtModeStart) {
-    if (!snapshot.hasFatigue) return false;
-  } else if (!snapshot.hasFatigue ||
-             (snapshot.fatigueSamples - fatigueSamplesAtModeStart) < MIN_FATIGUE_SAMPLES) {
-    return false;
-  }
-
-  if (hadBpAtModeStart) {
-    if (!snapshot.hasBloodPressure) return false;
-  } else if (!snapshot.hasBloodPressure ||
-             (snapshot.bpSamples - bpSamplesAtModeStart) < MIN_BP_SAMPLES) {
-    return false;
-  }
-
-  return true;
-}
-
-bool fastTestBpmTempTargetReached() {
-  if (hadBpmAtModeStart) {
-    if (!snapshot.hasBpm) return false;
-  } else if (!snapshot.hasBpm ||
-             (snapshot.bpmSamples - bpmSamplesAtModeStart) < MIN_BPM_SAMPLES) {
-    return false;
-  }
-
-  if (hadTempAtModeStart) {
-    if (!snapshot.hasTemperature) return false;
-  } else if (!snapshot.hasTemperature ||
-             (snapshot.temperatureSamples - tempSamplesAtModeStart) < MIN_TEMP_SAMPLES) {
-    return false;
-  }
-
-  return true;
+  return snapshot.hasHrv &&
+         snapshot.hasFatigue &&
+         snapshot.hasBloodPressure &&
+         (snapshot.hrvSamples - hrvSamplesAtModeStart) >= MIN_HRV_SAMPLES &&
+         (snapshot.fatigueSamples - fatigueSamplesAtModeStart) >= MIN_FATIGUE_SAMPLES &&
+         (snapshot.bpSamples - bpSamplesAtModeStart) >= MIN_BP_SAMPLES;
 }
 
 bool activeModeTargetReached(uint8_t mode) {
   if (mode == 0x02) {
-    if (FAST_TEST_MODE) return fastTestBpmTempTargetReached();
+    if (FAST_TEST_MODE) return snapshot.hasBpm;
     return snapshot.bpmSamples >= MIN_BPM_SAMPLES;
   }
 
@@ -1991,31 +1754,6 @@ bool activeModeTargetReached(uint8_t mode) {
   }
 
   return false;
-}
-
-void kickActiveSpo2Sensor(uint8_t kickNumber) {
-  Serial.print("[FRESH] SpO2 sem resposta — reiniciando sensor 0x03 (kick ");
-  Serial.print(kickNumber);
-  Serial.println(")");
-  stopActive028(0x03);
-  delay(2000);
-  startActive028(0x03);
-  currentActiveModeAcceptAfterMs = millis() + ACTIVE_WARMUP_MS;
-  ble028ReceivedCount = 0;
-}
-
-void trySpo2HistoryFallback() {
-  if (snapshot.hasSpo2 || !FAST_TEST_MODE) return;
-
-  Serial.println("[FALLBACK] SpO2 ativo falhou — tentando histórico 0x66...");
-  captureHistoryEnabled = true;
-  readHistorySpo2Auto();
-  delay(HIST_DELAY_LONG_MS);
-  captureHistoryEnabled = false;
-
-  if (snapshot.hasSpo2) {
-    Serial.println("[FALLBACK] SpO2 obtido via histórico 0x66.");
-  }
 }
 
 void collectActiveMode(uint8_t mode, const char* label, unsigned long durationMs) {
@@ -2041,29 +1779,13 @@ void collectActiveMode(uint8_t mode, const char* label, unsigned long durationMs
   fatigueSamplesAtModeStart = snapshot.fatigueSamples;
   bpSamplesAtModeStart = snapshot.bpSamples;
 
-  if (mode == 0x01 && FAST_TEST_MODE) {
-    hadHrvAtModeStart = snapshot.hasHrv;
-    hadFatigueAtModeStart = snapshot.hasFatigue;
-    hadBpAtModeStart = snapshot.hasBloodPressure;
-  }
-
-  if (mode == 0x02 && FAST_TEST_MODE) {
-    hadBpmAtModeStart = snapshot.hasBpm;
-    hadTempAtModeStart = snapshot.hasTemperature;
-  }
-
   startActive028(mode);
 
   unsigned long start = millis();
   unsigned long targetReachedAt = 0;
-  unsigned long lastProgressLogAt = start;
-  unsigned long lastSpo2KickAt = 0;
-  uint8_t spo2KickCount = 0;
-  ble028ReceivedCount = 0;
 
   while (millis() - start < durationMs) {
     delay(500);
-    flushPendingTimingLogs();
 
     if (heapCriticallyLow()) {
       Serial.println("[MEM] Heap crítico — encerrando modo ativo para evitar travamento.");
@@ -2071,37 +1793,10 @@ void collectActiveMode(uint8_t mode, const char* label, unsigned long durationMs
       break;
     }
 
-    unsigned long elapsed = millis() - start;
-
-    if (mode == 0x03 && !snapshot.hasSpo2) {
-      if (spo2KickCount < 2 && elapsed >= SPO2_SENSOR_KICK_MS * (spo2KickCount + 1)) {
-        if (lastSpo2KickAt == 0 || (millis() - lastSpo2KickAt) >= SPO2_SENSOR_KICK_MS) {
-          spo2KickCount++;
-          lastSpo2KickAt = millis();
-          kickActiveSpo2Sensor(spo2KickCount);
-        }
-      }
-    }
-
-    if (millis() - lastProgressLogAt >= ACTIVE_PROGRESS_LOG_MS) {
-      lastProgressLogAt = millis();
-      Serial.print("[FRESH] aguardando modo=");
-      Serial.print(label);
-      Serial.print(" elapsed=");
-      Serial.print(elapsed / 1000);
-      Serial.print("s 0x28=");
-      Serial.print(ble028ReceivedCount);
-      Serial.print(" heap=");
-      Serial.println(ESP.getFreeHeap());
-    }
-
     bool reached = false;
     if (mode == 0x02) {
-      if (FAST_TEST_MODE) {
-        reached = fastTestBpmTempTargetReached();
-      } else {
-        reached = (snapshot.bpmSamples - bpmSamplesAtModeStart) >= MIN_BPM_SAMPLES;
-      }
+      reached = (snapshot.bpmSamples - bpmSamplesAtModeStart) >= MIN_BPM_SAMPLES;
+      if (FAST_TEST_MODE) reached = reached && snapshot.hasBpm;
     } else if (mode == 0x03) {
       reached = (snapshot.spo2Samples - spo2SamplesAtModeStart) >= MIN_SPO2_SAMPLES;
       if (FAST_TEST_MODE) reached = reached && snapshot.hasSpo2;
@@ -2147,7 +1842,6 @@ void collectActiveMode(uint8_t mode, const char* label, unsigned long durationMs
   delay(STOP_ACTIVE_DELAY_MS);
 
   captureFreshActiveEnabled = false;
-  flushPendingTimingLogs();
 
   Serial.print("[FRESH] STOP modo=");
   Serial.println(label);
@@ -2243,7 +1937,7 @@ void logBpmTempCheck() {
     Serial.print(sessionMs);
     Serial.println("ms");
   } else {
-    Serial.println("[CHECK] BPM ausente — tentará modo 0x02 se necessário.");
+    Serial.println("[CHECK] BPM ausente — não vou ligar modo 0x02.");
   }
 
   if (snapshot.hasTemperature) {
@@ -2258,39 +1952,7 @@ void logBpmTempCheck() {
     Serial.print(sessionMs);
     Serial.println("ms");
   } else {
-    Serial.println("[CHECK] Temperatura ausente — tentará modo 0x02 se necessário.");
-  }
-}
-
-void collectFastTestVitalsIncremental() {
-  bool needHrvGroup = !snapshot.hasHrv || !snapshot.hasFatigue || !snapshot.hasBloodPressure;
-
-  if (needHrvGroup) {
-    Serial.println("[INCR] Modo 0x01 — HRV/fadiga/PA (só o que falta)");
-    collectActiveMode(0x01, "TEST_HRV_FATIGUE_BP", TEST_HRV_FATIGUE_BP_MS);
-    delay(GAP_BETWEEN_ACTIVE_MODES_MS);
-  } else {
-    Serial.println("[INCR] HRV/fadiga/PA já OK — pulando 0x01");
-  }
-
-  if (!snapshot.hasSpo2) {
-    Serial.println("[INCR] Pausa antes SpO2 (pulseira troca sensor)...");
-    delay(GAP_BEFORE_SPO2_MS);
-    Serial.println("[INCR] Modo 0x03 — SpO2");
-    collectActiveMode(0x03, "TEST_SPO2", TEST_SPO2_MS);
-    if (!snapshot.hasSpo2) {
-      trySpo2HistoryFallback();
-    }
-    delay(GAP_BETWEEN_ACTIVE_MODES_MS);
-  } else {
-    Serial.println("[INCR] SpO2 já OK — pulando 0x03");
-  }
-
-  logBpmTempCheck();
-
-  if (!snapshot.hasBpm || !snapshot.hasTemperature) {
-    Serial.println("[INCR] Modo 0x02 — BPM/temp (fallback, aguarda até chegar)");
-    collectActiveMode(0x02, "TEST_BPM_TEMP", TEST_BPM_TEMP_MS);
+    Serial.println("[CHECK] Temperatura ausente — não vou ligar modo 0x02.");
   }
 }
 
@@ -2337,7 +1999,7 @@ void printTimingSummary() {
 
 void collectFreshActiveVitals() {
   Serial.println(FAST_TEST_MODE
-    ? "[MODE] BOOT 1 - TESTE RÁPIDO (incremental: só mede o que falta)"
+    ? "[MODE] BOOT 1 - TESTE RÁPIDO (HRV+PA → SpO2 → check BPM/temp)"
     : "[MODE] BOOT 1 - SYNC APP-LIKE 2 POR HORA");
 
   if (!connectBle()) {
@@ -2347,30 +2009,10 @@ void collectFreshActiveVitals() {
     goToDeepSleep(retrySec, 1);
   }
 
-  bool resumed = tryLoadPartialSnapshot();
+  clearPacketsFile();
+  resetSnapshot();
 
-  if (!resumed) {
-    clearCollectionForNewCycle();
-    resetSnapshot();
-    measurementSessionId = bootCounter;
-  } else {
-    Serial.println("[MODE] Retomando snapshot parcial. Ainda faltam:");
-    printSnapshotMissing();
-    if (!SPIFFS.exists(PACKETS_FILE)) {
-      clearPacketsFileOnly();
-    }
-
-    if (onlySpo2Missing() && spo2FailStreak >= 2) {
-      Serial.println("[RECOVERY] SpO2 falhou várias vezes — reconectando BLE...");
-      bleOff();
-      delay(3000);
-      if (!connectBle()) {
-        Serial.println("[RECOVERY] Falha ao reconectar BLE.");
-        goToDeepSleep(SPO2_RETRY_SLEEP_SECONDS, 1);
-      }
-    }
-  }
-
+  measurementSessionId = bootCounter;
   measurementSessionStartedAtMs = millis();
   Serial.print("[TIMING] Sessão de coleta iniciada em millis()=");
   Serial.println(measurementSessionStartedAtMs);
@@ -2382,7 +2024,14 @@ void collectFreshActiveVitals() {
   }
 
   if (FAST_TEST_MODE) {
-    collectFastTestVitalsIncremental();
+    // Sequência de teste: 0x01 (HRV+fadiga+PA) → 0x03 (SpO2) → verifica BPM/temp sem 0x02.
+    collectActiveMode(0x01, "TEST_HRV_FATIGUE_BP", TEST_HRV_FATIGUE_BP_MS);
+    delay(GAP_BETWEEN_ACTIVE_MODES_MS);
+
+    collectActiveMode(0x03, "TEST_SPO2", TEST_SPO2_MS);
+    delay(GAP_BETWEEN_ACTIVE_MODES_MS);
+
+    logBpmTempCheck();
   } else {
     if (USE_ACTIVE_HEART_BP_REFRESH) {
       collectActiveMode(0x02, "HEART_BP_OPPORTUNISTIC", ACTIVE_HEART_BP_MS);
@@ -2442,29 +2091,15 @@ void collectFreshActiveVitals() {
   printSnapshotDebug();
 
   if (!snapshotComplete()) {
-    Serial.println("[MODE] Snapshot INCOMPLETO — checkpoint salvo. Próximo boot mede só o que falta:");
+    Serial.println("[MODE] Snapshot INCOMPLETO — não grava nem envia para API. Faltam:");
     printSnapshotMissing();
     saveCollectionCheckpoint("incompleto");
     bleOff();
-
-    if (onlySpo2Missing()) {
-      spo2FailStreak++;
-      Serial.print("[MODE] SpO2 falhou (streak=");
-      Serial.print(spo2FailStreak);
-      Serial.println("). Próximo boot pula HRV e tenta só SpO2.");
-    } else {
-      spo2FailStreak = 0;
-    }
-
-    uint64_t retrySec = onlySpo2Missing()
-      ? (spo2FailStreak >= 3 ? 20ULL : SPO2_RETRY_SLEEP_SECONDS)
-      : SHORT_SLEEP_SECONDS;
     Serial.println("[MODE] Nova tentativa de coleta em breve (boot 1).");
-    goToDeepSleep(retrySec, 1);
+    goToDeepSleep(SHORT_SLEEP_SECONDS, 1);
     return;
   }
 
-  spo2FailStreak = 0;
   Serial.println("[MODE] Snapshot completo — OK para enviar API.");
   saveVitalsSnapshotToFile();
   appendSnapshotToPacketsFile();

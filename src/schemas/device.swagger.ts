@@ -2,11 +2,22 @@ const patientInfoSchema = {
   type: "object",
   required: ["patientId", "patientName", "age", "email"],
   properties: {
-    patientId: { type: "string", example: "P001" },
-    patientName: { type: "string", example: "Ana Clara" },
-    age: { type: "integer", example: 22 },
-    email: { type: "string", example: "Ana.trindade@anery.com.br" },
-    leito: { type: "string", example: "Leito 101", nullable: true },
+    patientId: { type: "string", example: "3691", description: "Código do paciente" },
+    patientName: { type: "string", example: "Jurandir Filadelfo Dos Santos" },
+    age: { type: "integer", example: 40 },
+    email: { type: "string", example: "carlos.mozer@pcpsaude.com.br" },
+    leito: { type: "string", example: "LEITO 215", nullable: true },
+    idatendimento: {
+      type: "integer",
+      example: 5054,
+      nullable: true,
+      description: "Código de atendimento (null para paciente de teste)",
+    },
+    convenio: { type: "string", example: "Caixa Economica Federal", nullable: true },
+    unidade: { type: "string", example: "Alto da Boa Vista", nullable: true },
+    internacao: { type: "string", example: "2ª ANDAR-ABV", nullable: true },
+    perfil: { type: "string", example: "Reabilitação", nullable: true },
+    dataEntrada: { type: "string", example: "10/06/2026", nullable: true },
   },
 } as const;
 
@@ -42,7 +53,7 @@ export const getDevicesRouteSchema = {
   tags: ["bracelets"],
   summary: "List registered test bracelets with latest vitals",
   description:
-    "Returns the 4 configured bracelets. patient/label/deviceMac are fixed; battery, mergedHealth, online and lastSeenAt come from real packets in the database.",
+    "Returns the 4 configured bracelets (3 pacientes reais + Matheus Dev de teste). patient/label/deviceMac são fixos; battery, mergedHealth, online e lastSeenAt vêm dos pacotes reais no banco.",
   response: {
     200: {
       description: "Registered devices overview",
@@ -62,4 +73,11 @@ export const patientFieldSchema = {
   ...resolvedPatientSchema,
   nullable: true,
   description: "Patient resolved from deviceMac (null if MAC is not registered)",
+};
+
+export const idAtendimentoFieldSchema = {
+  type: "integer",
+  nullable: true,
+  description: "Código de atendimento do paciente vinculado ao MAC (null se não cadastrado ou teste)",
+  example: 5054,
 };

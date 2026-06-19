@@ -117,6 +117,15 @@ export type DecodedSnapshot = {
   sleepTotals?: SleepStageTotals;
   /** Campos idênticos ao snapshot anterior — firmware pode estar enviando leitura repetida. */
   staleFields?: string[];
+  /** Horário estimado de cada medição (ISO 8601). */
+  vitalMeasuredAt?: Partial<
+    Record<
+      "heartRate" | "spo2" | "temperature" | "hrv" | "fatigue" | "bloodPressure" | "battery",
+      string
+    >
+  >;
+  /** Bateria da pulseira (0–100), quando enviada no SNAPSHOT_VITALS. */
+  battery?: number | null;
 };
 
 export type DecodedPacket =

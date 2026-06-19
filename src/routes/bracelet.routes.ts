@@ -26,6 +26,7 @@ import {
   buildDevicesOverview,
   enrichWithPatient,
   listRegisteredBracelets,
+  resolveIdAtendimentoForMac,
   resolvePatientForMac,
 } from "../services/device-registry.service.js";
 import {
@@ -62,6 +63,10 @@ import {
   type InboundPacket,
 } from "../services/vitals-consolidation.service.js";
 import { expandPacketsForLegacyRead } from "../services/legacy-packet-read.service.js";
+import {
+  batteryFromSnapshotMetrics,
+  computeVitalMeasuredAt,
+} from "../services/vital-timestamps.service.js";
 
 function resolveReportWindowMinutes(value: number | undefined): number {
   return typeof value === "number" && Number.isFinite(value)
@@ -160,7 +165,25 @@ async function processInboundPacket(
       : detectAndClearStaleVitals(vitals, prevDecoded, extras);
     const sleepFields = sleepFieldsFromMetrics(item.metrics);
 
-    const decoded: DecodedPacket = { type: "snapshot", ...vitals, ...sleepFields, staleFields };
+    const timingExtras = rawSnapshot as
+      | { postDelayMs?: number; collectionPostedAt?: string }
+      | undefined;
+    const receivedAtEstimate = new Date().toISOString();
+    const vitalMeasuredAt = computeVitalMeasuredAt(item.metrics, receivedAtEstimate, {
+      postDelayMs: timingExtras?.postDelayMs,
+      collectionPostedAt: timingExtras?.collectionPostedAt,
+    });
+    const battery = batteryFromSnapshotMetrics(item.metrics);
+
+    const decoded: DecodedPacket = {
+      type: "snapshot",
+      ...vitals,
+      ...sleepFields,
+      staleFields,
+      vitalMeasuredAt,
+      battery,
+    };
+
     const saved = await savePacket({
       payload,
       crcValid: false,
@@ -169,8 +192,9 @@ async function processInboundPacket(
       ingestionBatchId,
       rawSnapshot,
     });
+
     log.info(
-      { id: saved.id, deviceMac: payload.deviceMac, vitals, staleFields },
+      { id: saved.id, deviceMac: payload.deviceMac, vitals, staleFields, battery },
       "SNAPSHOT_VITALS saved",
     );
     return {
@@ -400,10 +424,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     // Cada ciclo agrega muitos pacotes crus; busca um múltiplo do limite pedido.
     const rawLimit = Math.min(Math.max(limit * 80, 400), 2000);
     const packets = await listPackets(rawLimit, deviceMac);
-    return buildCycleSummaries(packets, limit).map((cycle) => ({
-      ...cycle,
-      patient: resolvePatientForMac(cycle.deviceMac),
-    }));
+    return buildCycleSummaries(packets, limit).map((cycle) => enrichWithPatient(cycle));
   }
 
   app.get("/bracelets/packets", { schema: getPacketRouteSchema }, async (request, reply) => {
@@ -433,10 +454,9 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     if (wantSnapshots) {
       const rawLimit = Math.min(Math.max(limit * 80, 400), 2000);
       const packets = await listPackets(rawLimit, deviceMac);
-      const snapshots = buildSnapshotsFromPackets(packets, limit).map((snapshot) => ({
-        ...snapshot,
-        patient: resolvePatientForMac(snapshot.deviceMac),
-      }));
+      const snapshots = buildSnapshotsFromPackets(packets, limit).map((snapshot) =>
+        enrichWithPatient(snapshot),
+      );
       return reply.status(200).send({ view: "snapshots", snapshots });
     }
 
@@ -506,6 +526,8 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
               ...(item as Record<string, unknown>),
               bootCounter: batchExtras.bootCounter,
               measurementSessionId: batchExtras.measurementSessionId,
+              postDelayMs: batchExtras.postDelayMs,
+              collectionPostedAt: batchExtras.collectionPostedAt,
             }
           : undefined;
 
@@ -550,6 +572,26 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     );
     const staleFields: string[] = snapshotResult?.staleFields ?? [];
 
+    const patient = resolvePatientForMac(batch.deviceMac);
+    const idatendimento = resolveIdAtendimentoForMac(batch.deviceMac);
+
+    const snapshotPacket = batch.packets.find(
+      (p) => p.packetType === SNAPSHOT_VITALS_TYPE,
+    );
+    const vitalMeasuredAt = computeVitalMeasuredAt(
+      snapshotPacket?.metrics,
+      measuredAt,
+      {
+        postDelayMs:
+          typeof batchExtras.postDelayMs === "number" ? batchExtras.postDelayMs : undefined,
+        collectionPostedAt:
+          typeof batchExtras.collectionPostedAt === "string"
+            ? batchExtras.collectionPostedAt
+            : undefined,
+      },
+    );
+    const battery = batteryFromSnapshotMetrics(snapshotPacket?.metrics);
+
     const snapshot = {
       deviceMac: batch.deviceMac,
       source: batch.source,
@@ -558,7 +600,10 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       sources: consolidated.sources,
       quality: consolidated.quality,
       staleFields,
-      patient: resolvePatientForMac(batch.deviceMac),
+      vitalMeasuredAt,
+      battery,
+      patient,
+      idatendimento,
     };
 
     if (!consolidated.quality.snapshotComplete) {
@@ -570,9 +615,10 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
 
     return reply.status(200).send({
       deviceMac: batch.deviceMac,
+      idatendimento,
       source: batch.source,
       ingestionBatchId,
-      patient: resolvePatientForMac(batch.deviceMac),
+      patient,
       snapshot,
       staleFields,
       usedSnapshotVitals: consolidated.usedSnapshotVitals,
