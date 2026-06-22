@@ -373,7 +373,58 @@
     }
 
     .panel-ts { margin-top: 10px; font-size: 12px; color: var(--muted); }
+
+    /* ── Export panel ── */
+    .export-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--card-radius);
+      padding: 20px 22px;
+      margin-bottom: 24px;
+    }
+    .export-panel h2 {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .export-panel .hint {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 16px;
+    }
+    .export-form {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 16px;
+      align-items: flex-end;
+    }
+    .export-field label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .export-field input,
+    .export-field select {
+      min-width: 150px;
+    }
+    .export-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .export-status {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 12px;
+      min-height: 18px;
+    }
+    .export-status.ok { color: var(--accent2); }
+    .export-status.err { color: var(--danger); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
   </style>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 </head>
 <body>
 
@@ -470,6 +521,45 @@
       <div class="panel-title"><span class="dot sleep"></span>Sleep (0x53)</div>
       <div id="sleepPanel"><div class="no-data">Sem dados de sono</div></div>
     </div>
+  </div>
+
+  <!-- Export -->
+  <div class="export-panel">
+    <h2>Exportar dados</h2>
+    <p class="hint">Selecione o período e baixe uma planilha Excel (.xlsx) com todos os pacotes do intervalo (até 10.000 linhas).</p>
+    <div class="export-form">
+      <div class="export-field">
+        <label for="exportFrom">Data início</label>
+        <input type="date" id="exportFrom" />
+      </div>
+      <div class="export-field">
+        <label for="exportTo">Data fim</label>
+        <input type="date" id="exportTo" />
+      </div>
+      <div class="export-field">
+        <label for="exportDevice">Pulseira</label>
+        <select id="exportDevice">
+          <option value="">Todas</option>
+        </select>
+      </div>
+      <div class="export-field">
+        <label for="exportType">Tipo de pacote</label>
+        <select id="exportType">
+          <option value="">Todos</option>
+          <option value="SNAPSHOT_VITALS" selected>SNAPSHOT_VITALS</option>
+          <option value="0x28">0x28 Health</option>
+          <option value="0x56">0x56 HRV</option>
+          <option value="0x09">0x09 Realtime</option>
+          <option value="0x53">0x53 Sleep</option>
+          <option value="0x13">0x13 Battery</option>
+        </select>
+      </div>
+      <div class="export-actions">
+        <button type="button" id="exportBtn" onclick="exportToExcel()">Exportar Excel</button>
+        <button type="button" class="secondary" id="exportAllTypesBtn" onclick="exportToExcel(true)">Exportar tudo (todos os tipos)</button>
+      </div>
+    </div>
+    <div class="export-status" id="exportStatus"></div>
   </div>
 
   <!-- Packets table -->
@@ -695,14 +785,27 @@
 
   function renderDeviceSelect() {
     const select = document.getElementById('deviceSelect');
+    const exportSelect = document.getElementById('exportDevice');
     const current = select.value;
-    select.innerHTML = '<option value="">Todas as pulseiras</option>' +
+    const exportCurrent = exportSelect.value;
+    const options = '<option value="">Todas as pulseiras</option>' +
       devices.map(d => {
         const name = d.patient?.patientName || d.label;
         const online = d.online ? ' ●' : '';
         return `<option value="${d.deviceMac}">${name} (${d.deviceMac})${online}</option>`;
       }).join('');
+    select.innerHTML = options;
+    exportSelect.innerHTML = '<option value="">Todas</option>' +
+      devices.map(d => {
+        const name = d.patient?.patientName || d.label;
+        return `<option value="${d.deviceMac}">${name}</option>`;
+      }).join('');
     if (current && [...select.options].some(o => o.value === current)) select.value = current;
+    if (exportCurrent && [...exportSelect.options].some(o => o.value === exportCurrent)) {
+      exportSelect.value = exportCurrent;
+    } else if (current) {
+      exportSelect.value = current;
+    }
   }
 
   function onDeviceChange() { fetchPackets(); }
@@ -861,7 +964,8 @@
     const display = (val === null || val === undefined || val === 0) ? '--' : val;
     const isMissing = display === '--';
     const colorStyle = isMissing ? 'color:var(--muted)' : (color ? `color:${color}` : '');
-    const staleBadge = !isMissing && stale ? ' <span class="badge badge-stale">repetido</span>' : '';
+    const staleLabel = isMissing ? 'descartado' : 'repetido';
+    const staleBadge = stale ? ` <span class="badge badge-stale">${staleLabel}</span>` : '';
     return `<span class="metric-val" style="${colorStyle}">${display}</span>${staleBadge}`;
   }
 
@@ -885,7 +989,7 @@
       : null;
     const bpStale = stale.has('systolicPressure') || stale.has('diastolicPressure');
     const bpDisplay = bpVal === null
-      ? '<span class="metric-val" style="color:var(--muted)">--</span>'
+      ? `<span class="metric-val" style="color:var(--muted)">--</span>${bpStale ? ' <span class="badge badge-stale">descartado</span>' : ''}`
       : `<span class="metric-val" style="color:#c084fc;font-size:16px">${bpVal}</span>${bpStale ? ' <span class="badge badge-stale">repetido</span>' : ''}`;
 
     const modeStr = d.measurementMode || null;
@@ -1222,6 +1326,192 @@
     setTimeout(() => { el.className = ''; }, 3500);
   }
 
+  // ── Export Excel ─────────────────────────────────────────────────────────────
+  function initExportDates() {
+    const to = new Date();
+    const from = new Date();
+    from.setDate(from.getDate() - 7);
+    document.getElementById('exportTo').value = toISODateLocal(to);
+    document.getElementById('exportFrom').value = toISODateLocal(from);
+  }
+
+  function toISODateLocal(d) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  function localDateToIso(dateStr, endOfDay) {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const dt = endOfDay
+      ? new Date(y, m - 1, d, 23, 59, 59, 999)
+      : new Date(y, m - 1, d, 0, 0, 0, 0);
+    return dt.toISOString();
+  }
+
+  function exportNum(v) {
+    if (v === null || v === undefined || v === 0) return '';
+    return v;
+  }
+
+  function exportDateTime(ts) {
+    if (!ts) return '';
+    const d = new Date(ts);
+    if (Number.isNaN(d.getTime())) return String(ts);
+    return d.toLocaleString('pt-BR', { hour12: false });
+  }
+
+  function packetToExportRow(p) {
+    const pt = field(p, 'packetType', 'packet_type');
+    const decoded = p.decoded || {};
+    const view = healthView(p) || {};
+    const vm = decoded.vitalMeasuredAt || {};
+    const patient = p.patient?.patientName || p.patient?.label || '';
+
+    let steps = '';
+    let calories = '';
+    let sleepMin = '';
+    let battery = '';
+    let firmware = '';
+
+    if (decoded.type === '0x09') {
+      steps = exportNum(decoded.steps);
+      calories = exportNum(decoded.caloriesKcal);
+    }
+    if (decoded.type === '0x53') {
+      sleepMin = exportNum(decoded.sleepMinutes);
+    }
+    if (decoded.type === '0x13') {
+      battery = exportNum(decoded.battery);
+    }
+    if (decoded.type === 'snapshot' && typeof decoded.battery === 'number') {
+      battery = decoded.battery;
+    }
+    if (decoded.type === '0x27') {
+      firmware = `V${decoded.major}.${decoded.minor}.${decoded.patch}`;
+    }
+    if (pt === 'SNAPSHOT_VITALS' && decoded.sleepMinutes) {
+      sleepMin = exportNum(decoded.sleepMinutes);
+    }
+
+    return {
+      'ID': p.id,
+      'Data/Hora': exportDateTime(field(p, 'createdAt', 'created_at')),
+      'Paciente': patient,
+      'MAC': field(p, 'deviceMac', 'device_mac'),
+      'Tipo': pt,
+      'Source': p.source || '',
+      'BPM': exportNum(view.heartRate ?? decoded.heartRate),
+      'SpO2 (%)': exportNum(view.spo2 ?? decoded.spo2),
+      'Temp (°C)': exportNum(view.temperature ?? decoded.temperature),
+      'HRV (ms)': exportNum(view.hrv ?? decoded.hrv),
+      'Fadiga': exportNum(view.fatigue ?? decoded.fatigue),
+      'PA Sistólica': exportNum(view.systolicPressure ?? decoded.systolicPressure),
+      'PA Diastólica': exportNum(view.diastolicPressure ?? decoded.diastolicPressure),
+      'Bateria (%)': battery,
+      'Sono (min)': sleepMin,
+      'Passos': steps,
+      'Calorias (kcal)': calories,
+      'Firmware': firmware,
+      'CRC OK': field(p, 'crcValid', 'crc_valid') ? 'Sim' : 'Não',
+      'Erro decode': field(p, 'decodeError', 'decode_error') || '',
+      'BPM medido em': exportDateTime(vm.heartRate),
+      'SpO2 medido em': exportDateTime(vm.spo2),
+      'Temp medido em': exportDateTime(vm.temperature),
+      'HRV medido em': exportDateTime(vm.hrv),
+      'Fadiga medido em': exportDateTime(vm.fatigue),
+      'PA medido em': exportDateTime(vm.bloodPressure),
+      'Bateria medido em': exportDateTime(vm.battery),
+    };
+  }
+
+  function setExportStatus(msg, type) {
+    const el = document.getElementById('exportStatus');
+    el.textContent = msg;
+    el.className = 'export-status' + (type ? ' ' + type : '');
+  }
+
+  async function exportToExcel(allTypes) {
+    const fromDate = document.getElementById('exportFrom').value;
+    const toDate = document.getElementById('exportTo').value;
+    if (!fromDate || !toDate) {
+      toast('Selecione data início e fim', 'err');
+      return;
+    }
+    if (fromDate > toDate) {
+      toast('Data início deve ser anterior à data fim', 'err');
+      return;
+    }
+    if (typeof XLSX === 'undefined') {
+      toast('Biblioteca Excel não carregou. Recarregue a página.', 'err');
+      return;
+    }
+
+    const btn = document.getElementById('exportBtn');
+    const btnAll = document.getElementById('exportAllTypesBtn');
+    btn.disabled = true;
+    btnAll.disabled = true;
+    setExportStatus('Buscando dados na API…');
+
+    try {
+      const qs = new URLSearchParams({
+        from: localDateToIso(fromDate, false),
+        to: localDateToIso(toDate, true),
+        limit: '10000',
+      });
+      const deviceMac = document.getElementById('exportDevice').value;
+      if (deviceMac) qs.set('deviceMac', deviceMac);
+      if (!allTypes) {
+        const packetType = document.getElementById('exportType').value;
+        if (packetType) qs.set('packetType', packetType);
+      }
+
+      const res = await fetch(`${apiBase()}/bracelets/packets/export?${qs}`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      const rows = (data.packets || []).map(packetToExportRow);
+      if (rows.length === 0) {
+        setExportStatus('Nenhum pacote encontrado no período.', 'err');
+        toast('Nenhum dado no período selecionado', 'err');
+        return;
+      }
+
+      const wb = XLSX.utils.book_new();
+      const wsAll = XLSX.utils.json_to_sheet(rows);
+      XLSX.utils.book_append_sheet(wb, wsAll, 'Pacotes');
+
+      const vitalRows = rows.filter(r =>
+        r['BPM'] !== '' || r['SpO2 (%)'] !== '' || r['HRV (ms)'] !== '' || r['PA Sistólica'] !== ''
+      );
+      if (vitalRows.length > 0 && vitalRows.length !== rows.length) {
+        const wsVitals = XLSX.utils.json_to_sheet(vitalRows);
+        XLSX.utils.book_append_sheet(wb, wsVitals, 'Vitais');
+      }
+
+      const macPart = deviceMac ? deviceMac.replace(/:/g, '') : 'todas';
+      const filename = `bracelet_${fromDate}_${toDate}_${macPart}.xlsx`;
+      XLSX.writeFile(wb, filename);
+
+      let msg = `${rows.length} linha(s) exportada(s).`;
+      if (data.truncated) {
+        msg += ' Limite de 10.000 atingido — reduza o período se faltar dado.';
+      }
+      setExportStatus(msg, 'ok');
+      toast(`Excel baixado: ${filename}`);
+    } catch (e) {
+      setExportStatus('Erro: ' + e.message, 'err');
+      toast('Falha na exportação: ' + e.message, 'err');
+    } finally {
+      btn.disabled = false;
+      btnAll.disabled = false;
+    }
+  }
+
   // ── Auto-refresh ─────────────────────────────────────────────────────────────
   document.getElementById('autoRefreshBtn').addEventListener('click', function () {
     autoRefresh = !autoRefresh;
@@ -1253,6 +1543,7 @@
 
   // ── Init ─────────────────────────────────────────────────────────────────────
   initApiBase();
+  initExportDates();
   checkApiHealth()
     .then(() => fetchDevices())
     .then(() => fetchPackets())

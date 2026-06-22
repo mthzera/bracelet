@@ -5,6 +5,7 @@ import {
   getMergedHealthForDevice,
   getLastSnapshotVitalsForDevice,
   listPackets,
+  listPacketsInRange,
   savePacket,
 } from "../repositories/packet.repository.js";
 import {
@@ -19,6 +20,7 @@ import {
 } from "../schemas/report.swagger.js";
 import {
   getPacketRouteSchema,
+  getPacketExportRouteSchema,
   getPacketSummaryRouteSchema,
   postPacketRouteSchema,
 } from "../schemas/packet.swagger.js";
@@ -39,6 +41,7 @@ import {
   rawHexToBytes,
   type DecodedHealth,
   type DecodedPacket,
+  type DecodedSnapshot,
 } from "../services/packet-decoder.service.js";
 import {
   enrichDecodedHealthFromMetrics,
@@ -59,6 +62,7 @@ import {
   buildConsolidatedSnapshot,
   SNAPSHOT_VITALS_TYPE,
   sleepFieldsFromMetrics,
+  type ConsolidatedQuality,
   type ConsolidatedVitals,
   type InboundPacket,
 } from "../services/vitals-consolidation.service.js";
@@ -105,6 +109,44 @@ type SnapshotExtras = {
 function staleSourceKey(vital: (typeof STALE_VITAL_KEYS)[number]): string {
   if (vital === "systolicPressure" || vital === "diastolicPressure") return "bloodPressure";
   return vital;
+}
+
+/** FAST_TEST / notebook gateway: não descarta HRV, fadiga e PA repetidos entre ciclos. */
+function isSnapshotTestMode(
+  metrics: PacketItem["metrics"],
+  source: string,
+  extras?: SnapshotExtras,
+): boolean {
+  return (
+    metrics?.testMode === true ||
+    source === "ESP32_FAST_TEST" ||
+    source === "NOTEBOOK_GATEWAY" ||
+    extras?.sources?.bpm?.includes("FAST_TEST") === true
+  );
+}
+
+function vitalsFromSavedSnapshot(decoded: DecodedSnapshot): ConsolidatedVitals {
+  return {
+    heartRate: decoded.heartRate,
+    spo2: decoded.spo2,
+    temperature: decoded.temperature,
+    hrv: decoded.hrv,
+    fatigue: decoded.fatigue,
+    systolicPressure: decoded.systolicPressure,
+    diastolicPressure: decoded.diastolicPressure,
+  };
+}
+
+function qualityFromVitals(vitals: ConsolidatedVitals): ConsolidatedQuality {
+  return {
+    snapshotComplete:
+      vitals.heartRate !== null &&
+      vitals.spo2 !== null &&
+      vitals.temperature !== null &&
+      vitals.hrv !== null &&
+      vitals.fatigue !== null,
+    bloodPressure: vitals.systolicPressure !== null ? "estimated" : "absent",
+  };
 }
 
 function detectAndClearStaleVitals(
@@ -156,10 +198,7 @@ async function processInboundPacket(
     const prevPacket = await getLastSnapshotVitalsForDevice(payload.deviceMac);
     const prevDecoded = prevPacket?.decoded?.type === "snapshot" ? prevPacket.decoded : null;
     const extras = rawSnapshot as SnapshotExtras | undefined;
-    const isTestMode =
-      item.metrics?.testMode === true ||
-      payload.source === "ESP32_FAST_TEST" ||
-      extras?.sources?.bpm?.includes("FAST_TEST") === true;
+    const isTestMode = isSnapshotTestMode(item.metrics, payload.source, extras);
     const staleFields = isTestMode
       ? []
       : detectAndClearStaleVitals(vitals, prevDecoded, extras);
@@ -472,6 +511,71 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get(
+    "/bracelets/packets/export",
+    { schema: getPacketExportRouteSchema },
+    async (request, reply) => {
+      const query = request.query as {
+        from?: string;
+        to?: string;
+        deviceMac?: string;
+        packetType?: string;
+        limit?: number;
+      };
+
+      const from = query.from?.trim();
+      const to = query.to?.trim();
+      if (!from || !to) {
+        return reply.status(400).send({
+          error: "Parâmetros from e to são obrigatórios (ISO 8601)",
+        });
+      }
+
+      const fromMs = new Date(from).getTime();
+      const toMs = new Date(to).getTime();
+      if (!Number.isFinite(fromMs) || !Number.isFinite(toMs)) {
+        return reply.status(400).send({ error: "Datas inválidas" });
+      }
+      if (fromMs > toMs) {
+        return reply.status(400).send({ error: "from deve ser anterior ou igual a to" });
+      }
+
+      const limit =
+        typeof query.limit === "number" && Number.isFinite(query.limit)
+          ? Math.min(Math.max(query.limit, 1), 10_000)
+          : 10_000;
+
+      const deviceMac =
+        typeof query.deviceMac === "string" && query.deviceMac.trim()
+          ? query.deviceMac.trim()
+          : undefined;
+      const packetType =
+        typeof query.packetType === "string" && query.packetType.trim()
+          ? query.packetType.trim()
+          : undefined;
+
+      const rows = await listPacketsInRange({
+        from,
+        to,
+        deviceMac,
+        packetType,
+        limit,
+      });
+
+      const packets = rows.map(enrichWithPatient);
+      const truncated = rows.length >= limit;
+
+      return reply.status(200).send({
+        from,
+        to,
+        count: packets.length,
+        truncated,
+        limit,
+        packets,
+      });
+    },
+  );
+
+  app.get(
     "/bracelets/packets/summary",
     { schema: getPacketSummaryRouteSchema },
     async (request, reply) => {
@@ -572,6 +676,15 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     );
     const staleFields: string[] = snapshotResult?.staleFields ?? [];
 
+    const savedSnapshotDecoded =
+      snapshotResult?.decoded?.type === "snapshot" ? snapshotResult.decoded : null;
+    const responseVitals = savedSnapshotDecoded
+      ? vitalsFromSavedSnapshot(savedSnapshotDecoded)
+      : consolidated.vitals;
+    const responseQuality = savedSnapshotDecoded
+      ? qualityFromVitals(responseVitals)
+      : consolidated.quality;
+
     const patient = resolvePatientForMac(batch.deviceMac);
     const idatendimento = resolveIdAtendimentoForMac(batch.deviceMac);
 
@@ -596,9 +709,9 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       deviceMac: batch.deviceMac,
       source: batch.source,
       measuredAt,
-      vitals: consolidated.vitals,
+      vitals: responseVitals,
       sources: consolidated.sources,
-      quality: consolidated.quality,
+      quality: responseQuality,
       staleFields,
       vitalMeasuredAt,
       battery,
@@ -606,9 +719,9 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
       idatendimento,
     };
 
-    if (!consolidated.quality.snapshotComplete) {
+    if (!responseQuality.snapshotComplete) {
       request.log.warn(
-        { deviceMac: batch.deviceMac, vitals: consolidated.vitals, sources: consolidated.sources },
+        { deviceMac: batch.deviceMac, vitals: responseVitals, sources: consolidated.sources },
         "Consolidated snapshot incomplete",
       );
     }
@@ -629,7 +742,7 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
         failed: failedCount,
         rawSaved: okCount,
         invalidIgnored: consolidated.stats.invalidIgnored,
-        snapshotComplete: consolidated.quality.snapshotComplete,
+        snapshotComplete: responseQuality.snapshotComplete,
       },
     });
   });

@@ -388,6 +388,64 @@ export const getPacketRouteSchema = {
   },
 };
 
+export const getPacketExportRouteSchema = {
+  tags: ["bracelets"],
+  summary: "Export packets by date range",
+  description:
+    "Returns all packets between from and to (inclusive), oldest first. Max 10 000 rows per request.",
+  querystring: {
+    type: "object",
+    required: ["from", "to"],
+    properties: {
+      from: {
+        type: "string",
+        format: "date-time",
+        description: "Start of period (ISO 8601)",
+        example: "2026-06-01T00:00:00.000Z",
+      },
+      to: {
+        type: "string",
+        format: "date-time",
+        description: "End of period (ISO 8601)",
+        example: "2026-06-22T23:59:59.999Z",
+      },
+      deviceMac: {
+        type: "string",
+        description: "Filter by bracelet MAC",
+      },
+      packetType: {
+        type: "string",
+        description: 'Filter by packet type (e.g. "SNAPSHOT_VITALS", "0x28")',
+      },
+      limit: {
+        type: "integer",
+        minimum: 1,
+        maximum: 10000,
+        default: 10000,
+      },
+    },
+  },
+  response: {
+    200: {
+      description: "Packets in range",
+      type: "object",
+      properties: {
+        from: { type: "string" },
+        to: { type: "string" },
+        count: { type: "integer" },
+        truncated: { type: "boolean" },
+        limit: { type: "integer" },
+        packets: { type: "array", items: { type: "object", additionalProperties: true } },
+      },
+    },
+    400: {
+      description: "Invalid query",
+      type: "object",
+      properties: { error: { type: "string" } },
+    },
+  },
+};
+
 export const postPacketRouteSchema = {
   tags: ["bracelets"],
   summary: "Receive and decode BLE packets (batch)",

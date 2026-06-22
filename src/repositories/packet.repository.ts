@@ -200,6 +200,56 @@ export async function listPackets(limit = 50, deviceMac?: string): Promise<Saved
   return attachMergedHealth(rows.map(rowToSavedPacket));
 }
 
+export type ListPacketsInRangeParams = {
+  from: string;
+  to: string;
+  deviceMac?: string;
+  packetType?: string;
+  limit?: number;
+};
+
+const EXPORT_MAX_ROWS = 10_000;
+
+/** Lista pacotes em um intervalo de datas (inclusivo), ordenados do mais antigo ao mais recente. */
+export async function listPacketsInRange(
+  params: ListPacketsInRangeParams,
+): Promise<SavedPacket[]> {
+  const pool = getPool();
+  const safeLimit = Math.min(Math.max(params.limit ?? EXPORT_MAX_ROWS, 1), EXPORT_MAX_ROWS);
+
+  const values: Array<string | number> = [params.from, params.to];
+  const conditions = [
+    "created_at >= $1::timestamptz",
+    "created_at <= $2::timestamptz",
+  ];
+
+  if (params.deviceMac?.trim()) {
+    values.push(params.deviceMac.trim().toUpperCase());
+    conditions.push(`UPPER(device_mac) = $${values.length}`);
+  }
+
+  if (params.packetType?.trim()) {
+    values.push(params.packetType.trim());
+    conditions.push(`LOWER(packet_type) = LOWER($${values.length})`);
+  }
+
+  values.push(safeLimit);
+  const limitParam = values.length;
+
+  const { rows } = await pool.query<PacketRow>(
+    `
+      SELECT id, device_mac, packet_type, raw_hex, source, bytes, crc_valid, decoded, decode_error, created_at
+      FROM packets
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY created_at ASC
+      LIMIT $${limitParam}
+    `,
+    values,
+  );
+
+  return attachMergedHealth(rows.map(rowToSavedPacket));
+}
+
 export async function getLatestPacketForDevice(
   deviceMac: string,
   packetType?: string,

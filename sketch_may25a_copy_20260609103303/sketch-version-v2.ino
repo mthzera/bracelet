@@ -67,8 +67,9 @@ const uint64_t COLLECT_SLEEP_SECONDS = FAST_TEST_MODE ? 5ULL : 900ULL;
 const uint64_t SHORT_SLEEP_SECONDS = FAST_TEST_MODE ? 3ULL : 5ULL;
 
 // Timeouts da sequência de teste: HRV+PA → SpO2 (BPM/temp só verifica, sem ligar 0x02).
-const unsigned long TEST_HRV_FATIGUE_BP_MS = 180000UL;
-const unsigned long TEST_SPO2_MS = 180000UL;
+// DEBUG: 60s para iterar rápido — voltar para 180000UL em produção.
+const unsigned long TEST_HRV_FATIGUE_BP_MS = 60000UL;
+const unsigned long TEST_SPO2_MS = 60000UL;
 
 // Delays de leitura de histórico BLE (cada comando 0x54/0x56/…)
 const unsigned long HIST_DELAY_MS = FAST_TEST_MODE ? 1800UL : 3500UL;
@@ -133,12 +134,16 @@ const uint8_t MIN_FATIGUE_SAMPLES = 1;
 
 // Logs e debug — em teste, logs verbosos BLE esgotam heap e travam o ESP32.
 const bool VERBOSE_BLE_LOGS = false;
+// DEBUG campo: log leve dos pacotes 0x28 (sem String/toHex). Desligar após teste.
+const bool DEBUG_028_RAW = true;
+const unsigned long DEBUG_028_EVERY_MS = 2000UL;
 const uint32_t MIN_FREE_HEAP_BYTES = 32000;
 const unsigned long PRINT_028_EVERY_MS = VERBOSE_BLE_LOGS ? 3000UL : 0UL;
 const unsigned long SAVE_028_EVERY_MS = 5000UL;
 
 unsigned long lastPrint028 = 0;
 unsigned long lastSave028 = 0;
+unsigned long lastDebug028Ms = 0;
 
 // ============================================================
 // SNAPSHOT
@@ -1408,6 +1413,41 @@ void handleActivePacket028(uint8_t* data, size_t len) {
   uint8_t pressaoBaixa = data[7];
   float temp = parseTempLittleEndian(data[8], data[9]);
 
+  // DEBUG: log leve (throttled) — mostra se a pulseira manda modo errado ou valores zerados.
+  if (DEBUG_028_RAW && now - lastDebug028Ms >= DEBUG_028_EVERY_MS) {
+    lastDebug028Ms = now;
+
+    if (packetMode != currentActiveMode) {
+      Serial.print("[0x28] IGN pkt=0x");
+      Serial.print(packetMode, HEX);
+      Serial.print(" esperado=0x");
+      Serial.print(currentActiveMode, HEX);
+      Serial.print(" bpm=");
+      Serial.print(bpm);
+      Serial.print(" spo2=");
+      Serial.print(spo2);
+      Serial.print(" hrv=");
+      Serial.print(hrv);
+      Serial.print(" fat=");
+      Serial.println(fadiga);
+    } else {
+      Serial.print("[0x28] mode=0x");
+      Serial.print(packetMode, HEX);
+      Serial.print(" bpm=");
+      Serial.print(bpm);
+      Serial.print(" spo2=");
+      Serial.print(spo2);
+      Serial.print(" hrv=");
+      Serial.print(hrv);
+      Serial.print(" fat=");
+      Serial.print(fadiga);
+      Serial.print(" bp=");
+      Serial.print(pressaoAlta);
+      Serial.print("/");
+      Serial.println(pressaoBaixa);
+    }
+  }
+
   // Evita aceitar notificação atrasada de outro modo.
   // Ex.: iniciou SpO2, mas ainda chegou um 0x28 do modo HR/BP anterior.
   if (packetMode != currentActiveMode) {
@@ -1875,6 +1915,7 @@ void collectActiveMode(uint8_t mode, const char* label, unsigned long durationMs
   captureFreshActiveEnabled = true;
   lastPrint028 = 0;
   lastSave028 = 0;
+  lastDebug028Ms = 0;
 
   bpmSamplesAtModeStart = snapshot.bpmSamples;
   spo2SamplesAtModeStart = snapshot.spo2Samples;
@@ -1887,9 +1928,20 @@ void collectActiveMode(uint8_t mode, const char* label, unsigned long durationMs
 
   unsigned long start = millis();
   unsigned long targetReachedAt = 0;
+  unsigned long lastFreshHeartbeatMs = start;
 
   while (millis() - start < durationMs) {
     delay(500);
+
+    if (millis() - lastFreshHeartbeatMs >= 30000) {
+      lastFreshHeartbeatMs = millis();
+      Serial.print("[FRESH] aguardando ");
+      Serial.print(label);
+      Serial.print(" +");
+      Serial.print((millis() - start) / 1000);
+      Serial.print("s heap=");
+      Serial.println(ESP.getFreeHeap());
+    }
 
     if (heapCriticallyLow()) {
       Serial.println("[MEM] Heap crítico — encerrando modo ativo para evitar travamento.");
