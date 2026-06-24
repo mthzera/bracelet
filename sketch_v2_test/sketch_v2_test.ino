@@ -943,6 +943,19 @@ void updateSnapshotSleep(uint16_t recordId, const char* date, const char* time, 
 void updateSnapshotBattery(uint8_t bat) {
   if (bat == 0 || bat > 100) return;
 
+  // A pulseira costuma mandar 2+ notifies 0x13 seguidos (ex.: 96% depois 100%).
+  // Mantém a primeira leitura da sessão — é a resposta direta ao comando.
+  if (snapshot.hasBattery) {
+    if (bat != snapshot.battery) {
+      Serial.print("[BATT] Ignorando leitura posterior ");
+      Serial.print(bat);
+      Serial.print("% (mantendo ");
+      Serial.print(snapshot.battery);
+      Serial.println("%)");
+    }
+    return;
+  }
+
   snapshot.hasBattery = true;
   snapshot.battery = bat;
   snapshot.batteryAtMs = millis();
@@ -1392,14 +1405,21 @@ void disableRealtimeStream() {
   sendRaw16(pkt);
 }
 
-// Reinicia o sensor SpO2 quando ele fica sem responder (lights off).
-void kickActiveSpo2Sensor(uint8_t kickNumber) {
-  Serial.print("[SPO2] Sensor sem resposta — reiniciando (kick ");
+const unsigned long ACTIVE_SILENCE_KICK_MS = 12000UL;
+const uint8_t MAX_ACTIVE_SENSOR_KICKS = 3;
+
+// Reinicia medição ativa quando os pacotes 0x28 param (sensor apagou).
+void kickActiveSensor(uint8_t mode, uint8_t kickNumber, const char* label) {
+  Serial.print("[");
+  Serial.print(label);
+  Serial.print("] Silêncio detectado — reiniciando sensor (kick ");
   Serial.print(kickNumber);
   Serial.println(")");
-  stopActive028(0x03);
+  stopActive028(mode);
   delay(2000);
-  startActive028(0x03);
+  startActive028(mode);
+  lastReceived028Ms = millis();
+  currentActiveModeAcceptAfterMs = millis() + ACTIVE_WARMUP_MS;
 }
 
 // Envia 0x01 com data/hora atual para sincronizar o relógio da pulseira.
@@ -2148,8 +2168,7 @@ void collectActiveMode(uint8_t mode, const char* label, unsigned long durationMs
 
   unsigned long start = millis();
   unsigned long targetReachedAt = 0;
-  unsigned long lastSpo2KickMs = 0;
-  uint8_t spo2KickCount = 0;
+  uint8_t sensorKickCount = 0;
 
   while (millis() - start < durationMs) {
     delay(500);
@@ -2160,20 +2179,33 @@ void collectActiveMode(uint8_t mode, const char* label, unsigned long durationMs
       break;
     }
 
-    // Kick SpO2 baseado em SILÊNCIO — só kika se os pacotes 0x28 pararem de chegar.
-    // Se spo2=0 mas pacotes chegam normalmente → sensor está medindo (paciente lento) → NÃO kika.
-    // Se pacotes pararam há 12s → sensor apagou → kika para religar.
-    // Isso garante que pacientes que demoram mais recebem o tempo total sem interrupção.
-    if (mode == 0x03 && !snapshot.hasSpo2 && spo2KickCount < 3) {
+    // Kick por SILÊNCIO — só reinicia se os pacotes 0x28 pararem de chegar.
+    // Valores ainda zerados mas pacotes chegando = sensor medindo (paciente lento) → NÃO kika.
+    if (sensorKickCount < MAX_ACTIVE_SENSOR_KICKS) {
       unsigned long silenceMs = millis() - lastReceived028Ms;
-      if (silenceMs > 12000) {
-        Serial.print("[SPO2] Silêncio de ");
+      bool needKick = false;
+
+      if (mode == 0x03 && !snapshot.hasSpo2 && silenceMs > ACTIVE_SILENCE_KICK_MS) {
+        needKick = true;
+      } else if (mode == 0x01) {
+        bool hrvTargetReached = FAST_TEST_MODE
+          ? fastTestHrvFatigueBpTargetReached()
+          : (snapshot.hrvSamples - hrvSamplesAtModeStart) >= MIN_HRV_SAMPLES &&
+            (snapshot.fatigueSamples - fatigueSamplesAtModeStart) >= MIN_FATIGUE_SAMPLES;
+        if (!hrvTargetReached && silenceMs > ACTIVE_SILENCE_KICK_MS) {
+          needKick = true;
+        }
+      }
+
+      if (needKick) {
+        Serial.print("[");
+        Serial.print(label);
+        Serial.print("] Silêncio de ");
         Serial.print(silenceMs / 1000);
-        Serial.println("s detectado — sensor provavelmente apagou.");
-        kickActiveSpo2Sensor(spo2KickCount + 1);
-        lastSpo2KickMs = millis();
-        lastReceived028Ms = millis(); // reseta contador após kick
-        spo2KickCount++;
+        Serial.println("s — sensor provavelmente apagou.");
+        kickActiveSensor(mode, sensorKickCount + 1, label);
+        sensorKickCount++;
+        targetReachedAt = 0;
       }
     }
 

@@ -936,6 +936,19 @@ void updateSnapshotSleep(uint16_t recordId, const char* date, const char* time, 
 void updateSnapshotBattery(uint8_t bat) {
   if (bat == 0 || bat > 100) return;
 
+  // A pulseira costuma mandar 2+ notifies 0x13 seguidos (ex.: 96% depois 100%).
+  // Mantém a primeira leitura da sessão — é a resposta direta ao comando.
+  if (snapshot.hasBattery) {
+    if (bat != snapshot.battery) {
+      Serial.print("[BATT] Ignorando leitura posterior ");
+      Serial.print(bat);
+      Serial.print("% (mantendo ");
+      Serial.print(snapshot.battery);
+      Serial.println("%)");
+    }
+    return;
+  }
+
   snapshot.hasBattery = true;
   snapshot.battery = bat;
   snapshot.batteryAtMs = millis();

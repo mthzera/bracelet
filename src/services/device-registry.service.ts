@@ -67,6 +67,21 @@ function batteryFromPacket(packet: SavedPacket | null): number | null {
   return null;
 }
 
+/** Prefere a leitura mais recente — SNAPSHOT_VITALS costuma ser mais atual que 0x13 isolado. */
+function pickLatestBattery(
+  batteryPacket: SavedPacket | null,
+  snapshotPacket: SavedPacket | null,
+): number | null {
+  const candidates = [batteryPacket, snapshotPacket]
+    .filter((p): p is SavedPacket => p !== null)
+    .map((p) => ({ at: p.createdAt, value: batteryFromPacket(p) }))
+    .filter((c): c is { at: string; value: number } => c.value !== null);
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+  return candidates[0].value;
+}
+
 export async function buildDeviceOverview(bracelet: TestBracelet): Promise<DeviceOverview> {
   const [mergedHealth, batteryPacket, snapshotPacket, lastPacket] = await Promise.all([
     getMergedHealthForDevice(bracelet.deviceMac),
@@ -86,7 +101,7 @@ export async function buildDeviceOverview(bracelet: TestBracelet): Promise<Devic
     patient: bracelet.patient,
     online,
     lastSeenAt,
-    battery: batteryFromPacket(batteryPacket) ?? batteryFromPacket(snapshotPacket),
+    battery: pickLatestBattery(batteryPacket, snapshotPacket),
     mergedHealth,
   };
 }

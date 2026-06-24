@@ -913,10 +913,10 @@
       ? (withSteps.decoded.steps || 0).toLocaleString('pt-BR')
       : '—';
 
-    // Battery
+    // Battery — alinha com o painel HEALTH: snapshot > 0x13 > device overview
     const snapDecoded = latestSnapshotPacket()?.decoded;
     const batPacket = packets.find(p => p.decoded?.type === '0x13');
-    const batPct = device?.battery ?? snapDecoded?.battery ?? batPacket?.decoded?.battery ?? null;
+    const batPct = snapDecoded?.battery ?? batPacket?.decoded?.battery ?? device?.battery ?? null;
     const batTime = formatVitalCard(vTimes.battery);
     document.getElementById('sumBatTime').textContent = batTime;
     if (batPct != null) {
