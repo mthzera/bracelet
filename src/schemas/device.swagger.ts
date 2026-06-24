@@ -53,7 +53,7 @@ export const getDevicesRouteSchema = {
   tags: ["bracelets"],
   summary: "List registered test bracelets with latest vitals",
   description:
-    "Returns the 4 configured bracelets (3 pacientes reais + Matheus Dev de teste). patient/label/deviceMac são fixos; battery, mergedHealth, online e lastSeenAt vêm dos pacotes reais no banco.",
+    "Returns the 4 configured bracelets (3 pacientes reais + Arlene de teste). patient/label/deviceMac são fixos; battery, mergedHealth, online e lastSeenAt vêm dos pacotes reais no banco.",
   response: {
     200: {
       description: "Registered devices overview",
