@@ -702,16 +702,38 @@
     return snap?.decoded?.vitalMeasuredAt || {};
   }
 
-  function formatVitalCard(ts) {
-    if (!ts) return '';
-    const d = new Date(ts);
-    const time = d.toLocaleTimeString('pt-BR', { hour12: false });
-    const date = d.toLocaleDateString('pt-BR', { day: 'numeric', month: 'long' });
-    return `${time} ${date}`;
+  function formatVitalCard(ts, fallbackTs) {
+    const primary = ts || fallbackTs;
+    if (!primary) return '';
+    const d = new Date(primary);
+    if (Number.isNaN(d.getTime())) return '';
+
+    // Se o timestamp do vital estiver muito longe do recebimento, usa o fallback (createdAt).
+    if (ts && fallbackTs) {
+      const vitalMs = d.getTime();
+      const fallMs = new Date(fallbackTs).getTime();
+      if (!Number.isNaN(fallMs) && Math.abs(vitalMs - fallMs) > 7 * 24 * 3600 * 1000) {
+        return formatVitalCard(fallbackTs);
+      }
+    }
+
+    const diffSec = (Date.now() - d.getTime()) / 1000;
+    if (diffSec >= 0 && diffSec < 86400) return relTime(d.toISOString());
+    return d.toLocaleString('pt-BR', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    });
   }
 
-  function metricRow(name, valueHtml, measuredAt) {
-    const ts = measuredAt ? `<div class="sub" style="margin-top:2px;font-size:11px">${formatVitalCard(measuredAt)}</div>` : '';
+  function metricRow(name, valueHtml, measuredAt, fallbackTs) {
+    const ts = measuredAt || fallbackTs
+      ? `<div class="sub" style="margin-top:2px;font-size:11px">${formatVitalCard(measuredAt, fallbackTs)}</div>`
+      : '';
     return `<div class="metric-row">
       <span class="metric-name">${name}</span>
       <span style="text-align:right">${valueHtml}${ts}</span>
@@ -863,24 +885,28 @@
 
     // Vitais
     const vTimes = vitalMeasuredAtMap();
+    const snap = latestSnapshotPacket();
+    const snapAt = snap ? field(snap, 'createdAt', 'created_at') : null;
     const hr = latestVital(v => v.heartRate);
     document.getElementById('sumHR').innerHTML = (hr && hr.value != null)
       ? hr.value + '<span class="unit">bpm</span>'
       : '--<span class="unit">bpm</span>';
     document.getElementById('sumHRTime').textContent =
-      formatVitalCard(vTimes.heartRate) || (hr?.time ? relTime(hr.time) : '');
+      formatVitalCard(vTimes.heartRate, snapAt || hr?.time) || (hr?.time ? relTime(hr.time) : '');
 
     const spo2 = latestVital(v => v.spo2);
     document.getElementById('sumSpo2').innerHTML = (spo2 && spo2.value != null)
       ? spo2.value + '<span class="unit">%</span>'
       : '--<span class="unit">%</span>';
-    document.getElementById('sumSpo2Time').textContent = formatVitalCard(vTimes.spo2);
+    document.getElementById('sumSpo2Time').textContent =
+      formatVitalCard(vTimes.spo2, snapAt || spo2?.time);
 
     const temp = latestVital(v => v.temperature);
     document.getElementById('sumTemp').innerHTML = (temp && temp.value != null)
-      ? temp.value + '<span class="unit">°C</span>'
+      ? temp.value.toFixed(1) + '<span class="unit">°C</span>'
       : '--<span class="unit">°C</span>';
-    document.getElementById('sumTempTime').textContent = formatVitalCard(vTimes.temperature);
+    document.getElementById('sumTempTime').textContent =
+      formatVitalCard(vTimes.temperature, snapAt || temp?.time);
 
     // Blood Pressure
     const bpVital = latestVital(v => v.systolicPressure || v.diastolicPressure);
@@ -897,7 +923,8 @@
       if (view && view.systolicPressure > 0) {
         document.getElementById('sumBP').innerHTML =
           `${view.systolicPressure}/<span style="font-size:18px">${view.diastolicPressure}</span>`;
-        bpTimeEl.textContent = formatVitalCard(vTimes.bloodPressure) || 'mmHg';
+        bpTimeEl.textContent =
+          formatVitalCard(vTimes.bloodPressure, snapAt || bpVital.time) || 'mmHg';
       } else {
         document.getElementById('sumBP').textContent = '—';
         bpTimeEl.textContent = 'mmHg';
@@ -917,7 +944,10 @@
     const snapDecoded = latestSnapshotPacket()?.decoded;
     const batPacket = packets.find(p => p.decoded?.type === '0x13');
     const batPct = snapDecoded?.battery ?? batPacket?.decoded?.battery ?? device?.battery ?? null;
-    const batTime = formatVitalCard(vTimes.battery);
+    const batTime = formatVitalCard(
+      vTimes.battery,
+      snapAt || (batPacket ? field(batPacket, 'createdAt', 'created_at') : null),
+    );
     document.getElementById('sumBatTime').textContent = batTime;
     if (batPct != null) {
       const color = batPct > 50 ? 'var(--accent2)' : batPct > 20 ? 'var(--warn)' : 'var(--danger)';
@@ -983,6 +1013,7 @@
     const d = h.decoded;
     const stale = new Set(Array.isArray(d?.staleFields) ? d.staleFields : []);
     const vTimes = d?.vitalMeasuredAt || {};
+    const receivedAt = field(h, 'createdAt', 'created_at');
 
     const bpVal = (d.systolicPressure != null && d.systolicPressure > 0)
       ? `${d.systolicPressure}/${d.diastolicPressure}`
@@ -996,19 +1027,19 @@
     const source = isSnapshotPacket(h) ? 'SNAPSHOT_VITALS' : (d.type || '0x28');
 
     el.innerHTML = `
-      ${metricRow('&#x2764;&#xFE0F; Heart Rate', `${fmtVal(d.heartRate, '#ff6b8a', false)}<span class="metric-unit">bpm</span>`, vTimes.heartRate)}
-      ${metricRow('&#x1F4A8; SpO2', `${fmtVal(d.spo2, 'var(--accent2)', false)}<span class="metric-unit">%</span>`, vTimes.spo2)}
-      ${metricRow('&#x1F321;&#xFE0F; Temperature', `${fmtVal(d.temperature, 'var(--warn)', false)}<span class="metric-unit">°C</span>`, vTimes.temperature)}
-      ${metricRow('&#x1FA78; Blood Pressure', `${bpDisplay}<span class="metric-unit">mmHg</span>`, vTimes.bloodPressure)}
-      ${metricRow('&#x1F9E0; HRV', `${fmtVal(d.hrv, '#38bdf8', stale.has('hrv'))}<span class="metric-unit">ms</span>`, vTimes.hrv)}
-      ${metricRow('&#x26A1; Fadiga', `${fmtVal(d.fatigue, null, stale.has('fatigue'))}`, vTimes.fatigue)}
-      ${typeof d.battery === 'number' ? metricRow('&#x1F50B; Bateria', `<span class="metric-val" style="color:var(--warn)">${d.battery}</span><span class="metric-unit">%</span>`, vTimes.battery) : ''}
+      ${metricRow('&#x2764;&#xFE0F; Heart Rate', `${fmtVal(d.heartRate, '#ff6b8a', false)}<span class="metric-unit">bpm</span>`, vTimes.heartRate, receivedAt)}
+      ${metricRow('&#x1F4A8; SpO2', `${fmtVal(d.spo2, 'var(--accent2)', false)}<span class="metric-unit">%</span>`, vTimes.spo2, receivedAt)}
+      ${metricRow('&#x1F321;&#xFE0F; Temperature', `${fmtVal(d.temperature, 'var(--warn)', false)}<span class="metric-unit">°C</span>`, vTimes.temperature, receivedAt)}
+      ${metricRow('&#x1FA78; Blood Pressure', `${bpDisplay}<span class="metric-unit">mmHg</span>`, vTimes.bloodPressure, receivedAt)}
+      ${metricRow('&#x1F9E0; HRV', `${fmtVal(d.hrv, '#38bdf8', stale.has('hrv'))}<span class="metric-unit">ms</span>`, vTimes.hrv, receivedAt)}
+      ${metricRow('&#x26A1; Fadiga', `${fmtVal(d.fatigue, null, stale.has('fatigue'))}`, vTimes.fatigue, receivedAt)}
+      ${typeof d.battery === 'number' ? metricRow('&#x1F50B; Bateria', `<span class="metric-val" style="color:var(--warn)">${d.battery}</span><span class="metric-unit">%</span>`, vTimes.battery, receivedAt) : ''}
       <div class="metric-row">
         <span class="metric-name">Fonte</span>
         <span class="badge badge-health">${source}</span>
       </div>
       ${modeStr ? `<div class="metric-row"><span class="metric-name">Modo</span><span class="badge badge-health">${modeStr}</span></div>` : ''}
-      <div class="panel-ts">${relTime(field(h, 'createdAt', 'created_at'))}</div>
+      <div class="panel-ts">${relTime(receivedAt)}</div>
     `;
   }
 
@@ -1313,10 +1344,23 @@
 
   function relTime(ts) {
     if (!ts) return '';
-    const diff = (Date.now() - new Date(ts)) / 1000;
+    const d = new Date(ts);
+    if (Number.isNaN(d.getTime())) return '';
+    const diff = (Date.now() - d.getTime()) / 1000;
+    if (diff < 0) {
+      return d.toLocaleString('pt-BR', {
+        day: '2-digit', month: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', hour12: false,
+      });
+    }
     if (diff < 60)   return `há ${Math.floor(diff)}s`;
     if (diff < 3600) return `há ${Math.floor(diff / 60)}m`;
-    return `há ${Math.floor(diff / 3600)}h`;
+    if (diff < 86400) return `há ${Math.floor(diff / 3600)}h`;
+    if (diff < 86400 * 7) return `há ${Math.floor(diff / 86400)}d`;
+    return d.toLocaleString('pt-BR', {
+      day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    });
   }
 
   function toast(msg, type = 'ok') {

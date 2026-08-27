@@ -205,12 +205,22 @@ async function processInboundPacket(
     const sleepFields = sleepFieldsFromMetrics(item.metrics);
 
     const timingExtras = rawSnapshot as
-      | { postDelayMs?: number; collectionPostedAt?: string }
+      | {
+          postDelayMs?: number;
+          collectionPostedAt?: string;
+          measurementSessionStartedAtMs?: number;
+          receivedAtMs?: number;
+        }
       | undefined;
     const receivedAtEstimate = new Date().toISOString();
     const vitalMeasuredAt = computeVitalMeasuredAt(item.metrics, receivedAtEstimate, {
       postDelayMs: timingExtras?.postDelayMs,
       collectionPostedAt: timingExtras?.collectionPostedAt,
+      measurementSessionStartedAtMs: timingExtras?.measurementSessionStartedAtMs,
+      deviceReceivedAtMs:
+        typeof timingExtras?.receivedAtMs === "number"
+          ? timingExtras.receivedAtMs
+          : item.receivedAtMs,
     });
     const battery = batteryFromSnapshotMetrics(item.metrics);
 
@@ -700,6 +710,18 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
         collectionPostedAt:
           typeof batchExtras.collectionPostedAt === "string"
             ? batchExtras.collectionPostedAt
+            : undefined,
+        measurementSessionStartedAtMs:
+          typeof (snapshotPacket as { measurementSessionStartedAtMs?: number } | undefined)
+            ?.measurementSessionStartedAtMs === "number"
+            ? (snapshotPacket as { measurementSessionStartedAtMs: number })
+                .measurementSessionStartedAtMs
+            : typeof batchExtras.measurementSessionStartedAtMs === "number"
+              ? batchExtras.measurementSessionStartedAtMs
+              : undefined,
+        deviceReceivedAtMs:
+          typeof snapshotPacket?.receivedAtMs === "number"
+            ? snapshotPacket.receivedAtMs
             : undefined,
       },
     );
