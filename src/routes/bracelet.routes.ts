@@ -701,6 +701,11 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     const snapshotPacket = batch.packets.find(
       (p) => p.packetType === SNAPSHOT_VITALS_TYPE,
     );
+    const snapshotPacketExtras = snapshotPacket as
+      | (typeof snapshotPacket & { measurementSessionStartedAtMs?: number })
+      | undefined;
+    const sessionStartedFromPacket = snapshotPacketExtras?.measurementSessionStartedAtMs;
+    const sessionStartedFromBatch = batchExtras.measurementSessionStartedAtMs;
     const vitalMeasuredAt = computeVitalMeasuredAt(
       snapshotPacket?.metrics,
       measuredAt,
@@ -712,12 +717,10 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
             ? batchExtras.collectionPostedAt
             : undefined,
         measurementSessionStartedAtMs:
-          typeof (snapshotPacket as { measurementSessionStartedAtMs?: number } | undefined)
-            ?.measurementSessionStartedAtMs === "number"
-            ? (snapshotPacket as { measurementSessionStartedAtMs: number })
-                .measurementSessionStartedAtMs
-            : typeof batchExtras.measurementSessionStartedAtMs === "number"
-              ? batchExtras.measurementSessionStartedAtMs
+          typeof sessionStartedFromPacket === "number"
+            ? sessionStartedFromPacket
+            : typeof sessionStartedFromBatch === "number"
+              ? sessionStartedFromBatch
               : undefined,
         deviceReceivedAtMs:
           typeof snapshotPacket?.receivedAtMs === "number"
