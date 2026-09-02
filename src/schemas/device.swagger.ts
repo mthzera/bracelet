@@ -3,7 +3,7 @@ const patientInfoSchema = {
   required: ["patientId", "patientName", "age", "email"],
   properties: {
     patientId: { type: "string", example: "3691", description: "Código do paciente" },
-    patientName: { type: "string", example: "Jurandir Filadelfo Dos Santos" },
+    patientName: { type: "string", example: "Dora de Andreia" },
     age: { type: "integer", example: 40 },
     email: { type: "string", example: "carlos.mozer@pcpsaude.com.br" },
     leito: { type: "string", example: "LEITO 215", nullable: true },

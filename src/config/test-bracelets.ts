@@ -25,7 +25,7 @@ export type TestBracelet = {
 /** Nomes para dropdown no Swagger (GET /bracelets/reports/vitals). */
 export const REPORT_PATIENT_NAMES = [
   "Rubens Prospero Menezes",
-  "Jurandir Filadelfo Dos Santos",
+  "Dora de Andreia",
   "Anderson Vieira Rodrigues Lino",
   "Luciene Marques Lizardo",
 ] as const;
@@ -54,10 +54,10 @@ export const TEST_BRACELETS: TestBracelet[] = [
     label: "Bracelet 2",
     patient: {
       patientId: "3691",
-      patientName: "Jurandir Filadelfo Dos Santos",
+      patientName: "Dora de Andreia",
       age: 40,
       email: "carlos.mozer@pcpsaude.com.br",
-      leito: "LEITO 215",
+      leito: "Anery HomeCare",
       idatendimento: 5054,
       convenio: "Caixa Economica Federal",
       unidade: "Alto da Boa Vista",
