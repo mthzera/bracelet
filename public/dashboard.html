@@ -374,6 +374,78 @@
 
     .panel-ts { margin-top: 10px; font-size: 12px; color: var(--muted); }
 
+    /* ── Tablet gateways ── */
+    .gateways-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--card-radius);
+      padding: 18px 20px;
+      margin-bottom: 24px;
+    }
+    .gateways-panel h2 {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .gateways-panel .hint {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 14px;
+    }
+    .gateway-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 12px;
+    }
+    .gateway-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+    }
+    .gateway-card-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .gateway-card-title {
+      font-weight: 600;
+      font-size: 14px;
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .gateway-pill {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 999px;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+    .gateway-pill.on {
+      background: rgba(0, 212, 170, 0.15);
+      color: var(--accent2);
+    }
+    .gateway-pill.off {
+      background: rgba(255, 92, 108, 0.15);
+      color: var(--danger);
+    }
+    .gateway-kv {
+      display: grid;
+      grid-template-columns: 110px 1fr;
+      gap: 4px 8px;
+      font-size: 12px;
+    }
+    .gateway-kv .k { color: var(--muted); }
+    .gateway-kv .v { word-break: break-word; }
+    .gateway-kv .warn { color: var(--warn); }
+    .gateway-kv .bad { color: var(--danger); }
+    .gateway-kv .ok { color: var(--accent2); }
+
     /* ── Export panel ── */
     .export-panel {
       background: var(--surface);
@@ -503,6 +575,19 @@
     </div>
   </div>
 
+  <!-- Tablets / Gateways -->
+  <div class="gateways-panel">
+    <h2>Tablets (gateways)</h2>
+    <p class="hint">
+      Heartbeat a cada ~30s do app BioSync. Online = heartbeat nos últimos 2 minutos.
+      Cada tablet que abre o app fica registrado aqui (tabletId + Android ID).
+      Se vitais sumirem por horas, use estes cards para ver se o app morreu, BLE caiu, medição parou, bateria do tablet ou a fila/API falhou.
+    </p>
+    <div class="gateway-grid" id="gatewayGrid">
+      <div class="no-data" style="padding:24px 0">Nenhum tablet reportando ainda (precisa do app 0.2.5+)</div>
+    </div>
+  </div>
+
   <!-- Panels 2x2 -->
   <div class="panels">
     <div class="panel">
@@ -629,6 +714,7 @@
 <script>
   let packets = [];
   let devices = [];
+  let gateways = [];
   let autoRefresh = true;
   let refreshTimer = null;
   const REFRESH_INTERVAL = 5000;
@@ -803,6 +889,97 @@
     } catch (e) {
       toast('Falha ao carregar pulseiras: ' + e.message, 'err');
     }
+  }
+
+  async function fetchGateways() {
+    try {
+      const res = await fetch(`${apiBase()}/bracelets/gateways`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      gateways = data.gateways || [];
+      renderGateways();
+    } catch (e) {
+      console.error('fetchGateways', e);
+      const el = document.getElementById('gatewayGrid');
+      if (el) {
+        el.innerHTML = `<div class="no-data" style="padding:24px 0">Falha ao carregar tablets: ${escapeHtml(e.message)}</div>`;
+      }
+    }
+  }
+
+  function gatewayDiagnosis(g) {
+    if (!g.online) return { text: 'App parado / sem rede / tablet desligado', cls: 'bad' };
+    if (!g.bleConnected) return { text: 'App vivo, BLE desconectado', cls: 'warn' };
+    if (!g.isMeasuring) return { text: 'BLE ok, medição parada', cls: 'warn' };
+    if ((g.pendingSyncCount || 0) > 0) return { text: 'Medindo, fila/API com pendência', cls: 'warn' };
+    if (g.apiReachable === false) return { text: 'Medindo, API inacessível', cls: 'warn' };
+    return { text: 'Operando normalmente', cls: 'ok' };
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function renderGateways() {
+    const el = document.getElementById('gatewayGrid');
+    if (!el) return;
+    if (!gateways.length) {
+      el.innerHTML = '<div class="no-data" style="padding:24px 0">Nenhum tablet reportando ainda (precisa do app 0.2.5+)</div>';
+      return;
+    }
+
+    el.innerHTML = gateways.map((g) => {
+      const label = (g.tabletLabel || '').trim() || g.tabletId.slice(0, 8);
+      const diag = gatewayDiagnosis(g);
+      const lastHb = g.receivedAt ? relTime(g.receivedAt) : '—';
+      const lastSync = g.lastSyncAt
+        ? `${g.lastSyncOk === false ? 'falhou' : 'ok'} · ${relTime(g.lastSyncAt)}`
+        : '—';
+      const err = g.lastError
+        ? `<div class="k">Último erro</div><div class="v bad">${escapeHtml(g.lastError)}</div>`
+        : '';
+      return `<div class="gateway-card">
+        <div class="gateway-card-head">
+          <span class="status-dot ${g.online ? 'live' : 'error'}"></span>
+          <span class="gateway-card-title" title="${escapeHtml(g.tabletId)}">${escapeHtml(label)}</span>
+          <span class="gateway-pill ${g.online ? 'on' : 'off'}">${g.online ? 'online' : 'offline'}</span>
+        </div>
+        <div class="gateway-kv">
+          <div class="k">Diagnóstico</div><div class="v ${diag.cls}">${escapeHtml(diag.text)}</div>
+          <div class="k">Heartbeat</div><div class="v">${escapeHtml(lastHb)}</div>
+          <div class="k">Versão</div><div class="v">${escapeHtml(g.appVersion || '—')}</div>
+          <div class="k">Dispositivo</div><div class="v">${escapeHtml(
+            [g.deviceManufacturer, g.deviceModel].filter(Boolean).join(' ') || '—'
+          )}</div>
+          <div class="k">Android ID</div><div class="v mono" style="font-size:11px">${escapeHtml(g.androidId || '—')}</div>
+          <div class="k">Bateria tablet</div><div class="v ${
+            typeof g.tabletBatteryPercent === 'number' && g.tabletBatteryPercent <= 20 ? 'bad' : ''
+          }">${
+            typeof g.tabletBatteryPercent === 'number'
+              ? `${g.tabletBatteryPercent}%${g.tabletCharging ? ' ⚡' : ''}`
+              : '—'
+          }</div>
+          <div class="k">Login</div><div class="v">${escapeHtml(
+            g.sessionUser ? `${g.sessionUser}${g.sessionRole ? ` (${g.sessionRole})` : ''}` : '—'
+          )}</div>
+          <div class="k">1º acesso</div><div class="v">${g.firstSeenAt ? escapeHtml(relTime(g.firstSeenAt)) : '—'}</div>
+          <div class="k">Pulseira</div><div class="v mono">${escapeHtml(g.braceletMac || '—')}</div>
+          <div class="k">BLE</div><div class="v ${g.bleConnected ? 'ok' : 'bad'}">${g.bleConnected ? 'conectado' : 'desconectado'}</div>
+          <div class="k">Medindo</div><div class="v">${g.isMeasuring ? 'sim' : 'não'}</div>
+          <div class="k">Status</div><div class="v">${escapeHtml(g.statusMessage || g.phase || '—')}</div>
+          <div class="k">Fila sync</div><div class="v ${(g.pendingSyncCount || 0) > 0 ? 'warn' : ''}">${g.pendingSyncCount ?? 0}</div>
+          <div class="k">Último envio</div><div class="v">${escapeHtml(lastSync)}</div>
+          <div class="k">API</div><div class="v ${g.apiReachable === false ? 'bad' : (g.apiReachable ? 'ok' : '')}">${
+            g.apiReachable === true ? 'ok' : g.apiReachable === false ? 'falha' : '—'
+          }</div>
+          ${err}
+        </div>
+      </div>`;
+    }).join('');
   }
 
   function renderDeviceSelect() {
@@ -1574,6 +1751,7 @@
     if (autoRefresh) {
       refreshTimer = setTimeout(async () => {
         await fetchDevices();
+        await fetchGateways();
         await fetchPackets();
         scheduleRefresh();
       }, REFRESH_INTERVAL);
@@ -1582,7 +1760,7 @@
 
   document.getElementById('apiBase').addEventListener('change', () => {
     localStorage.setItem('braceletApiBase', apiBase());
-    fetchDevices().then(() => fetchPackets());
+    fetchDevices().then(() => fetchGateways()).then(() => fetchPackets());
   });
 
   // ── Init ─────────────────────────────────────────────────────────────────────
@@ -1590,6 +1768,7 @@
   initExportDates();
   checkApiHealth()
     .then(() => fetchDevices())
+    .then(() => fetchGateways())
     .then(() => fetchPackets())
     .then(scheduleRefresh);
 </script>

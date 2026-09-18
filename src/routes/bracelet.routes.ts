@@ -71,6 +71,14 @@ import {
   batteryFromSnapshotMetrics,
   computeVitalMeasuredAt,
 } from "../services/vital-timestamps.service.js";
+import {
+  listGatewayHeartbeats,
+  upsertGatewayHeartbeat,
+} from "../repositories/gateway-heartbeat.repository.js";
+import {
+  getGatewaysRouteSchema,
+  postGatewayHeartbeatRouteSchema,
+} from "../schemas/gateway-heartbeat.swagger.js";
 
 function resolveReportWindowMinutes(value: number | undefined): number {
   return typeof value === "number" && Number.isFinite(value)
@@ -401,6 +409,68 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     const devices = await buildDevicesOverview();
     return reply.status(200).send({ devices });
   });
+
+  app.get("/bracelets/gateways", { schema: getGatewaysRouteSchema }, async (_request, reply) => {
+    const gateways = await listGatewayHeartbeats();
+    return reply.status(200).send({ gateways });
+  });
+
+  app.post(
+    "/bracelets/gateways/heartbeat",
+    { schema: postGatewayHeartbeatRouteSchema },
+    async (request, reply) => {
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const tabletId = typeof body.tabletId === "string" ? body.tabletId.trim() : "";
+      if (!tabletId) {
+        return reply.status(400).send({ error: "tabletId is required" });
+      }
+
+      const asBool = (value: unknown): boolean | undefined =>
+        typeof value === "boolean" ? value : undefined;
+      const asNullableBool = (value: unknown): boolean | null | undefined => {
+        if (value === null) return null;
+        return asBool(value);
+      };
+      const asString = (value: unknown): string | undefined =>
+        typeof value === "string" ? value : undefined;
+      const asNullableString = (value: unknown): string | null | undefined => {
+        if (value === null) return null;
+        return asString(value);
+      };
+      const asNumber = (value: unknown): number | undefined =>
+        typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+      try {
+        const gateway = await upsertGatewayHeartbeat({
+          tabletId,
+          tabletLabel: asString(body.tabletLabel),
+          appVersion: asString(body.appVersion),
+          braceletMac: asNullableString(body.braceletMac),
+          bleConnected: asBool(body.bleConnected),
+          isMeasuring: asBool(body.isMeasuring),
+          phase: asString(body.phase),
+          statusMessage: asString(body.statusMessage),
+          pendingSyncCount: asNumber(body.pendingSyncCount),
+          lastSyncOk: asNullableBool(body.lastSyncOk),
+          lastSyncAt: asNullableString(body.lastSyncAt),
+          lastError: asNullableString(body.lastError),
+          apiReachable: asNullableBool(body.apiReachable),
+          sentAt: asNullableString(body.sentAt),
+          tabletBatteryPercent: asNumber(body.tabletBatteryPercent) ?? null,
+          tabletCharging: asNullableBool(body.tabletCharging),
+          deviceModel: asNullableString(body.deviceModel),
+          deviceManufacturer: asNullableString(body.deviceManufacturer),
+          androidId: asNullableString(body.androidId),
+          sessionUser: asNullableString(body.sessionUser),
+          sessionRole: asNullableString(body.sessionRole),
+        });
+        return reply.status(200).send({ gateway });
+      } catch (err) {
+        request.log.error({ err }, "Failed to upsert gateway heartbeat");
+        return reply.status(500).send({ error: "Failed to save heartbeat" });
+      }
+    },
+  );
 
   app.get(
     "/bracelets/reports/vitals",
