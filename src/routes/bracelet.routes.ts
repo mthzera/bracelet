@@ -99,10 +99,8 @@ import {
 function requireGatewayAdminToken(request: {
   headers: Record<string, string | string[] | undefined>;
 }): boolean {
-  const expected = process.env.GATEWAY_ADMIN_TOKEN?.trim();
-  if (!expected) {
-    return false;
-  }
+  // Senha simples do painel (ou override via env GATEWAY_ADMIN_TOKEN).
+  const expected = (process.env.GATEWAY_ADMIN_TOKEN?.trim() || "14092003");
   const header = request.headers["x-gateway-admin-token"];
   const provided = Array.isArray(header) ? header[0]?.trim() : header?.trim();
   return Boolean(provided && provided === expected);

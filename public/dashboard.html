@@ -392,6 +392,32 @@
       color: var(--muted);
       margin-bottom: 14px;
     }
+    .gateways-lock {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin-top: 12px;
+    }
+    .gateways-lock input {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 8px 12px;
+      font-size: 14px;
+      min-width: 180px;
+    }
+    .gateways-lock .lock-error {
+      width: 100%;
+      font-size: 12px;
+      color: var(--danger);
+      display: none;
+    }
+    #gatewaysUnlocked { display: none; }
+    #gatewaysLocked { display: block; }
+    .gateways-panel.is-unlocked #gatewaysUnlocked { display: block; }
+    .gateways-panel.is-unlocked #gatewaysLocked { display: none; }
     .gateway-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
@@ -574,6 +600,59 @@
 
 <main>
 
+  <!-- Tablets / Gateways (topo — debug remoto) -->
+  <div class="gateways-panel" id="gatewaysPanel">
+    <h2>Tablets — debug remoto</h2>
+    <p class="hint">
+      Controle e diagnóstico dos tablets BioSync. Protegido por senha.
+    </p>
+
+    <div id="gatewaysLocked">
+      <div class="gateways-lock">
+        <input id="gatewaysPassword" type="password" placeholder="Senha" autocomplete="off" />
+        <button type="button" onclick="unlockGateways()">Entrar</button>
+        <div class="lock-error" id="gatewaysLockError">Senha incorreta</div>
+      </div>
+    </div>
+
+    <div id="gatewaysUnlocked">
+      <p class="hint" style="margin-top:0">
+        Heartbeat ~30s. Online = últimos 2 min. Em <b>Detalhes</b>: logs, BLE e comandos
+        (reconectar, medir, reenviar fila, reiniciar app — até ~30s). Reiniciar = só o app.
+      </p>
+      <div class="gateway-grid" id="gatewayGrid">
+        <div class="no-data" style="padding:24px 0">Nenhum tablet reportando ainda (precisa do app 0.2.6+)</div>
+      </div>
+      <div style="margin-top:10px">
+        <button class="secondary" type="button" onclick="lockGateways()">Bloquear seção</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="tabletModal" onclick="if(event.target===this) closeTabletModal()">
+    <div class="modal-sheet" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <span class="status-dot" id="modalDot"></span>
+        <h3 id="modalTitle">Tablet</h3>
+        <button class="secondary" type="button" onclick="closeTabletModal()">Fechar</button>
+      </div>
+      <div class="gateway-kv" id="modalMeta"></div>
+      <div class="cmd-row">
+        <button type="button" onclick="sendTabletCommand('reconnect_ble')">Reconectar pulseira</button>
+        <button type="button" onclick="sendTabletCommand('start_measurement')">Iniciar medição</button>
+        <button type="button" onclick="sendTabletCommand('stop_measurement')">Parar medição</button>
+        <button type="button" onclick="sendTabletCommand('retry_pending_sync')">Reenviar fila</button>
+        <button class="danger" type="button" onclick="sendTabletCommand('restart_app')">Reiniciar app</button>
+        <button class="secondary" type="button" onclick="refreshTabletDetail()">Atualizar</button>
+      </div>
+      <div class="cmd-status" id="modalCmdStatus">Comandos entram na fila e o tablet pega no próximo heartbeat (~30s).</div>
+      <h4 style="margin:14px 0 8px;font-size:13px">Logs do app</h4>
+      <div class="log-box" id="modalLogs">—</div>
+      <h4 style="margin:14px 0 8px;font-size:13px">Comandos recentes</h4>
+      <div class="log-box" id="modalCommands">—</div>
+    </div>
+  </div>
+
   <!-- Summary row -->
   <div class="summary-grid" id="summaryGrid">
     <div class="summary-card">
@@ -629,48 +708,6 @@
     <div class="summary-card">
       <div class="label">Last Update</div>
       <div class="value" id="sumLastUpdate" style="font-size:15px;color:var(--muted)">—</div>
-    </div>
-  </div>
-
-  <!-- Tablets / Gateways -->
-  <div class="gateways-panel">
-    <h2>Tablets (gateways) — debug remoto</h2>
-    <p class="hint">
-      Heartbeat ~30s. Online = últimos 2 min. Clique em <b>Detalhes</b> para logs, histórico BLE e comandos
-      (reiniciar app, reconectar, iniciar/parar medição, reenviar fila). Comandos levam até ~30s.
-      Reiniciar = só o app, não o Android. Configure o token admin (GATEWAY_ADMIN_TOKEN) abaixo no modal.
-    </p>
-    <div class="gateway-grid" id="gatewayGrid">
-      <div class="no-data" style="padding:24px 0">Nenhum tablet reportando ainda (precisa do app 0.2.6+)</div>
-    </div>
-  </div>
-
-  <div class="modal-backdrop" id="tabletModal" onclick="if(event.target===this) closeTabletModal()">
-    <div class="modal-sheet" role="dialog" aria-modal="true">
-      <div class="modal-head">
-        <span class="status-dot" id="modalDot"></span>
-        <h3 id="modalTitle">Tablet</h3>
-        <button class="secondary" type="button" onclick="closeTabletModal()">Fechar</button>
-      </div>
-      <div class="token-row">
-        <label style="font-size:12px;color:var(--muted)">Token admin</label>
-        <input id="gatewayAdminToken" type="password" placeholder="GATEWAY_ADMIN_TOKEN" autocomplete="off" />
-        <button class="secondary" type="button" onclick="saveGatewayToken()">Salvar token</button>
-      </div>
-      <div class="gateway-kv" id="modalMeta"></div>
-      <div class="cmd-row">
-        <button type="button" onclick="sendTabletCommand('reconnect_ble')">Reconectar pulseira</button>
-        <button type="button" onclick="sendTabletCommand('start_measurement')">Iniciar medição</button>
-        <button type="button" onclick="sendTabletCommand('stop_measurement')">Parar medição</button>
-        <button type="button" onclick="sendTabletCommand('retry_pending_sync')">Reenviar fila</button>
-        <button class="danger" type="button" onclick="sendTabletCommand('restart_app')">Reiniciar app</button>
-        <button class="secondary" type="button" onclick="refreshTabletDetail()">Atualizar</button>
-      </div>
-      <div class="cmd-status" id="modalCmdStatus">Comandos entram na fila e o tablet pega no próximo heartbeat (~30s).</div>
-      <h4 style="margin:14px 0 8px;font-size:13px">Logs do app</h4>
-      <div class="log-box" id="modalLogs">—</div>
-      <h4 style="margin:14px 0 8px;font-size:13px">Comandos recentes</h4>
-      <div class="log-box" id="modalCommands">—</div>
     </div>
   </div>
 
@@ -978,6 +1015,7 @@
   }
 
   async function fetchGateways() {
+    if (!isGatewaysUnlocked()) return;
     try {
       const res = await fetch(`${apiBase()}/bracelets/gateways`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1065,22 +1103,55 @@
 
   let selectedTabletId = null;
   let tabletDetailTimer = null;
+  const GATEWAYS_PASSWORD = '14092003';
+  const GATEWAYS_UNLOCK_KEY = 'gatewaysUnlocked';
 
-  function gatewayAdminToken() {
-    return (document.getElementById('gatewayAdminToken')?.value || '').trim();
+  function isGatewaysUnlocked() {
+    return sessionStorage.getItem(GATEWAYS_UNLOCK_KEY) === '1';
   }
 
-  function saveGatewayToken() {
-    localStorage.setItem('gatewayAdminToken', gatewayAdminToken());
-    toast('Token salvo neste navegador');
+  function applyGatewaysLockState() {
+    const panel = document.getElementById('gatewaysPanel');
+    if (!panel) return;
+    panel.classList.toggle('is-unlocked', isGatewaysUnlocked());
+    if (isGatewaysUnlocked()) {
+      fetchGateways();
+    }
+  }
+
+  function unlockGateways() {
+    const input = document.getElementById('gatewaysPassword');
+    const err = document.getElementById('gatewaysLockError');
+    const value = (input?.value || '').trim();
+    if (value !== GATEWAYS_PASSWORD) {
+      if (err) err.style.display = 'block';
+      toast('Senha incorreta', 'err');
+      return;
+    }
+    if (err) err.style.display = 'none';
+    sessionStorage.setItem(GATEWAYS_UNLOCK_KEY, '1');
+    if (input) input.value = '';
+    applyGatewaysLockState();
+    toast('Seção desbloqueada');
+  }
+
+  function lockGateways() {
+    sessionStorage.removeItem(GATEWAYS_UNLOCK_KEY);
+    closeTabletModal();
+    applyGatewaysLockState();
+    toast('Seção bloqueada');
+  }
+
+  function gatewayAdminToken() {
+    return GATEWAYS_PASSWORD;
   }
 
   function openTabletModal(tabletId) {
-    selectedTabletId = tabletId;
-    const input = document.getElementById('gatewayAdminToken');
-    if (input && !input.value) {
-      input.value = localStorage.getItem('gatewayAdminToken') || '';
+    if (!isGatewaysUnlocked()) {
+      toast('Desbloqueie a seção com a senha', 'err');
+      return;
     }
+    selectedTabletId = tabletId;
     document.getElementById('tabletModal').classList.add('open');
     refreshTabletDetail();
     clearInterval(tabletDetailTimer);
@@ -1095,7 +1166,7 @@
   }
 
   async function refreshTabletDetail() {
-    if (!selectedTabletId) return;
+    if (!selectedTabletId || !isGatewaysUnlocked()) return;
     try {
       const res = await fetch(`${apiBase()}/bracelets/gateways/${encodeURIComponent(selectedTabletId)}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1138,12 +1209,8 @@
   }
 
   async function sendTabletCommand(command) {
-    if (!selectedTabletId) return;
+    if (!selectedTabletId || !isGatewaysUnlocked()) return;
     const token = gatewayAdminToken();
-    if (!token) {
-      toast('Informe e salve o token admin (GATEWAY_ADMIN_TOKEN)', 'err');
-      return;
-    }
     if (command === 'restart_app' && !confirm('Reiniciar o app neste tablet? (não reinicia o Android)')) {
       return;
     }
@@ -1955,6 +2022,10 @@
   // ── Init ─────────────────────────────────────────────────────────────────────
   initApiBase();
   initExportDates();
+  applyGatewaysLockState();
+  document.getElementById('gatewaysPassword')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') unlockGateways();
+  });
   checkApiHealth()
     .then(() => fetchDevices())
     .then(() => fetchGateways())
