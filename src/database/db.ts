@@ -138,9 +138,50 @@ async function migrate(client: PoolClient): Promise<void> {
     ALTER TABLE gateway_heartbeats
     ADD COLUMN IF NOT EXISTS session_role TEXT;
   `);
+  await client.query(`
+    ALTER TABLE gateway_heartbeats
+    ADD COLUMN IF NOT EXISTS last_ble_connected_at TIMESTAMPTZ;
+  `);
+  await client.query(`
+    ALTER TABLE gateway_heartbeats
+    ADD COLUMN IF NOT EXISTS last_ble_disconnected_at TIMESTAMPTZ;
+  `);
+  await client.query(`
+    ALTER TABLE gateway_heartbeats
+    ADD COLUMN IF NOT EXISTS last_ble_disconnect_reason TEXT;
+  `);
 
   await client.query(
     `CREATE INDEX IF NOT EXISTS idx_gateway_heartbeats_received_at ON gateway_heartbeats(received_at);`,
+  );
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS gateway_commands (
+      id SERIAL PRIMARY KEY,
+      tablet_id TEXT NOT NULL,
+      command TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      result TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      acked_at TIMESTAMPTZ,
+      finished_at TIMESTAMPTZ
+    );
+  `);
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_gateway_commands_tablet_status ON gateway_commands(tablet_id, status, created_at DESC);`,
+  );
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS gateway_logs (
+      id SERIAL PRIMARY KEY,
+      tablet_id TEXT NOT NULL,
+      logged_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      level TEXT NOT NULL DEFAULT 'info',
+      message TEXT NOT NULL
+    );
+  `);
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_gateway_logs_tablet_logged ON gateway_logs(tablet_id, logged_at DESC);`,
   );
 }
 

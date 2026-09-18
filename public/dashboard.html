@@ -445,6 +445,63 @@
     .gateway-kv .warn { color: var(--warn); }
     .gateway-kv .bad { color: var(--danger); }
     .gateway-kv .ok { color: var(--accent2); }
+    .gateway-actions { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .gateway-actions button { font-size: 12px; padding: 6px 10px; }
+
+    .modal-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.55);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal-sheet {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      width: min(920px, 100%);
+      max-height: 90vh;
+      overflow: auto;
+      padding: 18px 20px;
+    }
+    .modal-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .modal-head h3 { font-size: 16px; flex: 1; }
+    .log-box {
+      background: #0b0d14;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-family: 'Cascadia Code', 'Fira Code', monospace;
+      font-size: 11px;
+      line-height: 1.45;
+      max-height: 280px;
+      overflow: auto;
+      white-space: pre-wrap;
+      color: #c8cde0;
+    }
+    .cmd-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+    .cmd-row button.danger { background: var(--danger); }
+    .token-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+    .token-row input {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 6px 10px;
+      font-size: 13px;
+      min-width: 220px;
+      flex: 1;
+    }
+    .cmd-status { font-size: 12px; color: var(--muted); margin-top: 6px; }
 
     /* ── Export panel ── */
     .export-panel {
@@ -577,14 +634,43 @@
 
   <!-- Tablets / Gateways -->
   <div class="gateways-panel">
-    <h2>Tablets (gateways)</h2>
+    <h2>Tablets (gateways) — debug remoto</h2>
     <p class="hint">
-      Heartbeat a cada ~30s do app BioSync. Online = heartbeat nos últimos 2 minutos.
-      Cada tablet que abre o app fica registrado aqui (tabletId + Android ID).
-      Se vitais sumirem por horas, use estes cards para ver se o app morreu, BLE caiu, medição parou, bateria do tablet ou a fila/API falhou.
+      Heartbeat ~30s. Online = últimos 2 min. Clique em <b>Detalhes</b> para logs, histórico BLE e comandos
+      (reiniciar app, reconectar, iniciar/parar medição, reenviar fila). Comandos levam até ~30s.
+      Reiniciar = só o app, não o Android. Configure o token admin (GATEWAY_ADMIN_TOKEN) abaixo no modal.
     </p>
     <div class="gateway-grid" id="gatewayGrid">
-      <div class="no-data" style="padding:24px 0">Nenhum tablet reportando ainda (precisa do app 0.2.5+)</div>
+      <div class="no-data" style="padding:24px 0">Nenhum tablet reportando ainda (precisa do app 0.2.6+)</div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="tabletModal" onclick="if(event.target===this) closeTabletModal()">
+    <div class="modal-sheet" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <span class="status-dot" id="modalDot"></span>
+        <h3 id="modalTitle">Tablet</h3>
+        <button class="secondary" type="button" onclick="closeTabletModal()">Fechar</button>
+      </div>
+      <div class="token-row">
+        <label style="font-size:12px;color:var(--muted)">Token admin</label>
+        <input id="gatewayAdminToken" type="password" placeholder="GATEWAY_ADMIN_TOKEN" autocomplete="off" />
+        <button class="secondary" type="button" onclick="saveGatewayToken()">Salvar token</button>
+      </div>
+      <div class="gateway-kv" id="modalMeta"></div>
+      <div class="cmd-row">
+        <button type="button" onclick="sendTabletCommand('reconnect_ble')">Reconectar pulseira</button>
+        <button type="button" onclick="sendTabletCommand('start_measurement')">Iniciar medição</button>
+        <button type="button" onclick="sendTabletCommand('stop_measurement')">Parar medição</button>
+        <button type="button" onclick="sendTabletCommand('retry_pending_sync')">Reenviar fila</button>
+        <button class="danger" type="button" onclick="sendTabletCommand('restart_app')">Reiniciar app</button>
+        <button class="secondary" type="button" onclick="refreshTabletDetail()">Atualizar</button>
+      </div>
+      <div class="cmd-status" id="modalCmdStatus">Comandos entram na fila e o tablet pega no próximo heartbeat (~30s).</div>
+      <h4 style="margin:14px 0 8px;font-size:13px">Logs do app</h4>
+      <div class="log-box" id="modalLogs">—</div>
+      <h4 style="margin:14px 0 8px;font-size:13px">Comandos recentes</h4>
+      <div class="log-box" id="modalCommands">—</div>
     </div>
   </div>
 
@@ -928,7 +1014,7 @@
     const el = document.getElementById('gatewayGrid');
     if (!el) return;
     if (!gateways.length) {
-      el.innerHTML = '<div class="no-data" style="padding:24px 0">Nenhum tablet reportando ainda (precisa do app 0.2.5+)</div>';
+      el.innerHTML = '<div class="no-data" style="padding:24px 0">Nenhum tablet reportando ainda (precisa do app 0.2.6+)</div>';
       return;
     }
 
@@ -939,47 +1025,150 @@
       const lastSync = g.lastSyncAt
         ? `${g.lastSyncOk === false ? 'falhou' : 'ok'} · ${relTime(g.lastSyncAt)}`
         : '—';
+      const bleLine = g.bleConnected
+        ? `conectado${g.lastBleConnectedAt ? ' desde ' + relTime(g.lastBleConnectedAt) : ''}`
+        : `desconectado${g.lastBleDisconnectedAt ? ' · última vez ' + relTime(g.lastBleDisconnectedAt) : ''}${g.lastBleDisconnectReason ? ' (' + g.lastBleDisconnectReason + ')' : ''}`;
       const err = g.lastError
         ? `<div class="k">Último erro</div><div class="v bad">${escapeHtml(g.lastError)}</div>`
         : '';
+      const tid = escapeHtml(g.tabletId);
       return `<div class="gateway-card">
         <div class="gateway-card-head">
           <span class="status-dot ${g.online ? 'live' : 'error'}"></span>
-          <span class="gateway-card-title" title="${escapeHtml(g.tabletId)}">${escapeHtml(label)}</span>
+          <span class="gateway-card-title" title="${tid}">${escapeHtml(label)}</span>
           <span class="gateway-pill ${g.online ? 'on' : 'off'}">${g.online ? 'online' : 'offline'}</span>
         </div>
         <div class="gateway-kv">
           <div class="k">Diagnóstico</div><div class="v ${diag.cls}">${escapeHtml(diag.text)}</div>
           <div class="k">Heartbeat</div><div class="v">${escapeHtml(lastHb)}</div>
           <div class="k">Versão</div><div class="v">${escapeHtml(g.appVersion || '—')}</div>
-          <div class="k">Dispositivo</div><div class="v">${escapeHtml(
-            [g.deviceManufacturer, g.deviceModel].filter(Boolean).join(' ') || '—'
-          )}</div>
-          <div class="k">Android ID</div><div class="v mono" style="font-size:11px">${escapeHtml(g.androidId || '—')}</div>
-          <div class="k">Bateria tablet</div><div class="v ${
+          <div class="k">Bateria</div><div class="v ${
             typeof g.tabletBatteryPercent === 'number' && g.tabletBatteryPercent <= 20 ? 'bad' : ''
           }">${
             typeof g.tabletBatteryPercent === 'number'
               ? `${g.tabletBatteryPercent}%${g.tabletCharging ? ' ⚡' : ''}`
               : '—'
           }</div>
-          <div class="k">Login</div><div class="v">${escapeHtml(
-            g.sessionUser ? `${g.sessionUser}${g.sessionRole ? ` (${g.sessionRole})` : ''}` : '—'
-          )}</div>
-          <div class="k">1º acesso</div><div class="v">${g.firstSeenAt ? escapeHtml(relTime(g.firstSeenAt)) : '—'}</div>
           <div class="k">Pulseira</div><div class="v mono">${escapeHtml(g.braceletMac || '—')}</div>
-          <div class="k">BLE</div><div class="v ${g.bleConnected ? 'ok' : 'bad'}">${g.bleConnected ? 'conectado' : 'desconectado'}</div>
+          <div class="k">BLE</div><div class="v ${g.bleConnected ? 'ok' : 'bad'}">${escapeHtml(bleLine)}</div>
           <div class="k">Medindo</div><div class="v">${g.isMeasuring ? 'sim' : 'não'}</div>
-          <div class="k">Status</div><div class="v">${escapeHtml(g.statusMessage || g.phase || '—')}</div>
           <div class="k">Fila sync</div><div class="v ${(g.pendingSyncCount || 0) > 0 ? 'warn' : ''}">${g.pendingSyncCount ?? 0}</div>
           <div class="k">Último envio</div><div class="v">${escapeHtml(lastSync)}</div>
-          <div class="k">API</div><div class="v ${g.apiReachable === false ? 'bad' : (g.apiReachable ? 'ok' : '')}">${
-            g.apiReachable === true ? 'ok' : g.apiReachable === false ? 'falha' : '—'
-          }</div>
           ${err}
+        </div>
+        <div class="gateway-actions">
+          <button type="button" onclick="openTabletModal('${tid}')">Detalhes / comandos</button>
         </div>
       </div>`;
     }).join('');
+  }
+
+  let selectedTabletId = null;
+  let tabletDetailTimer = null;
+
+  function gatewayAdminToken() {
+    return (document.getElementById('gatewayAdminToken')?.value || '').trim();
+  }
+
+  function saveGatewayToken() {
+    localStorage.setItem('gatewayAdminToken', gatewayAdminToken());
+    toast('Token salvo neste navegador');
+  }
+
+  function openTabletModal(tabletId) {
+    selectedTabletId = tabletId;
+    const input = document.getElementById('gatewayAdminToken');
+    if (input && !input.value) {
+      input.value = localStorage.getItem('gatewayAdminToken') || '';
+    }
+    document.getElementById('tabletModal').classList.add('open');
+    refreshTabletDetail();
+    clearInterval(tabletDetailTimer);
+    tabletDetailTimer = setInterval(refreshTabletDetail, 5000);
+  }
+
+  function closeTabletModal() {
+    document.getElementById('tabletModal').classList.remove('open');
+    selectedTabletId = null;
+    clearInterval(tabletDetailTimer);
+    tabletDetailTimer = null;
+  }
+
+  async function refreshTabletDetail() {
+    if (!selectedTabletId) return;
+    try {
+      const res = await fetch(`${apiBase()}/bracelets/gateways/${encodeURIComponent(selectedTabletId)}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const g = data.gateway || {};
+      const label = (g.tabletLabel || '').trim() || g.tabletId;
+      document.getElementById('modalTitle').textContent = label;
+      const dot = document.getElementById('modalDot');
+      dot.className = `status-dot ${g.online ? 'live' : 'error'}`;
+
+      const bleLine = g.bleConnected
+        ? `conectado${g.lastBleConnectedAt ? ' desde ' + relTime(g.lastBleConnectedAt) : ''}`
+        : `OFF · última conexão/desconexão: ${g.lastBleDisconnectedAt ? relTime(g.lastBleDisconnectedAt) : '—'} (${g.lastBleDisconnectReason || '—'})`;
+
+      document.getElementById('modalMeta').innerHTML = `
+        <div class="k">Tablet ID</div><div class="v mono">${escapeHtml(g.tabletId || '')}</div>
+        <div class="k">Online</div><div class="v ${g.online ? 'ok' : 'bad'}">${g.online ? 'sim' : 'não'} · HB ${escapeHtml(g.receivedAt ? relTime(g.receivedAt) : '—')}</div>
+        <div class="k">App</div><div class="v">${escapeHtml(g.appVersion || '—')} · ${escapeHtml([g.deviceManufacturer, g.deviceModel].filter(Boolean).join(' ') || '—')}</div>
+        <div class="k">Bateria</div><div class="v">${typeof g.tabletBatteryPercent === 'number' ? g.tabletBatteryPercent + '%' + (g.tabletCharging ? ' ⚡' : '') : '—'}</div>
+        <div class="k">Login</div><div class="v">${escapeHtml(g.sessionUser || '—')} (${escapeHtml(g.sessionRole || '—')})</div>
+        <div class="k">Pulseira</div><div class="v mono">${escapeHtml(g.braceletMac || '—')}</div>
+        <div class="k">BLE</div><div class="v ${g.bleConnected ? 'ok' : 'bad'}">${escapeHtml(bleLine)}</div>
+        <div class="k">Medição</div><div class="v">${g.isMeasuring ? 'sim' : 'não'} · ${escapeHtml(g.statusMessage || g.phase || '—')}</div>
+        <div class="k">Fila / API</div><div class="v">pending=${g.pendingSyncCount ?? 0} · api=${g.apiReachable === true ? 'ok' : g.apiReachable === false ? 'falha' : '—'}</div>
+        <div class="k">Último erro</div><div class="v bad">${escapeHtml(g.lastError || '—')}</div>
+      `;
+
+      const logs = data.logs || [];
+      document.getElementById('modalLogs').textContent = logs.length
+        ? logs.map(l => `${(l.loggedAt || '').replace('T',' ').slice(0,19)} [${l.level}] ${l.message}`).join('\n')
+        : '(sem logs ainda — aguarde heartbeats do app 0.2.6+)';
+
+      const cmds = data.commands || [];
+      document.getElementById('modalCommands').textContent = cmds.length
+        ? cmds.map(c => `#${c.id} ${c.command} · ${c.status}${c.result ? ' · ' + c.result : ''} · ${c.createdAt ? relTime(c.createdAt) : ''}`).join('\n')
+        : '(nenhum comando ainda)';
+    } catch (e) {
+      document.getElementById('modalCmdStatus').textContent = 'Falha ao carregar detalhe: ' + e.message;
+    }
+  }
+
+  async function sendTabletCommand(command) {
+    if (!selectedTabletId) return;
+    const token = gatewayAdminToken();
+    if (!token) {
+      toast('Informe e salve o token admin (GATEWAY_ADMIN_TOKEN)', 'err');
+      return;
+    }
+    if (command === 'restart_app' && !confirm('Reiniciar o app neste tablet? (não reinicia o Android)')) {
+      return;
+    }
+    try {
+      const res = await fetch(
+        `${apiBase()}/bracelets/gateways/${encodeURIComponent(selectedTabletId)}/commands`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Gateway-Admin-Token': token,
+          },
+          body: JSON.stringify({ command }),
+        },
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      document.getElementById('modalCmdStatus').textContent =
+        `Comando #${data.command?.id} (${command}) enfileirado — o tablet deve pegar em até ~30s.`;
+      toast('Comando enfileirado');
+      refreshTabletDetail();
+    } catch (e) {
+      toast('Falha: ' + e.message, 'err');
+      document.getElementById('modalCmdStatus').textContent = 'Erro: ' + e.message;
+    }
   }
 
   function renderDeviceSelect() {

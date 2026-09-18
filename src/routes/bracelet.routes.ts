@@ -72,13 +72,41 @@ import {
   computeVitalMeasuredAt,
 } from "../services/vital-timestamps.service.js";
 import {
+  getGatewayHeartbeat,
   listGatewayHeartbeats,
   upsertGatewayHeartbeat,
 } from "../repositories/gateway-heartbeat.repository.js";
 import {
+  claimPendingCommands,
+  completeGatewayCommand,
+  enqueueGatewayCommand,
+  isGatewayCommand,
+  listRecentCommands,
+} from "../repositories/gateway-command.repository.js";
+import {
+  appendGatewayLogs,
+  listGatewayLogs,
+} from "../repositories/gateway-log.repository.js";
+import {
+  getGatewayDetailRouteSchema,
   getGatewaysRouteSchema,
+  postGatewayCommandResultRouteSchema,
+  postGatewayCommandRouteSchema,
   postGatewayHeartbeatRouteSchema,
+  postGatewayLogsRouteSchema,
 } from "../schemas/gateway-heartbeat.swagger.js";
+
+function requireGatewayAdminToken(request: {
+  headers: Record<string, string | string[] | undefined>;
+}): boolean {
+  const expected = process.env.GATEWAY_ADMIN_TOKEN?.trim();
+  if (!expected) {
+    return false;
+  }
+  const header = request.headers["x-gateway-admin-token"];
+  const provided = Array.isArray(header) ? header[0]?.trim() : header?.trim();
+  return Boolean(provided && provided === expected);
+}
 
 function resolveReportWindowMinutes(value: number | undefined): number {
   return typeof value === "number" && Number.isFinite(value)
@@ -415,6 +443,98 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
     return reply.status(200).send({ gateways });
   });
 
+  app.get(
+    "/bracelets/gateways/:tabletId",
+    { schema: getGatewayDetailRouteSchema },
+    async (request, reply) => {
+      const { tabletId } = request.params as { tabletId: string };
+      const gateway = await getGatewayHeartbeat(tabletId);
+      if (!gateway) {
+        return reply.status(404).send({ error: "tablet not found" });
+      }
+      const [logs, commands] = await Promise.all([
+        listGatewayLogs(tabletId, 200),
+        listRecentCommands(tabletId, 30),
+      ]);
+      return reply.status(200).send({ gateway, logs, commands });
+    },
+  );
+
+  app.post(
+    "/bracelets/gateways/:tabletId/commands",
+    { schema: postGatewayCommandRouteSchema },
+    async (request, reply) => {
+      if (!requireGatewayAdminToken(request)) {
+        return reply.status(401).send({
+          error: "Missing or invalid X-Gateway-Admin-Token (set GATEWAY_ADMIN_TOKEN on API)",
+        });
+      }
+      const { tabletId } = request.params as { tabletId: string };
+      const body = (request.body ?? {}) as { command?: string };
+      const command = typeof body.command === "string" ? body.command.trim() : "";
+      if (!isGatewayCommand(command)) {
+        return reply.status(400).send({ error: "invalid command" });
+      }
+      const existing = await getGatewayHeartbeat(tabletId);
+      if (!existing) {
+        return reply.status(404).send({ error: "tablet not found — wait for first heartbeat" });
+      }
+      const queued = await enqueueGatewayCommand(tabletId, command);
+      return reply.status(200).send({ command: queued });
+    },
+  );
+
+  app.post(
+    "/bracelets/gateways/:tabletId/commands/:commandId/result",
+    { schema: postGatewayCommandResultRouteSchema },
+    async (request, reply) => {
+      const { tabletId, commandId } = request.params as {
+        tabletId: string;
+        commandId: string;
+      };
+      const id = Number(commandId);
+      if (!Number.isFinite(id)) {
+        return reply.status(400).send({ error: "invalid commandId" });
+      }
+      const body = (request.body ?? {}) as { ok?: boolean; result?: string | null };
+      const updated = await completeGatewayCommand(
+        tabletId,
+        id,
+        Boolean(body.ok),
+        typeof body.result === "string" ? body.result : null,
+      );
+      if (!updated) {
+        return reply.status(404).send({ error: "command not found" });
+      }
+      return reply.status(200).send({ command: updated });
+    },
+  );
+
+  app.post(
+    "/bracelets/gateways/:tabletId/logs",
+    { schema: postGatewayLogsRouteSchema },
+    async (request, reply) => {
+      const { tabletId } = request.params as { tabletId: string };
+      const body = (request.body ?? {}) as { logs?: unknown };
+      const rawLogs = Array.isArray(body.logs) ? body.logs : [];
+      const logs = rawLogs
+        .map((entry) => {
+          if (!entry || typeof entry !== "object") return null;
+          const row = entry as Record<string, unknown>;
+          const message = typeof row.message === "string" ? row.message : "";
+          if (!message.trim()) return null;
+          return {
+            message,
+            level: typeof row.level === "string" ? row.level : "info",
+            loggedAt: typeof row.loggedAt === "string" ? row.loggedAt : null,
+          };
+        })
+        .filter((x): x is NonNullable<typeof x> => x != null);
+      const inserted = await appendGatewayLogs(tabletId, logs);
+      return reply.status(200).send({ inserted });
+    },
+  );
+
   app.post(
     "/bracelets/gateways/heartbeat",
     { schema: postGatewayHeartbeatRouteSchema },
@@ -463,8 +583,32 @@ export async function braceletRoutes(app: FastifyInstance): Promise<void> {
           androidId: asNullableString(body.androidId),
           sessionUser: asNullableString(body.sessionUser),
           sessionRole: asNullableString(body.sessionRole),
+          lastBleConnectedAt: asNullableString(body.lastBleConnectedAt),
+          lastBleDisconnectedAt: asNullableString(body.lastBleDisconnectedAt),
+          lastBleDisconnectReason: asNullableString(body.lastBleDisconnectReason),
         });
-        return reply.status(200).send({ gateway });
+
+        if (Array.isArray(body.logs) && body.logs.length > 0) {
+          const logs = body.logs
+            .map((entry) => {
+              if (!entry || typeof entry !== "object") return null;
+              const row = entry as Record<string, unknown>;
+              const message = typeof row.message === "string" ? row.message : "";
+              if (!message.trim()) return null;
+              return {
+                message,
+                level: typeof row.level === "string" ? row.level : "info",
+                loggedAt: typeof row.loggedAt === "string" ? row.loggedAt : null,
+              };
+            })
+            .filter((x): x is NonNullable<typeof x> => x != null);
+          if (logs.length > 0) {
+            await appendGatewayLogs(tabletId, logs);
+          }
+        }
+
+        const commands = await claimPendingCommands(tabletId);
+        return reply.status(200).send({ gateway, commands });
       } catch (err) {
         request.log.error({ err }, "Failed to upsert gateway heartbeat");
         return reply.status(500).send({ error: "Failed to save heartbeat" });

@@ -22,6 +22,9 @@ export type GatewayHeartbeatInput = {
   androidId?: string | null;
   sessionUser?: string | null;
   sessionRole?: string | null;
+  lastBleConnectedAt?: string | null;
+  lastBleDisconnectedAt?: string | null;
+  lastBleDisconnectReason?: string | null;
 };
 
 export type GatewayHeartbeatRow = {
@@ -49,6 +52,9 @@ export type GatewayHeartbeatRow = {
   androidId: string | null;
   sessionUser: string | null;
   sessionRole: string | null;
+  lastBleConnectedAt: string | null;
+  lastBleDisconnectedAt: string | null;
+  lastBleDisconnectReason: string | null;
 };
 
 const ONLINE_WINDOW_MS = 2 * 60 * 1000;
@@ -77,6 +83,9 @@ type DbRow = {
   android_id: string | null;
   session_user: string | null;
   session_role: string | null;
+  last_ble_connected_at: Date | null;
+  last_ble_disconnected_at: Date | null;
+  last_ble_disconnect_reason: string | null;
 };
 
 function toIso(value: Date | null | undefined): string | null {
@@ -111,6 +120,9 @@ function mapRow(row: DbRow, nowMs = Date.now()): GatewayHeartbeatRow {
     androidId: row.android_id,
     sessionUser: row.session_user,
     sessionRole: row.session_role,
+    lastBleConnectedAt: toIso(row.last_ble_connected_at),
+    lastBleDisconnectedAt: toIso(row.last_ble_disconnected_at),
+    lastBleDisconnectReason: row.last_ble_disconnect_reason,
   };
 }
 
@@ -131,32 +143,16 @@ export async function upsertGatewayHeartbeat(
   const result = await pool.query<DbRow>(
     `
     INSERT INTO gateway_heartbeats (
-      tablet_id,
-      tablet_label,
-      app_version,
-      bracelet_mac,
-      ble_connected,
-      is_measuring,
-      phase,
-      status_message,
-      pending_sync_count,
-      last_sync_ok,
-      last_sync_at,
-      last_error,
-      api_reachable,
-      client_sent_at,
-      received_at,
-      first_seen_at,
-      tablet_battery_percent,
-      tablet_charging,
-      device_model,
-      device_manufacturer,
-      android_id,
-      session_user,
-      session_role
+      tablet_id, tablet_label, app_version, bracelet_mac,
+      ble_connected, is_measuring, phase, status_message,
+      pending_sync_count, last_sync_ok, last_sync_at, last_error,
+      api_reachable, client_sent_at, received_at, first_seen_at,
+      tablet_battery_percent, tablet_charging, device_model, device_manufacturer,
+      android_id, session_user, session_role,
+      last_ble_connected_at, last_ble_disconnected_at, last_ble_disconnect_reason
     ) VALUES (
-      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-      now(), now(), $15, $16, $17, $18, $19, $20, $21
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+      now(), now(), $15,$16,$17,$18,$19,$20,$21,$22,$23,$24
     )
     ON CONFLICT (tablet_id) DO UPDATE SET
       tablet_label = EXCLUDED.tablet_label,
@@ -179,7 +175,10 @@ export async function upsertGatewayHeartbeat(
       device_manufacturer = EXCLUDED.device_manufacturer,
       android_id = EXCLUDED.android_id,
       session_user = EXCLUDED.session_user,
-      session_role = EXCLUDED.session_role
+      session_role = EXCLUDED.session_role,
+      last_ble_connected_at = EXCLUDED.last_ble_connected_at,
+      last_ble_disconnected_at = EXCLUDED.last_ble_disconnected_at,
+      last_ble_disconnect_reason = EXCLUDED.last_ble_disconnect_reason
     RETURNING *
     `,
     [
@@ -204,6 +203,9 @@ export async function upsertGatewayHeartbeat(
       input.androidId?.trim() || null,
       input.sessionUser?.trim() || null,
       input.sessionRole?.trim() || null,
+      input.lastBleConnectedAt ? new Date(input.lastBleConnectedAt) : null,
+      input.lastBleDisconnectedAt ? new Date(input.lastBleDisconnectedAt) : null,
+      input.lastBleDisconnectReason?.trim() || null,
     ],
   );
 
@@ -213,12 +215,19 @@ export async function upsertGatewayHeartbeat(
 export async function listGatewayHeartbeats(): Promise<GatewayHeartbeatRow[]> {
   const pool = getPool();
   const result = await pool.query<DbRow>(
-    `
-    SELECT *
-    FROM gateway_heartbeats
-    ORDER BY received_at DESC
-    `,
+    `SELECT * FROM gateway_heartbeats ORDER BY received_at DESC`,
   );
   const nowMs = Date.now();
   return result.rows.map((row) => mapRow(row, nowMs));
+}
+
+export async function getGatewayHeartbeat(
+  tabletId: string,
+): Promise<GatewayHeartbeatRow | null> {
+  const pool = getPool();
+  const result = await pool.query<DbRow>(
+    `SELECT * FROM gateway_heartbeats WHERE tablet_id = $1`,
+    [tabletId.trim()],
+  );
+  return result.rows[0] ? mapRow(result.rows[0]) : null;
 }
